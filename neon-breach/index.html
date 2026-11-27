@@ -1509,6 +1509,53 @@ Input.init();
 resize();
 loadLevel(0);
 requestAnimationFrame(t => { last = t; frame(t); });
+
+// Keep the screen on while someone is playing. The operating system only counts
+// keyboard and mouse as activity, so during controller play it would switch the
+// display off. After 5 minutes with no input at all the lock is let go, so a
+// forgotten tab still lets the screen sleep.
+(function () {
+  if (typeof navigator === 'undefined' || !navigator.wakeLock) return;
+  var IDLE_MS = 5 * 60 * 1000;
+  var lock = null, asking = false, last = Date.now(), axes = [];
+  function hold() {
+    if (lock || asking || document.visibilityState !== 'visible') return;
+    asking = true;
+    navigator.wakeLock.request('screen').then(function (l) {
+      asking = false;
+      lock = l;
+      l.addEventListener('release', function () { if (lock === l) lock = null; });
+    }, function () { asking = false; });
+  }
+  function active() { last = Date.now(); hold(); }
+  ['keydown', 'pointerdown', 'pointermove', 'wheel'].forEach(function (t) {
+    addEventListener(t, active, { passive: true });
+  });
+  // The system drops the lock when the tab is hidden; take it again on return.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') active();
+  });
+  // Controllers fire no events for buttons or sticks, so look at them directly.
+  setInterval(function () {
+    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (var i = 0; i < pads.length; i++) {
+      var p = pads[i];
+      if (!p) continue;
+      var a = axes[i] || (axes[i] = []);
+      for (var b = 0; b < p.buttons.length; b++) if (p.buttons[b].pressed) { active(); break; }
+      for (var k = 0; k < p.axes.length; k++) {
+        if (Math.abs(p.axes[k] - (a[k] || 0)) > 0.25) active();
+        a[k] = p.axes[k];
+      }
+    }
+    if (lock && Date.now() - last > IDLE_MS) {
+      var l = lock;
+      lock = null;
+      l.release().catch(function () {});
+    }
+  }, 250);
+  active();
+})();
 </script>
 </body>
 </html>
