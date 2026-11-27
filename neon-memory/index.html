@@ -1,0 +1,1581 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Memory</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  flip: 0.28,          // seconds for a card to turn over
+  missPause: 0.9,      // a missed pair stays face up this long (after turning) before it turns back
+  peekTime: 3,         // Peek: seconds every card is shown at the start
+  deal: 0.35,          // seconds for one card to settle in when a board is dealt
+  winDelay: 1.6,       // seconds of celebration before the win card
+  // Where the board may go: cards are as big as fits, up to maxPitch per cell; gap is a share of the cell
+  board: { x0: 200, x1: 760, y0: 27, y1: 513, maxPitch: 124, gap: 0.1 },
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', title: '#ffab91', good: '#7dffc0', warn: '#ffd88a',
+    p1: '#4fe3ff', p2: '#ff7ad9',
+  },
+};
+// Board sizes: the name is the one on the menu; the grid is laid out wide so the cards stay big
+const SIZES = [
+  { id: 'tiny', label: 'Tiny', name: '3×4', cols: 4, rows: 3, hint: '6 pairs: just right for little ones.' },
+  { id: 'small', label: 'Small', name: '4×4', cols: 4, rows: 4, hint: '8 pairs: a gentle start.' },
+  { id: 'medium', label: 'Medium', name: '4×5', cols: 5, rows: 4, hint: '10 pairs: a cosy challenge.' },
+  { id: 'large', label: 'Large', name: '5×6', cols: 6, rows: 5, hint: '15 pairs: for a longer unwind.' },
+  { id: 'huge', label: 'Huge', name: '6×6', cols: 6, rows: 6, hint: '18 pairs: the big one.' },
+];
+const PLAYER_NAMES = ['Cyan', 'Pink'];
+const NOTES = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98]; // C major pentatonic
+const KIND_WORDS = ['Lovely focus.', 'Nicely remembered.', 'Calm and clear.', 'Beautifully done.', 'What a memory.'];
+
+// Card faces: 20 neon icons, each with its own colour AND its own shape.
+// draw(g, R, body, line, col) builds paths around (0, 0) with radius about R:
+// body() fills the current path softly and outlines it in neon, line() only outlines it.
+function poly(g, pts, R) {
+  g.beginPath();
+  for (let i = 0; i < pts.length; i += 2) { const x = pts[i] * R, y = pts[i + 1] * R; if (i) g.lineTo(x, y); else g.moveTo(x, y); }
+  g.closePath();
+}
+const ICONS = [
+  { name: 'moon', color: '#fff1b8', draw(g, R, body) {
+    g.translate(R * 0.2, -R * 0.02); g.rotate(-0.5);
+    const o = R * 0.96, d = o * 0.42, r2 = o * 0.9;
+    const x = (d * d + o * o - r2 * r2) / (2 * d), y = Math.sqrt(Math.max(0, o * o - x * x)), a = Math.atan2(y, x);
+    g.beginPath(); g.arc(0, 0, o, a, TAU - a); g.arc(d, 0, r2, Math.atan2(-y, x - d), Math.atan2(y, x - d), true); g.closePath(); body();
+  } },
+  { name: 'sun', color: '#ffa04d', draw(g, R, body, line) {
+    g.beginPath(); g.arc(0, 0, R * 0.5, 0, TAU); body();
+    g.beginPath();
+    for (let i = 0; i < 8; i++) { const a = i * TAU / 8, c = Math.cos(a), s = Math.sin(a); g.moveTo(c * R * 0.72, s * R * 0.72); g.lineTo(c * R, s * R); }
+    line();
+  } },
+  { name: 'star', color: '#ffd84d', draw(g, R, body) {
+    g.translate(0, R * 0.08); g.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / 5, d = i % 2 ? R * 0.44 : R * 1.02;
+      if (i) g.lineTo(Math.cos(a) * d, Math.sin(a) * d); else g.moveTo(Math.cos(a) * d, Math.sin(a) * d);
+    }
+    g.closePath(); body();
+  } },
+  { name: 'lightning', color: '#f2ff5a', draw(g, R, body) { poly(g, [0.22, -1, -0.5, 0.14, -0.04, 0.14, -0.2, 1, 0.52, -0.16, 0.06, -0.16], R); body(); } },
+  { name: 'bell', color: '#ffc25a', draw(g, R, body, line) {
+    g.beginPath(); g.moveTo(-R * 0.82, R * 0.5);
+    g.bezierCurveTo(-R * 0.5, R * 0.36, -R * 0.66, -R * 0.74, 0, -R * 0.74);
+    g.bezierCurveTo(R * 0.66, -R * 0.74, R * 0.5, R * 0.36, R * 0.82, R * 0.5);
+    g.closePath(); body();
+    g.beginPath(); g.arc(0, R * 0.7, R * 0.15, 0, TAU); body();
+    g.beginPath(); g.arc(0, -R * 0.86, R * 0.1, 0, TAU); line();
+  } },
+  { name: 'crown', color: '#c8ff5a', draw(g, R, body, line) {
+    g.translate(0, R * 0.12);
+    poly(g, [-0.85, 0.55, -0.92, -0.42, -0.42, 0.02, 0, -0.66, 0.42, 0.02, 0.92, -0.42, 0.85, 0.55], R); body();
+    g.beginPath(); g.moveTo(-R * 0.86, R * 0.3); g.lineTo(R * 0.86, R * 0.3); line(0.7);
+    for (const [x, y] of [[-0.92, -0.55], [0, -0.8], [0.92, -0.55]]) { g.beginPath(); g.arc(x * R, y * R, R * 0.1, 0, TAU); body(); }
+  } },
+  { name: 'leaf', color: '#6dff7a', draw(g, R, body, line) {
+    g.rotate(-Math.PI / 4);
+    g.beginPath(); g.moveTo(-R * 0.85, 0); g.quadraticCurveTo(0, -R, R * 0.95, 0); g.quadraticCurveTo(0, R, -R * 0.85, 0); g.closePath(); body();
+    g.beginPath(); g.moveTo(-R * 1.1, 0); g.lineTo(R * 0.6, 0);
+    for (const x of [-0.4, 0, 0.36]) { g.moveTo(x * R, 0); g.lineTo((x + 0.22) * R, -0.26 * R); g.moveTo(x * R, 0); g.lineTo((x + 0.22) * R, 0.26 * R); }
+    line(0.7);
+  } },
+  { name: 'feather', color: '#5dffb8', draw(g, R, body, line) {
+    g.rotate(-Math.PI / 4);
+    g.beginPath(); g.moveTo(-0.42 * R, 0);
+    g.quadraticCurveTo(-0.38 * R, -0.4 * R, -0.04 * R, -0.44 * R);
+    g.lineTo(0.06 * R, -0.2 * R); g.lineTo(0.18 * R, -0.44 * R);           // a notch in the vane
+    g.quadraticCurveTo(0.78 * R, -0.38 * R, 1.02 * R, 0);
+    g.quadraticCurveTo(0.72 * R, 0.22 * R, 0.46 * R, 0.28 * R);
+    g.lineTo(0.34 * R, 0.1 * R); g.lineTo(0.22 * R, 0.3 * R);               // and one on the other side
+    g.quadraticCurveTo(-0.28 * R, 0.32 * R, -0.42 * R, 0);
+    g.closePath(); body();
+    g.beginPath(); g.moveTo(-1.08 * R, 0); g.lineTo(0.98 * R, 0);         // the quill
+    for (const x of [-0.26, 0.3, 0.62]) { g.moveTo(x * R, 0); g.lineTo((x + 0.2) * R, -0.26 * R); }
+    for (const x of [-0.18, 0.56]) { g.moveTo(x * R, 0); g.lineTo((x + 0.16) * R, 0.18 * R); }
+    line(0.7);
+    g.beginPath();                                                         // fluff at the base
+    g.moveTo(-0.55 * R, 0); g.quadraticCurveTo(-0.62 * R, -0.18 * R, -0.46 * R, -0.24 * R);
+    g.moveTo(-0.62 * R, 0); g.quadraticCurveTo(-0.72 * R, 0.16 * R, -0.56 * R, 0.22 * R);
+    line(0.6);
+  } },
+  { name: 'gem', color: '#2dffd8', draw(g, R, body, line) {
+    poly(g, [-0.5, -0.58, 0.5, -0.58, 0.92, -0.12, 0, 0.86, -0.92, -0.12], R); body();
+    g.beginPath();
+    g.moveTo(-0.92 * R, -0.12 * R); g.lineTo(0.92 * R, -0.12 * R);
+    g.moveTo(-0.5 * R, -0.58 * R); g.lineTo(-0.25 * R, -0.12 * R); g.lineTo(0, 0.86 * R); g.lineTo(0.25 * R, -0.12 * R); g.lineTo(0.5 * R, -0.58 * R);
+    g.moveTo(-0.25 * R, -0.12 * R); g.lineTo(0, -0.58 * R); g.lineTo(0.25 * R, -0.12 * R);
+    line(0.6);
+  } },
+  { name: 'fish', color: '#4fe3ff', draw(g, R, body, line, col) {
+    g.translate(R * 0.06, 0);
+    g.beginPath(); g.moveTo(R * 0.85, 0);
+    g.quadraticCurveTo(R * 0.2, -R * 0.95, -R * 0.42, 0);
+    g.quadraticCurveTo(R * 0.2, R * 0.95, R * 0.85, 0); g.closePath();
+    g.moveTo(-R * 0.4, 0); g.lineTo(-R * 0.95, -R * 0.45); g.lineTo(-R * 0.8, 0); g.lineTo(-R * 0.95, R * 0.45); g.closePath();
+    body();
+    g.beginPath(); g.arc(R * 0.42, -R * 0.1, R * 0.09, 0, TAU); g.fillStyle = col; g.fill();
+    g.beginPath(); g.arc(R * 0.02, 0, R * 0.28, -0.7, 0.7); line(0.6);
+  } },
+  { name: 'snowflake', color: '#a8f0ff', draw(g, R, body, line) {
+    g.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = i * TAU / 6 - Math.PI / 2, c = Math.cos(a), s = Math.sin(a), bx = c * R * 0.58, by = s * R * 0.58;
+      g.moveTo(c * R * 0.16, s * R * 0.16); g.lineTo(c * R, s * R);
+      for (const t of [-0.75, 0.75]) { g.moveTo(bx, by); g.lineTo(bx + Math.cos(a + t) * R * 0.3, by + Math.sin(a + t) * R * 0.3); }
+    }
+    line(1.1);
+    g.beginPath(); g.arc(0, 0, R * 0.15, 0, TAU); body();
+  } },
+  { name: 'drop', color: '#5aaaff', draw(g, R, body, line) {
+    g.beginPath(); g.moveTo(0, -R * 0.98);
+    g.bezierCurveTo(R * 0.3, -R * 0.52, R * 0.68, -R * 0.14, R * 0.68, R * 0.24);
+    g.arc(0, R * 0.24, R * 0.68, 0, Math.PI);
+    g.bezierCurveTo(-R * 0.68, -R * 0.14, -R * 0.3, -R * 0.52, 0, -R * 0.98);
+    g.closePath(); body();
+    g.beginPath(); g.arc(0, R * 0.24, R * 0.42, Math.PI * 0.62, Math.PI * 0.98); line(0.7);
+  } },
+  { name: 'cloud', color: '#9db0ff', draw(g, R, body) {
+    const s = R * 1.12;
+    g.translate(-0.02 * s, 0.06 * s);
+    g.beginPath(); g.moveTo(-0.5 * s, 0.42 * s); g.lineTo(0.52 * s, 0.42 * s);
+    g.arc(0.52 * s, 0.12 * s, 0.3 * s, Math.PI / 2, -1.772, true);
+    g.arc(0.02 * s, -0.08 * s, 0.45 * s, -0.21, -3.073, true);
+    g.arc(-0.5 * s, 0.15 * s, 0.27 * s, -1.305, Math.PI / 2, true);
+    g.closePath(); body();
+  } },
+  { name: 'butterfly', color: '#8f86ff', draw(g, R, body, line) {
+    for (const sx of [-1, 1]) {
+      g.beginPath(); g.ellipse(sx * R * 0.46, -R * 0.24, R * 0.46, R * 0.33, -sx * 0.6, 0, TAU); body();
+      g.beginPath(); g.ellipse(sx * R * 0.34, R * 0.42, R * 0.31, R * 0.23, sx * 0.6, 0, TAU); body();
+    }
+    g.beginPath(); g.moveTo(0, -R * 0.5); g.lineTo(0, R * 0.64); line(1.5);
+    g.beginPath();
+    for (const sx of [-1, 1]) { g.moveTo(0, -R * 0.45); g.quadraticCurveTo(sx * R * 0.12, -R * 0.86, sx * R * 0.34, -R * 0.96); }
+    line(0.7);
+  } },
+  { name: 'note', color: '#b07dff', draw(g, R, body, line) {
+    for (const [x, y] of [[-0.46, 0.58], [0.48, 0.42]]) { g.beginPath(); g.ellipse(x * R, y * R, R * 0.27, R * 0.19, -0.4, 0, TAU); body(); }
+    g.beginPath(); g.moveTo(-0.21 * R, 0.52 * R); g.lineTo(-0.21 * R, -0.58 * R); g.moveTo(0.73 * R, 0.36 * R); g.lineTo(0.73 * R, -0.76 * R); line();
+    poly(g, [-0.21, -0.58, 0.73, -0.76, 0.73, -0.52, -0.21, -0.34], R); body();
+  } },
+  { name: 'planet', color: '#d08bff', draw(g, R, body, line) {
+    g.rotate(-0.38);
+    g.beginPath(); g.ellipse(0, 0, R * 1.0, R * 0.3, 0, Math.PI, TAU); line(0.85);    // the far half of the ring
+    g.beginPath(); g.arc(0, 0, R * 0.52, 0, TAU); g.fillStyle = '#11152e'; g.fill(); body();
+    g.beginPath(); g.ellipse(0, 0, R * 1.0, R * 0.3, 0, 0, Math.PI); line(0.85);      // the near half
+  } },
+  { name: 'flower', color: '#ff6fe0', draw(g, R, body, line, col) {
+    for (let i = 0; i < 5; i++) {
+      const a = -Math.PI / 2 + i * TAU / 5;
+      g.beginPath(); g.ellipse(Math.cos(a) * R * 0.5, Math.sin(a) * R * 0.5, R * 0.42, R * 0.27, a, 0, TAU); body();
+    }
+    g.beginPath(); g.arc(0, 0, R * 0.24, 0, TAU); g.fillStyle = '#11152e'; g.fill(); g.fillStyle = hexA(col, 0.6); g.fill(); line();
+  } },
+  { name: 'umbrella', color: '#ff7ab8', draw(g, R, body, line) {
+    g.translate(0, -R * 0.06);
+    const sw = R * 0.95 * 2 / 3;
+    g.beginPath(); g.moveTo(-R * 0.95, 0); g.arc(0, 0, R * 0.95, Math.PI, TAU);
+    for (let i = 0; i < 3; i++) g.arc(R * 0.95 - sw * (i + 0.5), 0, sw / 2, 0, Math.PI, true);
+    g.closePath(); body();
+    g.beginPath(); g.moveTo(0, -R * 0.95); g.lineTo(0, -R * 1.06);
+    g.moveTo(0, -sw / 2); g.lineTo(0, R * 0.74); g.arc(-R * 0.17, R * 0.74, R * 0.17, 0, Math.PI); line();
+  } },
+  { name: 'heart', color: '#ff5f7f', draw(g, R, body) {
+    g.translate(0, R * 0.04);
+    g.beginPath(); g.moveTo(0, R * 0.82);
+    g.bezierCurveTo(-R * 1.15, R * 0.05, -R * 0.62, -R * 1.0, 0, -R * 0.4);
+    g.bezierCurveTo(R * 0.62, -R * 1.0, R * 1.15, R * 0.05, 0, R * 0.82);
+    g.closePath(); body();
+  } },
+  { name: 'kite', color: '#ff8a6a', draw(g, R, body, line) {
+    g.translate(-R * 0.08, -R * 0.06); g.rotate(0.18);
+    poly(g, [0, -0.95, 0.62, -0.28, 0, 0.5, -0.62, -0.28], R); body();
+    g.beginPath(); g.moveTo(0, -0.95 * R); g.lineTo(0, 0.5 * R); g.moveTo(-0.62 * R, -0.28 * R); g.lineTo(0.62 * R, -0.28 * R); line(0.6);
+    g.beginPath(); g.moveTo(0, 0.5 * R); g.bezierCurveTo(0.3 * R, 0.66 * R, -0.12 * R, 0.86 * R, 0.3 * R, 1.02 * R); line(0.8);
+    for (const [x, y] of [[0.1, 0.7], [0.13, 0.9]]) { poly(g, [x - 0.11, y - 0.07, x + 0.11, y + 0.07, x + 0.11, y - 0.07, x - 0.11, y + 0.07], R); body(); }
+  } },
+];
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);  // smooth in and out
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+const backOut = t => { const s = 1.6, u = t - 1; return 1 + (s + 1) * u * u * u + s * u * u; };
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+function fmtTime(s) { s = Math.floor(Math.max(0, s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; }
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas + art (icons, cards and background are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, backSprite = null;
+let iconSprites = [], faceSprites = [], haloSprites = [], dotSprites = [], sparkSprites = [];
+const CARD_PAD = 8;   // room around a card sprite for its edge glow
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+// Neon look: a soft fill, then wide faint strokes under a thin bright one, then a hot white core
+function neonFill(g, col, R) {
+  const gr = g.createLinearGradient(0, -R, 0, R);
+  gr.addColorStop(0, hexA(col, 0.42)); gr.addColorStop(1, hexA(col, 0.12));
+  g.fillStyle = gr; g.fill();
+}
+function neonStroke(g, col, lw) {
+  g.lineJoin = 'round'; g.lineCap = 'round'; g.strokeStyle = col;
+  g.globalAlpha = 0.12; g.lineWidth = lw * 4.4; g.stroke();
+  g.globalAlpha = 0.3; g.lineWidth = lw * 2.2; g.stroke();
+  g.globalAlpha = 1; g.lineWidth = lw; g.stroke();
+  g.globalAlpha = 0.35; g.strokeStyle = '#ffffff'; g.lineWidth = lw * 0.4; g.stroke();
+  g.globalAlpha = 1;
+}
+function drawIcon(g, i, R) {
+  const ic = ICONS[i], col = ic.color, lw = Math.max(1.6, R * 0.075);
+  const body = (k = 1) => { neonFill(g, col, R); neonStroke(g, col, lw * k); };
+  const line = (k = 1) => neonStroke(g, col, lw * k);
+  g.save(); ic.draw(g, R, body, line, col); g.restore();
+  g.globalAlpha = 1;
+}
+
+function makeIconSprite(i, S) {
+  const { c, g } = layer(S, S), col = ICONS[i].color;
+  g.translate(S / 2, S / 2);
+  const halo = g.createRadialGradient(0, 0, S * 0.1, 0, 0, S / 2);
+  halo.addColorStop(0, hexA(col, 0.2)); halo.addColorStop(1, hexA(col, 0));
+  g.fillStyle = halo; g.fillRect(-S / 2, -S / 2, S, S);
+  drawIcon(g, i, S * 0.32);
+  return c;
+}
+function makeHalo(col) {
+  const { c, g } = layer(64, 64);
+  const rg = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  rg.addColorStop(0, hexA(col, 0.55)); rg.addColorStop(0.5, hexA(col, 0.22)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 64, 64);
+  return c;
+}
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+function drawSpark(col) { // a soft four-point sparkle for the win card
+  const { c, g } = layer(32, 32);
+  g.translate(16, 16);
+  const h = g.createRadialGradient(0, 0, 0, 0, 0, 16);
+  h.addColorStop(0, hexA(col, 0.45)); h.addColorStop(1, hexA(col, 0));
+  g.fillStyle = h; g.fillRect(-16, -16, 32, 32);
+  g.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = i * Math.PI / 4 - Math.PI / 2, d = i % 2 ? 3 : 13;
+    if (i) g.lineTo(Math.cos(a) * d, Math.sin(a) * d); else g.moveTo(Math.cos(a) * d, Math.sin(a) * d);
+  }
+  g.closePath(); g.fillStyle = col; g.fill();
+  g.globalAlpha = 0.8; g.fillStyle = '#ffffff'; g.beginPath(); g.arc(0, 0, 2.5, 0, TAU); g.fill();
+  return c;
+}
+
+function cardShape(g, cs) { rr(g, 0, 0, cs, cs, Math.round(cs * 0.13)); }
+function makeFace(i, cs) {
+  const S = cs + CARD_PAD * 2, { c, g } = layer(S, S), col = ICONS[i].color;
+  g.translate(CARD_PAD, CARD_PAD);
+  cardShape(g, cs);
+  const bg = g.createLinearGradient(0, 0, 0, cs);
+  bg.addColorStop(0, '#161c3a'); bg.addColorStop(1, '#0b0f24');
+  g.fillStyle = bg; g.fill();
+  const halo = g.createRadialGradient(cs / 2, cs / 2, 0, cs / 2, cs / 2, cs * 0.6);
+  halo.addColorStop(0, hexA(col, 0.2)); halo.addColorStop(1, hexA(col, 0.03));
+  g.fillStyle = halo; g.fill();
+  g.strokeStyle = hexA(col, 0.6); g.lineWidth = 1.6; g.stroke();
+  g.translate(cs / 2, cs / 2);
+  drawIcon(g, i, cs * 0.3);
+  return c;
+}
+function makeBack(cs) {
+  const S = cs + CARD_PAD * 2, { c, g } = layer(S, S), col = CFG.color.title, r = Math.round(cs * 0.13);
+  g.translate(CARD_PAD, CARD_PAD);
+  cardShape(g, cs);
+  const bg = g.createLinearGradient(0, 0, cs, cs);
+  bg.addColorStop(0, '#1d2350'); bg.addColorStop(1, '#0e1232');
+  g.fillStyle = bg; g.fill();
+  g.save(); g.clip(); // a faint lattice of dots
+  g.fillStyle = hexA(col, 0.1);
+  const step = cs / 6;
+  for (let y = step / 2; y < cs; y += step) {
+    for (let x = step / 2; x < cs; x += step) { g.beginPath(); g.arc(x, y, Math.max(1, cs * 0.012), 0, TAU); g.fill(); }
+  }
+  g.restore();
+  cardShape(g, cs); g.strokeStyle = hexA(col, 0.65); g.lineWidth = 1.6; g.stroke();
+  const ins = cs * 0.08;
+  rr(g, ins, ins, cs - ins * 2, cs - ins * 2, r * 0.7); g.strokeStyle = hexA(col, 0.28); g.lineWidth = 1.2; g.stroke();
+  // centre: a diamond ring around a four-point sparkle
+  g.translate(cs / 2, cs / 2);
+  const R = cs * 0.2;
+  g.beginPath(); g.moveTo(0, -R * 1.25); g.lineTo(R * 1.25, 0); g.lineTo(0, R * 1.25); g.lineTo(-R * 1.25, 0); g.closePath();
+  g.strokeStyle = col; g.lineJoin = 'round';
+  g.globalAlpha = 0.15; g.lineWidth = 5; g.stroke();
+  g.globalAlpha = 0.55; g.lineWidth = 1.4; g.stroke();
+  g.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = i * Math.PI / 4 - Math.PI / 2, d = i % 2 ? R * 0.22 : R * 0.82;
+    if (i) g.lineTo(Math.cos(a) * d, Math.sin(a) * d); else g.moveTo(Math.cos(a) * d, Math.sin(a) * d);
+  }
+  g.closePath();
+  g.globalAlpha = 0.25; g.fillStyle = col; g.fill();
+  neonStroke(g, col, Math.max(1.3, cs * 0.014));
+  g.fillStyle = col; g.globalAlpha = 0.45;
+  for (const [dx, dy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) { g.beginPath(); g.arc(dx * cs * 0.3, dy * cs * 0.3, Math.max(1.2, cs * 0.018), 0, TAU); g.fill(); }
+  g.globalAlpha = 1;
+  return c;
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  const L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[140, 110, 300, '#3a5cff', 0.1], [830, 440, 320, '#a64dff', 0.08], [880, 70, 220, '#ff8a6a', 0.05], [80, 480, 240, '#20c0d0', 0.05]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  iconSprites = ICONS.map((_, i) => makeIconSprite(i, 96));
+  haloSprites = ICONS.map(ic => makeHalo(ic.color));
+  dotSprites = [...ICONS.map(ic => ic.color), '#ffffff'].map(drawDot);
+  sparkSprites = ICONS.map(ic => drawSpark(ic.color));
+  if (G.cards.length) buildCardArt();
+}
+// Card back and faces at the exact card size of the current board (sharp at any size)
+function buildCardArt() {
+  backSprite = makeBack(G.cs);
+  faceSprites = ICONS.map((_, i) => makeFace(i, G.cs));
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine bells only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) { // a soft airy puff
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  flip()    { if (this.ok('flip', 0.04)) { this.tone(520, 640, 0.09, 'sine', 0.045); this.noise(0.08, 0.012, 1600); } },
+  back()    { if (this.ok('back', 0.06)) this.tone(560, 430, 0.13, 'sine', 0.03); },
+  // Each pair found rings the next note up the scale, so a whole board plays a little tune
+  match(n)  { if (this.ok('match', 0.05)) { const f = NOTES[n % NOTES.length]; this.bell(f, 0.09, 0, 0.9); this.bell(f * 1.5, 0.035, 0.09, 0.8); } },
+  miss()    { if (this.ok('miss', 0.1)) { this.tone(392, 392, 0.18, 'sine', 0.032); this.tone(330, 330, 0.24, 'sine', 0.028, 0.12); } },
+  turn(p)   { if (this.ok('turn', 0.1)) { const f = p ? 659.25 : 523.25; this.tone(f, f, 0.14, 'triangle', 0.035); this.tone(f * 1.25, f * 1.25, 0.18, 'sine', 0.03, 0.08); } },
+  peek()    { if (this.ok('peek', 0.3)) { this.tone(440, 880, 0.6, 'sine', 0.03); this.noise(0.6, 0.015, 2400); } },
+  nope()    { if (this.ok('nope', 0.12)) this.tone(300, 300, 0.08, 'sine', 0.025); },
+  finish()  { if (this.ok()) [261.63, 329.63, 392, 493.88, 523.25].forEach((f, i) => this.bell(f, 0.06, i * 0.11, 1.5)); },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select()  { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()    { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, pause: false, mute: false, select: false, back: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+      if (e.pointerType === 'mouse' && this.device === 'touch' && !m.down) this.device = 'mouse';
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let act = P.has('Space') || P.has('Enter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) act = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      // D-pad or left stick as a cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state and saved settings
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let sizeIdx = SIZES.findIndex(s => s.id === load('neonMemory.size', 'small'));
+if (sizeIdx < 0) sizeIdx = 1;
+let players = load('neonMemory.players', '1') === '2' ? 2 : 1;
+let peekOn = load('neonMemory.peek', '0') === '1';
+let timerOn = load('neonMemory.timer', '0') === '1';
+const bestMoves = {}, bestTime = {};          // per size, 1 player only (0 = none yet)
+for (const s of SIZES) {
+  bestMoves[s.id] = Number(load('neonMemory.best.' + s.id, 0)) || 0;
+  bestTime[s.id] = Number(load('neonMemory.time.' + s.id, 0)) || 0;
+}
+let cleared = Number(load('neonMemory.cleared', 0)) || 0;   // boards finished, all time
+Sfx.muted = load('neonMemory.muted', '0') === '1';
+const toast = { text: '', t: 0 };
+let resultInfo = null;
+
+function showToast(text) { toast.text = text; toast.t = 2; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { clearFx(); setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonMemory.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function cycleSize(d) { sizeIdx = (sizeIdx + d + SIZES.length) % SIZES.length; save('neonMemory.size', SIZES[sizeIdx].id); }
+function cyclePlayers() { players = players === 1 ? 2 : 1; save('neonMemory.players', players); }
+function togglePeek() { peekOn = !peekOn; save('neonMemory.peek', peekOn ? 1 : 0); }
+function toggleTimer() { timerOn = !timerOn; save('neonMemory.timer', timerOn ? 1 : 0); }
+
+// ============================================================
+// 2. Deck and board layout
+// ============================================================
+// Fisher-Yates: every order is equally likely
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; }
+  return a;
+}
+// `pairs` different icons, two of each, shuffled
+function makeDeck(pairs) {
+  const pick = shuffle(ICONS.map((_, i) => i)).slice(0, pairs);
+  return shuffle([...pick, ...pick]);
+}
+function layoutFor(si) {
+  const s = SIZES[si], B = CFG.board;
+  const pitch = Math.min((B.x1 - B.x0) / s.cols, (B.y1 - B.y0) / s.rows, B.maxPitch);
+  return {
+    cols: s.cols, rows: s.rows, n: s.cols * s.rows, pitch, cs: Math.round(pitch * (1 - B.gap)),
+    BX: (W - s.cols * pitch) / 2, BY: (H - s.rows * pitch) / 2,
+  };
+}
+
+// ============================================================
+// 3. Play: flipping, matching and turns
+// ============================================================
+const G = {
+  size: SIZES[1], cols: 4, rows: 4, n: 16, pitch: 100, cs: 90, BX: 0, BY: 0, total: 8,
+  cards: [], open: [], phase: 'idle', phaseT: 0, missT: 0, matchFx: [],
+  moves: 0, pairs: 0, players: 1, turn: 0, scores: [0, 0], timer: false, peek: false, time: 0,
+  cursor: 0, peekUp: 0, peekLeft: 0,
+};
+const cardX = k => G.BX + ((k % G.cols) + 0.5) * G.pitch;
+const cardY = k => G.BY + (((k / G.cols) | 0) + 0.5) * G.pitch;
+// The card under a point. The whole cell counts (gaps too), so taps are forgiving.
+function cardAt(x, y) {
+  const c = Math.floor((x - G.BX) / G.pitch), r = Math.floor((y - G.BY) / G.pitch);
+  return r >= 0 && r < G.rows && c >= 0 && c < G.cols ? r * G.cols + c : -1;
+}
+const ripple = k => ((k % G.cols) + ((k / G.cols) | 0)) * 0.04;   // a diagonal wave across the board
+
+function startGame() {
+  Sfx.init();
+  clearFx();
+  const L = layoutFor(sizeIdx);
+  Object.assign(G, L, {
+    size: SIZES[sizeIdx], total: L.n / 2, open: [], phase: 'deal', phaseT: 0, missT: 0, matchFx: [],
+    moves: 0, pairs: 0, players, turn: 0, scores: [0, 0], timer: timerOn, peek: peekOn, time: 0,
+    cursor: 0, peekUp: 0, peekLeft: 0,
+  });
+  const stagger = Math.min(0.03, 0.7 / L.n);
+  G.cards = makeDeck(G.total).map((icon, k) => ({
+    icon, up: false, matched: false, owner: -1, flip: 0, target: 0, wait: 0,
+    deal: -(k * stagger) / CFG.deal, glowT: 0,
+  }));
+  buildCardArt();
+  setState('play');
+}
+
+function startPeek() {
+  G.phase = 'peek'; G.phaseT = 0; G.peekLeft = 1;
+  let maxWait = 0;
+  G.cards.forEach((c, k) => { c.target = 1; c.wait = ripple(k); maxWait = Math.max(maxWait, c.wait); });
+  G.peekUp = CFG.flip + maxWait;
+  Sfx.peek();
+}
+function endPeek() {
+  G.phase = 'unpeek'; G.phaseT = 0; G.peekLeft = 0;
+  G.cards.forEach((c, k) => { c.target = 0; c.wait = ripple(k); });
+  Sfx.back();
+}
+
+// Flip the card at k. Returns what happened (handy for tests):
+// 'first', 'match', 'miss', 'hurry', 'hurry+flip' or 'ignored'.
+function flipCard(k) {
+  if (G.phase === 'miss') {
+    // A tap while a missed pair waits turns them back at once; a tap on another card also flips it.
+    const wasOpen = G.open.includes(k);
+    resolveMiss();
+    if (wasOpen || k < 0 || k >= G.n || G.cards[k].matched) return 'hurry';
+    return flipCard(k) === 'first' ? 'hurry+flip' : 'hurry';
+  }
+  if (G.phase !== 'idle' || k < 0 || k >= G.n) return 'ignored';
+  const c = G.cards[k];
+  if (c.matched || c.up) { Sfx.nope(); return 'ignored'; }
+  c.up = true; c.target = 1; c.wait = 0;
+  Sfx.flip();
+  G.open.push(k);
+  if (G.open.length === 1) return 'first';
+  G.moves++;
+  const [a, b] = G.open, A = G.cards[a], B = G.cards[b];
+  if (A.icon === B.icon) {
+    G.open = [];
+    A.matched = B.matched = true;
+    A.owner = B.owner = G.turn;
+    A.glowT = B.glowT = -CFG.flip;            // the glow and chime land when the card has turned
+    G.pairs++; G.scores[G.turn]++;
+    G.matchFx.push({ t: CFG.flip, a, b, n: G.pairs - 1, p: G.turn });
+    if (G.pairs === G.total) { G.phase = 'won'; G.phaseT = 0; }
+    return 'match';
+  }
+  G.phase = 'miss'; G.missT = 0;
+  return 'miss';
+}
+
+function resolveMiss() {
+  for (const k of G.open) { const c = G.cards[k]; c.up = false; c.target = 0; c.wait = 0; }
+  G.open = [];
+  G.phase = 'idle'; G.phaseT = 0;
+  Sfx.back();
+  if (G.players === 2) {
+    G.turn = 1 - G.turn;
+    Sfx.turn(G.turn);
+    floater(`${PLAYER_NAMES[G.turn]}'s turn`, W / 2, H / 2, G.turn ? CFG.color.p2 : CFG.color.p1, 30);
+  }
+}
+
+function matchFx(f) {
+  const col = ICONS[G.cards[f.a].icon].color, ci = G.cards[f.a].icon;
+  for (const k of [f.a, f.b]) {
+    burst(cardX(k), cardY(k), ci, LOW_RES ? 5 : 10, 170, 0.8, 8);
+    ring(cardX(k), cardY(k), G.cs * 0.3, G.cs * 0.85, 0.6, col, 2);
+  }
+  Sfx.match(f.n);
+  if (G.players === 2) floater('+1', cardX(f.b), cardY(f.b) - G.cs * 0.45, f.p ? CFG.color.p2 : CFG.color.p1, 26);
+}
+
+function finishGame() {
+  const id = G.size.id, prevBest = bestMoves[id];
+  let isBest = false, isBestTime = false;
+  if (G.players === 1) {
+    isBest = !bestMoves[id] || G.moves < bestMoves[id];
+    if (isBest) { bestMoves[id] = G.moves; save('neonMemory.best.' + id, G.moves); }
+    if (G.timer) {
+      const t = Math.round(G.time * 10) / 10;
+      isBestTime = !bestTime[id] || t < bestTime[id];
+      if (isBestTime) { bestTime[id] = t; save('neonMemory.time.' + id, t); }
+    }
+  }
+  cleared++; save('neonMemory.cleared', cleared);
+  const s = G.scores;
+  resultInfo = {
+    size: G.size, moves: G.moves, pairs: G.total, best: bestMoves[id], prevBest, isBest, perfect: G.moves === G.total,
+    timer: G.timer, time: G.time, bestTime: bestTime[id], isBestTime,
+    players: G.players, scores: s.slice(), winner: s[0] > s[1] ? 0 : s[1] > s[0] ? 1 : -1,
+    word: KIND_WORDS[(Math.random() * KIND_WORDS.length) | 0],
+  };
+  setState('result');
+  Sfx.finish();
+  for (let i = 0; i < (LOW_RES ? 16 : 44); i++) spawnSpark(rand(0, W), rand(-30, H));
+}
+
+// Animation and flow for the board
+function stepBoard(dt) {
+  G.phaseT += dt;
+  for (const c of G.cards) {
+    if (c.deal < 1) c.deal = Math.min(1, c.deal + dt / CFG.deal);
+    if (c.wait > 0) c.wait = Math.max(0, c.wait - dt);
+    else if (c.flip !== c.target) {
+      const s = dt / CFG.flip;
+      c.flip = c.target > c.flip ? Math.min(c.target, c.flip + s) : Math.max(c.target, c.flip - s);
+    }
+    if (c.matched && c.glowT < 1) c.glowT = Math.min(1, c.glowT + dt / 0.9);
+  }
+  for (let i = G.matchFx.length - 1; i >= 0; i--) {
+    const f = G.matchFx[i];
+    f.t -= dt;
+    if (f.t <= 0) { G.matchFx.splice(i, 1); matchFx(f); }
+  }
+  switch (G.phase) {
+    case 'deal':
+      if (G.cards.every(c => c.deal >= 1)) { if (G.peek) startPeek(); else { G.phase = 'idle'; G.phaseT = 0; } }
+      break;
+    case 'peek':
+      G.peekLeft = clamp(1 - (G.phaseT - G.peekUp) / CFG.peekTime, 0, 1);
+      if (G.phaseT >= G.peekUp + CFG.peekTime) endPeek();
+      break;
+    case 'unpeek':
+      if (G.cards.every(c => c.wait <= 0 && c.flip === c.target)) { G.phase = 'idle'; G.phaseT = 0; }
+      break;
+    case 'miss': {
+      const before = G.missT;
+      G.missT += dt;
+      if (before < CFG.flip && G.missT >= CFG.flip) Sfx.miss();
+      if (G.missT >= CFG.flip + CFG.missPause) resolveMiss();
+      break;
+    }
+    case 'won':
+      if (G.phaseT >= CFG.flip + CFG.winDelay) finishGame();
+      break;
+  }
+  if (G.phase === 'idle' || G.phase === 'miss') G.time += dt;
+}
+
+const SOUND_BTN = { x: W - 124, y: 12, w: 50, h: 50 };
+const PAUSE_BTN = { x: W - 64, y: 12, w: 50, h: 50 };
+
+// Cursor (keyboard / controller) and taps / clicks
+function boardInput() {
+  const I = Input, m = I.mouse;
+  if (m.clicked && inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+  if (m.clicked && inRect(m, SOUND_BTN)) { toggleSound(); return; }
+  const dr = I.navUp ? -1 : I.navDown ? 1 : 0, dc = dr ? 0 : I.navLeft ? -1 : I.navRight ? 1 : 0;
+  if (dr || dc) {
+    const r = clamp(((G.cursor / G.cols) | 0) + dr, 0, G.rows - 1), c = clamp((G.cursor % G.cols) + dc, 0, G.cols - 1);
+    if (r * G.cols + c !== G.cursor) { G.cursor = r * G.cols + c; Sfx.tick(); }
+  }
+  if (I.act) flipCard(G.cursor);
+  if (m.clicked) {
+    const k = cardAt(m.x, m.y);
+    if (k >= 0) G.cursor = k;
+    if (k >= 0 || G.phase === 'miss') flipCard(k);   // a tap anywhere hurries a missed pair
+  }
+}
+
+function updatePlay(dt) {
+  boardInput();
+  if (state !== 'play') return; // paused from the on-screen button
+  stepBoard(dt);
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 120 : 260, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(32, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const floaters = new Pool(16, () => ({ x: 0, y: 0, text: '', color: '#fff', life: 0, max: 1, size: 20 }));
+const sparks = new Pool(LOW_RES ? 40 : 110, () => ({ x: 0, y: 0, vx: 0, vy: 0, ph: 0, s: 10, ci: 0 }));
+let sparkAcc = 0;
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 24); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: i % ICONS.length });
+}
+
+function burst(x, y, ci, n, speed, life = 0.7, size = 7) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+function floater(text, x, y, color, size = 20) {
+  const o = floaters.get();
+  if (!o) return;
+  o.text = text; o.x = x; o.y = y; o.color = color; o.size = size; o.life = o.max = 1.3;
+}
+function spawnSpark(x, y) {
+  const o = sparks.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.vx = rand(-10, 10); o.vy = rand(28, 62); o.ph = Math.random() * TAU; o.s = rand(10, 22);
+  o.ci = (Math.random() * ICONS.length) | 0;
+}
+function clearFx() { parts.clear(); rings.clear(); floaters.clear(); sparks.clear(); sparkAcc = 0; }
+
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 40 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const pool of [rings, floaters]) {
+    for (const o of pool.items) {
+      if (!o.active) continue;
+      o.life -= dt;
+      if (o.life <= 0) o.active = false;
+    }
+  }
+  for (const f of floaters.items) if (f.active) f.y -= 26 * dt;
+  // Win card: sparkles drift down like slow confetti
+  if (state === 'result') {
+    sparkAcc += dt * (LOW_RES ? 5 : 12);
+    while (sparkAcc >= 1) { sparkAcc--; spawnSpark(rand(0, W), -16); }
+  }
+  for (const o of sparks.items) {
+    if (!o.active) continue;
+    o.x += (o.vx + Math.sin(time * 1.3 + o.ph) * 18) * dt; o.y += o.vy * dt;
+    if (o.y > H + 20) o.active = false;
+  }
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function titleItems() {
+  const s = SIZES[sizeIdx], pairs = (s.cols * s.rows) / 2;
+  return [
+    { id: 'play', label: 'Play', hint: players === 2 ? `Take turns to find ${pairs} pairs together.`
+      : cleared > 0 ? `Find all ${pairs} pairs. ${cleared} ${cleared === 1 ? 'board' : 'boards'} cleared so far.` : `Find all ${pairs} pairs. No timer, no rush.` },
+    { id: 'size', label: 'Size', value: `${s.label} ${s.name}`, cycle: d => cycleSize(d), hint: s.hint },
+    { id: 'players', label: 'Players', value: players === 2 ? '2 players' : '1 player', cycle: () => cyclePlayers(),
+      hint: players === 2 ? 'Take turns on one device. Find a pair, go again.' : 'Just you, at your own pace.' },
+    { id: 'peek', label: 'Peek', value: peekOn ? 'On' : 'Off', cycle: () => togglePeek(), hint: 'See every card for 3 seconds at the start.' },
+    { id: 'timer', label: 'Timer', value: timerOn ? 'On' : 'Off', cycle: () => toggleTimer(), hint: 'Show a clock while you play. It never runs out.' },
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Controls, rules and the two-player mode.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() {
+  return [{ id: 'resume', label: 'Resume' }, { id: 'restart', label: 'Restart' }, soundItem(), { id: 'quit', label: 'Quit to menu' }];
+}
+function resultItems() { return [{ id: 'again', label: 'Play again' }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'play') startGame();
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 6; Sfx.blip(); }
+      break;
+    case 'play':
+      if (Input.pause) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') startGame();
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'result':
+      if (stateT > 0.8) {
+        const id = menuInput(resultItems());
+        if (id === 'again') startGame();
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.13 + 0.1 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+const playerColor = p => (p ? CFG.color.p2 : CFG.color.p1);
+const frameColor = () => (G.players === 2 && G.phase !== 'won' && state !== 'result' ? playerColor(G.turn) : CFG.color.title);
+
+// One card: dealt in, turned over with a horizontal squeeze, lifted a little mid-turn
+function drawCard(k) {
+  const c = G.cards[k], cs = G.cs, x = cardX(k);
+  let y = cardY(k), s = 1, a = 1;
+  if (c.deal < 1) {
+    const d = clamp(c.deal, 0, 1);
+    if (d <= 0) return;
+    s = 0.6 + 0.4 * backOut(d); a = d;
+  }
+  const p = ease(clamp(c.flip, 0, 1)), sx = Math.abs(Math.cos(p * Math.PI)), lift = Math.sin(p * Math.PI);
+  s *= 1 + 0.07 * lift;
+  if (G.phase === 'won' || state === 'result') { // a ripple of joy across the board
+    const t = G.phaseT - CFG.flip - Math.hypot((k % G.cols) - (G.cols - 1) / 2, ((k / G.cols) | 0) - (G.rows - 1) / 2) * 0.09;
+    if (state === 'play' && t > 0 && t < 0.5) s *= 1 + 0.08 * Math.sin((t / 0.5) * Math.PI);
+  }
+  const face = p >= 0.5, size = (cs + CARD_PAD * 2) * s, ch = cs * s;
+  y -= lift * 4;
+  ctx.globalAlpha = a;
+  if (c.matched && face && c.glowT > 0) { // a soft glow around a found pair (brighter just after the match)
+    const g = c.glowT, d = cs * (1.5 + 0.25 * (1 - g));
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = a * (0.2 + 0.05 * Math.sin(time * 1.6 + k) + 0.45 * (1 - g));
+    ctx.drawImage(haloSprites[c.icon], x - d / 2, y - d / 2, d, d);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = a;
+  }
+  if (lift > 0.02) {
+    const cw = ch * Math.max(sx, 0.05);
+    rrPath(x - cw / 2 + 2, y - ch / 2 + 7, cw, ch, cs * 0.13);
+    ctx.fillStyle = `rgba(0,0,0,${0.3 * lift})`; ctx.fill();
+  }
+  ctx.drawImage(face ? faceSprites[c.icon] : backSprite, x - (size * sx) / 2, y - size / 2, size * sx, size);
+  if (c.matched && face && c.glowT > 0) {
+    rrPath(x - (ch * sx) / 2, y - ch / 2, ch * sx, ch, cs * 0.13 * s);
+    ctx.globalAlpha = a * Math.min(1, c.glowT * 3) * (0.6 + 0.15 * Math.sin(time * 1.6 + k));
+    glowStroke(ICONS[c.icon].color, 1.8);
+  }
+  if (sx < 0.12) { // the card's thin edge as it turns
+    ctx.globalAlpha = a * (1 - sx / 0.12) * 0.8;
+    ctx.fillStyle = face ? ICONS[c.icon].color : CFG.color.title;
+    ctx.fillRect(x - 1, y - ch / 2, 2, ch);
+  }
+  if (c.matched && face && G.players === 2 && c.owner >= 0) { // whose pair it is
+    ctx.globalAlpha = a * Math.min(1, Math.max(0, c.glowT) * 3);
+    rrPath(x - cs * 0.22 * sx, y + ch / 2 - cs * 0.1, cs * 0.44 * sx, cs * 0.05, cs * 0.025);
+    ctx.fillStyle = playerColor(c.owner); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function renderBoard() {
+  const bw = G.cols * G.pitch, bh = G.rows * G.pitch;
+  rrPath(G.BX - 6, G.BY - 6, bw + 12, bh + 12, 18);
+  ctx.fillStyle = 'rgba(8,11,26,0.55)'; ctx.fill();
+  ctx.globalAlpha = 0.4 + 0.12 * Math.sin(time * 0.8);
+  glowStroke(frameColor(), 1.5);
+  ctx.globalAlpha = 1;
+  for (let k = 0; k < G.n; k++) if (G.cards[k].flip === 0 || G.cards[k].flip === 1) drawCard(k);
+  for (let k = 0; k < G.n; k++) if (G.cards[k].flip > 0 && G.cards[k].flip < 1) drawCard(k); // turning cards on top
+}
+
+function cardOutline(k, out) {
+  const cs = G.cs;
+  rrPath(cardX(k) - cs / 2 - out, cardY(k) - cs / 2 - out, cs + out * 2, cs + out * 2, cs * 0.13 + out);
+}
+function renderMarks() {
+  const dev = Input.device;
+  if (dev === 'kb' || dev === 'pad') {
+    cardOutline(G.cursor, 4);
+    ctx.globalAlpha = 0.7 + 0.3 * Math.sin(time * 4);
+    glowStroke('#ffffff', 2.4);
+    ctx.globalAlpha = 1;
+  } else if (dev === 'mouse' && (G.phase === 'idle' || G.phase === 'miss')) {
+    const k = cardAt(Input.mouse.x, Input.mouse.y);
+    if (k >= 0 && !G.cards[k].up && !G.cards[k].matched) {
+      cardOutline(k, 3); ctx.globalAlpha = 0.45; glowStroke('#ffffff', 1.6); ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawSparks() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of sparks.items) {
+    if (!o.active) continue;
+    const tw = 0.75 + 0.25 * Math.sin(time * 4 + o.ph), s = o.s * tw;
+    ctx.globalAlpha = 0.85;
+    ctx.drawImage(sparkSprites[o.ci], o.x - s / 2, o.y - s / 2, s, s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawFloaters() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const f of floaters.items) {
+    if (!f.active) continue;
+    const a = Math.min(1, (f.life / f.max) * 2.5);
+    ctx.font = `800 ${f.size}px ${SANS}`; ctx.lineJoin = 'round';
+    ctx.globalAlpha = a * 0.85; ctx.strokeStyle = '#05070f'; ctx.lineWidth = 7; ctx.strokeText(f.text, f.x, f.y); // dark edge so it reads over bright cards
+    ctx.globalAlpha = a;
+    glowText(f.text, f.x, f.y, `800 ${f.size}px ${SANS}`, f.color);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 13);
+  ctx.fillStyle = hover ? 'rgba(255,171,145,0.16)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 8, cy - 10, 6, 20); ctx.fillRect(cx + 2, cy - 10, 6, 20); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return ['D-pad: move', `${NN.a}: flip a card`, `${NN.start}: pause`];
+    case 'mouse': return ['Click a card', 'to flip it', 'Esc or ‖: pause'];
+    case 'touch': return ['Tap a card', 'to flip it', '‖ button: pause'];
+    default: return ['Arrows: move', 'Space: flip a card', 'Esc: pause'];
+  }
+}
+
+function bar(x, y, w, p, color) {
+  rrPath(x, y, w, 8, 4); ctx.fillStyle = 'rgba(131,144,189,0.18)'; ctx.fill();
+  if (p > 0.03) { rrPath(x, y, w * p, 8, 4); ctx.fillStyle = color; ctx.fill(); }
+}
+
+function playerPanel(p, x, y) {
+  const C = CFG.color, col = playerColor(p), active = G.turn === p && G.phase !== 'won' && state !== 'result';
+  rrPath(x - 84, y, 168, 168, 22);
+  ctx.fillStyle = active ? hexA(col, 0.08) : 'rgba(10,14,32,0.6)'; ctx.fill();
+  ctx.globalAlpha = active ? 0.75 + 0.25 * Math.sin(time * 3) : 0.35;
+  glowStroke(active ? col : C.faint, active ? 2 : 1.2);
+  ctx.globalAlpha = 1;
+  glowText(PLAYER_NAMES[p].toUpperCase(), x, y + 30, `800 24px ${SANS}`, col);
+  text(`Player ${p + 1}`, x, y + 55, `500 14px ${SANS}`, C.dim);
+  text(String(G.scores[p]), x, y + 98, `800 46px ${MONO}`, C.text);
+  text(active ? 'YOUR TURN' : G.scores[p] === 1 ? 'pair' : 'pairs', x, y + 142, `800 14px ${SANS}`, active ? col : C.faint);
+}
+
+function drawHUD() {
+  const C = CFG.color, LX = 100, RX = 860, id = G.size.id;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(G.size.label.toUpperCase(), LX, 52, `800 28px ${SANS}`, C.title);
+  text(`${G.total} pairs  ·  ${G.size.name}`, LX, 82, `500 14px ${SANS}`, C.dim);
+  if (G.players === 1) {
+    text('MOVES', LX, 136, `800 12px ${SANS}`, C.faint);
+    text(String(G.moves), LX, 172, `800 42px ${MONO}`, C.text);
+    text('PAIRS FOUND', LX, 226, `800 12px ${SANS}`, C.faint);
+    text(`${G.pairs} / ${G.total}`, LX, 258, `800 26px ${SANS}`, C.text);
+    bar(LX - 72, 282, 144, G.pairs / G.total, C.title);
+    text('BEST', LX, 330, `800 12px ${SANS}`, C.faint);
+    text(bestMoves[id] ? `${bestMoves[id]} moves` : 'not yet', LX, 356, `700 18px ${SANS}`, C.dim);
+    if (G.timer) {
+      text('TIME', LX, 408, `800 12px ${SANS}`, C.faint);
+      text(fmtTime(G.time), LX, 440, `800 28px ${MONO}`, C.text);
+      if (bestTime[id]) text(`best ${fmtTime(bestTime[id])}`, LX, 470, `500 14px ${SANS}`, C.faint);
+    }
+  } else {
+    playerPanel(0, LX, 112);
+    text('PAIRS FOUND', LX, 318, `800 12px ${SANS}`, C.faint);
+    text(`${G.pairs} / ${G.total}`, LX, 346, `800 24px ${SANS}`, C.text);
+    text('MOVES', LX, 390, `800 12px ${SANS}`, C.faint);
+    text(String(G.moves), LX, 418, `800 24px ${MONO}`, C.text);
+    if (G.timer) {
+      text('TIME', LX, 462, `800 12px ${SANS}`, C.faint);
+      text(fmtTime(G.time), LX, 490, `800 24px ${MONO}`, C.text);
+    }
+    playerPanel(1, RX, 112);
+  }
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  if (G.phase === 'peek' || G.phase === 'unpeek') {
+    const py = G.players === 2 ? 318 : 214;
+    glowText('PEEK', RX, py, `800 26px ${SANS}`, C.title);
+    text('Remember them…', RX, py + 30, `500 15px ${SANS}`, C.dim);
+    bar(RX - 70, py + 52, 140, G.peekLeft, C.title);
+  }
+  controlLines().forEach((s, i) => text(s, RX, 444 + i * 22, `500 14px ${SANS}`, i === 2 ? C.faint : C.dim));
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  renderBoard();
+  drawFx();
+  if (state === 'play') renderMarks();
+  drawHUD();
+  drawFloaters();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 380, h = Math.min(40, gap - 4);
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(255,171,145,0.10)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 70, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 85, y, `700 17px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  // Big cards' icons drifting slowly behind the menu
+  for (let i = 0; i < 12; i++) {
+    const x = ((i * 131 + time * (8 + (i % 3) * 5)) % (W + 160)) - 80;
+    const y = 50 + ((i * 197) % 440) + Math.sin(time * 0.6 + i) * 16;
+    const s = 70 + (i % 3) * 16;
+    ctx.globalAlpha = 0.16 + (i % 3) * 0.05;
+    ctx.drawImage(iconSprites[(i * 7) % ICONS.length], x - s / 2, y - s / 2, s, s);
+  }
+  ctx.globalAlpha = 1;
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 390);
+  shade.addColorStop(0, 'rgba(5,7,15,0.85)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON MEMORY', W / 2, 64, `800 60px ${SANS}`, CFG.color.title);
+  text('flip the cards, find the pairs', W / 2, 106, `500 16px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), y0 = 152, gap = 38;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap + 2, `500 15px ${SANS}`, CFG.color.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, y0 + items.length * gap + 26, `500 13px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 22, pad = Input.pad, s = SIZES[sizeIdx];
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(bestMoves[s.id] ? `${s.label} best: ${bestMoves[s.id]} moves` : `${s.label}: no best yet`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, CFG.color.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 40, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Move the cursor', 'D-pad / left stick', 'Arrows / W A S D', '–'],
+    ['Flip a card', NN.a, 'Space or Enter', 'Click or tap it'],
+    ['Hurry a miss', NN.a, 'Space or Enter', 'Tap any card'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [226, 250, 440, 620];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 80, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 80, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 80, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 106 + i * 25;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 236, W - 120, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 262, `800 12px ${SANS}`, C.faint);
+    lines.forEach(([s, c], i) => text(s, x, 290 + i * 24, `500 15px ${SANS}`, c ? C.dim : C.text));
+  };
+  col('THE GAME', 60, [
+    ['Flip two cards to find a pair.'],
+    ['A pair stays up and glows.'],
+    ['Not a pair? They turn back'],
+    ['after a moment, or tap to hurry.'],
+    ['Find every pair to finish.'],
+    ['Fewer moves is better.', 1],
+  ]);
+  col('RELAXING EXTRAS', 370, [
+    ['Peek: see every card for'],
+    ['3 seconds at the start.'],
+    ['Timer: a clock that never'],
+    ['runs out (off by default).'],
+    ['Size: from Tiny (6 pairs)'],
+    ['to Huge (18 pairs).', 1],
+  ]);
+  col('TWO PLAYERS', 670, [
+    ['Take turns on one device.'],
+    ['Find a pair: go again.'],
+    ['Miss: the other player goes.'],
+    ['Cyan and Pink each score'],
+    ['the pairs they find.'],
+    ['Most pairs wins.', 1],
+  ]);
+  for (let i = 0; i < ICONS.length; i++) { // the whole card set
+    const x = W / 2 + (i - (ICONS.length - 1) / 2) * 42, y = 458 + Math.sin(time * 1.2 + i * 0.6) * 3;
+    ctx.drawImage(iconSprites[i], x - 26, y - 26, 52, 52);
+  }
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 24, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the board
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.94)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  card(W / 2 - 240, 70, 480, 400);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 132, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time.', W / 2, 174, `500 15px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 236, true, 50);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 438, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawResult() {
+  overlay(Math.min(0.6, stateT * 1.5));
+  drawSparks();
+  const r = resultInfo, C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 260, 50, 520, 440);
+  if (r.players === 1) {
+    glowText(r.isBest ? 'New best!' : 'All pairs found!', W / 2, 100, `800 46px ${SANS}`, r.isBest ? C.warn : C.title);
+    text(r.perfect ? 'Perfect memory: not a single miss!' : r.word, W / 2, 142, `500 17px ${SANS}`, r.perfect ? C.good : C.dim);
+    text('MOVES', W / 2, 180, `800 12px ${SANS}`, C.faint);
+    text(String(r.moves), W / 2, 216, `800 46px ${MONO}`, C.text);
+    text(!r.isBest ? `Best on ${r.size.label}: ${r.best} moves` : r.prevBest ? `Your old best was ${r.prevBest} moves` : `Your first ${r.size.label} board: well done!`,
+      W / 2, 258, `600 17px ${SANS}`, C.dim);
+    if (r.timer) {
+      text(`Time ${fmtTime(r.time)}   ·   ${r.isBestTime ? 'a new best time!' : 'best ' + fmtTime(r.bestTime)}`, W / 2, 290, `500 16px ${SANS}`, r.isBestTime ? C.warn : C.faint);
+    }
+  } else {
+    const w = r.winner;
+    glowText(w >= 0 ? `${PLAYER_NAMES[w]} wins!` : "It's a tie!", W / 2, 100, `800 46px ${SANS}`, w >= 0 ? playerColor(w) : C.title);
+    text('Well played, both of you.', W / 2, 142, `500 17px ${SANS}`, C.dim);
+    for (let p = 0; p < 2; p++) {
+      const x = W / 2 + (p ? 100 : -100);
+      text(PLAYER_NAMES[p].toUpperCase(), x, 182, `800 14px ${SANS}`, playerColor(p));
+      text(String(r.scores[p]), x, 220, `800 46px ${MONO}`, C.text);
+    }
+    text(`${r.pairs} pairs in ${r.moves} moves${r.timer ? '   ·   ' + fmtTime(r.time) : ''}`, W / 2, 268, `500 16px ${SANS}`, C.faint);
+  }
+  drawMenu(resultItems(), 360, stateT > 0.8);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 14px ${SANS}`;
+  const y = state === 'play' ? H - 21 : H - 52, w = ctx.measureText(toast.text).width + 32;
+  rrPath(W / 2 - w / 2, y - 14, w, 28, 14);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  text(toast.text, W / 2, y, `600 14px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'result') drawResult();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

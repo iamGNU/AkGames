@@ -1,0 +1,1877 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Solitaire</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const CW = 88, CH = 124;                 // card size
+const GAP = 14, COLW = CW + GAP;         // space between columns
+const TX = 24;                           // left edge of the first column
+const TOPY = 16, TABY = 156;             // top row (deck, foundations) and the table row
+const TAB_BOTTOM = 532;                  // long columns squeeze together to stay above this line
+const PADS = 7;                          // glow margin around card sprites
+const PX = 748, PW = 196;                // right-hand panel
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  downGap: 14, upGap: 30,              // how far apart cards sit in a column (face down / face up)
+  fanGap: 24,                          // Draw 3: how far the drawn cards fan out
+  dragStart: 7, dragStartTouch: 11,    // pixels a press must move before it becomes a drag
+  doubleTap: 0.35,                     // a second click this soon after a card moved is part of a double-click
+  hintTime: 6,                         // seconds a hint glows
+  stuckDelay: 1.2,                     // pause before the "no more moves" card
+  glide: 13, follow: 36, hover: 18,    // card smoothing rates (higher = snappier)
+  dealStep: 0.04, finishStep: 0.1,     // seconds between cards when dealing / finishing
+  color: {
+    text: '#e8f0ff', dim: '#8d9ac6', faint: '#5e6894', title: '#ff7a93', accent: '#8fd8ff', good: '#7dffc0', warn: '#ffd88a',
+  },
+};
+const SUITS = [
+  { name: 'Spades', red: false }, { name: 'Hearts', red: true },
+  { name: 'Diamonds', red: true }, { name: 'Clubs', red: false },
+];
+// Suit colours: red and icy white-blue, or one colour per suit (warm suits stay warm, cool stay cool)
+const SUIT_COLORS = {
+  2: ['#cfe2ff', '#ff6b8a', '#ff6b8a', '#cfe2ff'],
+  4: ['#dfe9ff', '#ff5f7e', '#ffb84d', '#5cf0a0'],
+};
+const RANKS = ['', 'A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+const RANK_NAMES = ['', 'Ace', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'Jack', 'Queen', 'King'];
+const NOTES = [261.63, 293.66, 329.63, 392, 440, 523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51]; // C major pentatonic
+const STOCK = 0, WASTE = 1, F0 = 2, T0 = 6, NPILES = 13;   // pile numbers: deck, drawn cards, 4 foundations, 7 columns
+const TOP_ROW = [STOCK, WASTE, F0, F0 + 1, F0 + 2, F0 + 3];
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+function fmtTime(s) {
+  s = Math.max(0, Math.floor(s));
+  const h = (s / 3600) | 0, m = ((s % 3600) / 60) | 0, x = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${x}` : `${m}:${x}`;
+}
+const isFound = p => p >= F0 && p < F0 + 4;
+const isTab = p => p >= T0 && p < T0 + 7;
+const pileCol = p => (p === STOCK ? 0 : p === WASTE ? 1 : isFound(p) ? p - F0 + 3 : p - T0);
+const colX = i => TX + i * COLW;
+const pileX = p => colX(pileCol(p));
+const pileY = p => (isTab(p) ? TABY : TOPY);
+const topAbove = col => (col === 0 ? STOCK : col <= 2 ? WASTE : F0 + col - 3);
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas + art (cards, table and background are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, tableCanvas = null, backSprite = null, shadowSprite = null;
+let faceSprites = [], dotSprites = [];
+const DOT_COLS = ['#ffffff', CFG.color.title, CFG.color.accent, '#a68bff', CFG.color.good, CFG.color.warn];
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+// Suit shapes as vector paths, centred on (x, y), about 2r tall
+function suitPath(g, s, x, y, r) {
+  g.beginPath();
+  if (s === 1) { // heart
+    g.moveTo(x, y + r);
+    g.bezierCurveTo(x - r * 0.25, y + r * 0.7, x - r * 1.05, y + r * 0.2, x - r * 1.02, y - r * 0.32);
+    g.bezierCurveTo(x - r, y - r * 0.9, x - r * 0.28, y - r * 1.08, x, y - r * 0.5);
+    g.bezierCurveTo(x + r * 0.28, y - r * 1.08, x + r, y - r * 0.9, x + r * 1.02, y - r * 0.32);
+    g.bezierCurveTo(x + r * 1.05, y + r * 0.2, x + r * 0.25, y + r * 0.7, x, y + r);
+    g.closePath();
+  } else if (s === 2) { // diamond with softly curved sides
+    g.moveTo(x, y - r * 1.12);
+    g.quadraticCurveTo(x + r * 0.3, y - r * 0.4, x + r * 0.82, y);
+    g.quadraticCurveTo(x + r * 0.3, y + r * 0.4, x, y + r * 1.12);
+    g.quadraticCurveTo(x - r * 0.3, y + r * 0.4, x - r * 0.82, y);
+    g.quadraticCurveTo(x - r * 0.3, y - r * 0.4, x, y - r * 1.12);
+    g.closePath();
+  } else if (s === 0) { // spade: an upside-down heart on a little stem
+    g.moveTo(x, y - r * 1.05);
+    g.bezierCurveTo(x + r * 0.25, y - r * 0.7, x + r * 1.05, y - r * 0.25, x + r * 1.02, y + r * 0.22);
+    g.bezierCurveTo(x + r, y + r * 0.72, x + r * 0.32, y + r * 0.86, x, y + r * 0.38);
+    g.bezierCurveTo(x - r * 0.32, y + r * 0.86, x - r, y + r * 0.72, x - r * 1.02, y + r * 0.22);
+    g.bezierCurveTo(x - r * 1.05, y - r * 0.25, x - r * 0.25, y - r * 0.7, x, y - r * 1.05);
+    g.closePath();
+    g.moveTo(x, y + r * 0.2); g.lineTo(x + r * 0.4, y + r * 1.08); g.lineTo(x - r * 0.4, y + r * 1.08); g.closePath();
+  } else { // club: three round leaves on a stem
+    for (const [dx, dy] of [[0, -0.5], [-0.52, 0.12], [0.52, 0.12]]) {
+      g.moveTo(x + dx * r + r * 0.44, y + dy * r);
+      g.arc(x + dx * r, y + dy * r, r * 0.44, 0, TAU);
+    }
+    g.moveTo(x + r * 0.3, y); g.arc(x, y, r * 0.3, 0, TAU);
+    g.moveTo(x, y + r * 0.05); g.lineTo(x + r * 0.38, y + r * 1.08); g.lineTo(x - r * 0.38, y + r * 1.08); g.closePath();
+  }
+}
+
+function suitShape(g, s, x, y, r, col) {
+  suitPath(g, s, x, y, r);
+  g.lineJoin = 'round'; g.strokeStyle = col;
+  g.globalAlpha = 0.22; g.lineWidth = Math.max(3, r * 0.5); g.stroke();
+  g.globalAlpha = 1; g.fillStyle = col; g.fill();
+}
+
+function cardEdge(g, col, a = 1) {
+  g.lineJoin = 'round'; g.strokeStyle = col;
+  g.globalAlpha = 0.13 * a; g.lineWidth = 8; g.stroke();
+  g.globalAlpha = 0.3 * a; g.lineWidth = 4; g.stroke();
+  g.globalAlpha = 0.95 * a; g.lineWidth = 1.6; g.stroke();
+  g.globalAlpha = 1;
+}
+
+let colors = load('neonSolitaire.colors', '2') === '4' ? 4 : 2;
+
+function drawFace(id) {
+  const s = (id / 13) | 0, r = (id % 13) + 1, col = SUIT_COLORS[colors][s];
+  const { c, g } = layer(CW + PADS * 2, CH + PADS * 2);
+  g.translate(PADS, PADS);
+  rr(g, 0, 0, CW, CH, 9);
+  const body = g.createLinearGradient(0, 0, 0, CH);
+  body.addColorStop(0, '#1b2347'); body.addColorStop(1, '#0d1230');
+  g.fillStyle = body; g.fill();
+  cardEdge(g, col);
+  // Corner: rank on the left, suit on the right, both readable when the card is mostly covered
+  const label = RANKS[r];
+  g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+  g.font = `800 ${label.length > 1 ? 23 : 25}px ${SANS}`;
+  g.lineJoin = 'round'; g.strokeStyle = col; g.globalAlpha = 0.25; g.lineWidth = 5; g.strokeText(label, 8, 25);
+  g.globalAlpha = 1; g.fillStyle = col; g.fillText(label, 8, 25);
+  suitShape(g, s, CW - 17, 15, 9, col);
+  const cx = CW / 2, cy = CH * 0.6;
+  if (r === 1) {          // Ace: a large suit inside a glowing ring
+    g.beginPath(); g.arc(cx, cy, 31, 0, TAU);
+    g.strokeStyle = col; g.globalAlpha = 0.16; g.lineWidth = 8; g.stroke();
+    g.globalAlpha = 0.7; g.lineWidth = 1.5; g.stroke(); g.globalAlpha = 1;
+    suitShape(g, s, cx, cy, 19, col);
+  } else if (r > 10) {    // Jack, Queen, King: a framed letter
+    rr(g, 9, 34, CW - 18, CH - 43, 7);
+    g.strokeStyle = col; g.globalAlpha = 0.18; g.lineWidth = 5; g.stroke();
+    g.globalAlpha = 0.6; g.lineWidth = 1.2; g.stroke(); g.globalAlpha = 1;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.font = `800 40px ${SANS}`;
+    g.globalAlpha = 0.25; g.lineWidth = 6; g.strokeText(label, cx, cy - 4);
+    g.globalAlpha = 1; g.fillText(label, cx, cy - 4);
+    suitShape(g, s, cx, CH - 24, 7, col);
+  } else {
+    suitShape(g, s, cx, cy, 22, col);
+  }
+  return c;
+}
+
+function drawBack() {
+  const { c, g } = layer(CW + PADS * 2, CH + PADS * 2);
+  g.translate(PADS, PADS);
+  rr(g, 0, 0, CW, CH, 9);
+  const body = g.createLinearGradient(0, 0, CW, CH);
+  body.addColorStop(0, '#2a1660'); body.addColorStop(1, '#0d1b42');
+  g.fillStyle = body; g.fill();
+  cardEdge(g, '#b48cff', 0.85);
+  // A soft neon lattice inside an inset frame
+  g.save();
+  rr(g, 7, 7, CW - 14, CH - 14, 6); g.clip();
+  g.strokeStyle = 'rgba(180,140,255,0.2)'; g.lineWidth = 1;
+  g.beginPath();
+  for (let k = -CH; k < CW + CH; k += 11) { g.moveTo(k, 0); g.lineTo(k + CH, CH); g.moveTo(k, CH); g.lineTo(k + CH, 0); }
+  g.stroke();
+  g.restore();
+  rr(g, 7, 7, CW - 14, CH - 14, 6); g.strokeStyle = 'rgba(180,140,255,0.55)'; g.lineWidth = 1.2; g.stroke();
+  // Centre: a teal ring with a four-point spark
+  const cx = CW / 2, cy = CH / 2;
+  g.beginPath(); g.arc(cx, cy, 19, 0, TAU); g.fillStyle = 'rgba(12,16,44,0.92)'; g.fill();
+  g.strokeStyle = '#4fe3ff'; g.globalAlpha = 0.25; g.lineWidth = 7; g.stroke();
+  g.globalAlpha = 1; g.lineWidth = 1.8; g.stroke();
+  g.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 4, d = i % 2 ? 3.2 : 12;
+    if (i) g.lineTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d); else g.moveTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d);
+  }
+  g.closePath(); g.fillStyle = '#c9f6ff'; g.fill();
+  return c;
+}
+
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+function slot(g, p) {
+  const x = pileX(p), y = pileY(p);
+  rr(g, x, y, CW, CH, 9);
+  g.fillStyle = 'rgba(120,150,255,0.05)'; g.fill();
+  g.setLineDash([7, 6]); g.strokeStyle = 'rgba(143,170,255,0.32)'; g.lineWidth = 1.5; g.stroke(); g.setLineDash([]);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = 'rgba(143,170,255,0.2)'; g.strokeStyle = 'rgba(143,170,255,0.3)';
+  const cx = x + CW / 2, cy = y + CH / 2;
+  if (p === STOCK) { // a circular arrow: tap here to turn the deck over
+    g.lineWidth = 3; g.lineCap = 'round';
+    g.beginPath(); g.arc(cx, cy, 17, -Math.PI * 0.35, Math.PI * 1.35); g.stroke();
+    const a = -Math.PI * 0.35, ex = cx + Math.cos(a) * 17, ey = cy + Math.sin(a) * 17;
+    g.beginPath(); g.moveTo(ex + 7, ey - 3); g.lineTo(ex, ey); g.lineTo(ex + 1, ey + 8); g.stroke();
+    g.lineCap = 'butt';
+  } else {
+    g.font = `800 34px ${SANS}`;
+    g.fillText(isFound(p) ? 'A' : isTab(p) ? 'K' : '', cx, cy);
+  }
+}
+
+function buildFaces() {
+  faceSprites = [];
+  for (let id = 0; id < 52; id++) faceSprites.push(drawFace(id));
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  let L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[140, 110, 300, '#3a5cff', 0.1], [830, 440, 320, '#a64dff', 0.08], [880, 70, 220, '#ff4f7a', 0.05], [80, 480, 240, '#20c0d0', 0.05]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  // Table: a dark rounded panel with dashed slots for every pile
+  L = layer(W, H); g = L.g;
+  rr(g, 10, 6, 728, 528, 18);
+  g.fillStyle = 'rgba(9,12,30,0.55)'; g.fill();
+  g.strokeStyle = hexA(CFG.color.title, 0.16); g.lineWidth = 1.2; g.stroke();
+  for (let p = 0; p < NPILES; p++) if (p !== WASTE) slot(g, p);
+  tableCanvas = L.c;
+  // A soft shadow under lifted cards (blurred once here, never per frame)
+  L = layer(CW + 40, CH + 40); g = L.g;
+  g.shadowColor = 'rgba(0,0,0,0.75)'; g.shadowBlur = 14;
+  rr(g, 20, 20, CW, CH, 10); g.fillStyle = 'rgba(0,0,0,0.5)'; g.fill();
+  shadowSprite = L.c;
+  backSprite = drawBack();
+  buildFaces();
+  dotSprites = DOT_COLS.map(drawDot);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine notes only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) { // a soft airy swish
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.2, delay);
+  },
+  place()   { if (this.ok('place', 0.04)) { this.tone(392, 330, 0.12, 'sine', 0.05); this.tone(784, 784, 0.06, 'sine', 0.012); } },
+  found(r)  { if (this.ok('found', 0.05)) this.bell(NOTES[clamp(r - 1, 0, NOTES.length - 1)] * 2, 0.06, 0, 0.6); },
+  flip()    { if (this.ok('flip', 0.05)) this.tone(880, 990, 0.07, 'sine', 0.022, 0.08); },
+  draw()    { if (this.ok('draw', 0.05)) { this.noise(0.12, 0.018, 1800); this.tone(520, 620, 0.08, 'sine', 0.028); } },
+  recycle() { if (this.ok('recycle', 0.2)) { this.noise(0.35, 0.022, 1200); this.tone(330, 494, 0.3, 'sine', 0.032); } },
+  deal()    { if (this.ok('deal', 0.035)) this.tone(700, 640, 0.05, 'sine', 0.016); },
+  grab()    { if (this.ok('grab', 0.04)) this.tone(660, 740, 0.09, 'sine', 0.04); },
+  drop()    { if (this.ok('grab', 0.04)) this.tone(600, 520, 0.09, 'sine', 0.035); },
+  nope()    { if (this.ok('nope', 0.1)) { this.tone(392, 392, 0.14, 'sine', 0.035, 0.02); this.tone(330, 330, 0.2, 'sine', 0.03, 0.14); } },
+  undo()    { if (this.ok('undo', 0.05)) this.tone(587, 440, 0.16, 'sine', 0.04); },
+  hint()    { if (this.ok('hint', 0.2)) { this.bell(659.25, 0.04, 0, 0.5); this.bell(880, 0.03, 0.1, 0.5); } },
+  soft()    { if (this.ok('soft', 0.5)) { this.tone(440, 440, 0.5, 'sine', 0.03); this.tone(392, 392, 0.7, 'sine', 0.028, 0.25); } },
+  win()     { if (this.ok('win', 1)) [523.25, 659.25, 783.99, 1046.5, 1318.51].forEach((f, i) => this.bell(f, 0.04, i * 0.18, 1.6)); },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select()  { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()    { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, pause: false, mute: false, select: false, back: false,
+  draw: false, hint: false, undo: false, auto: false, deal: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+      if (!m.down && e.pointerType === 'mouse' && this.device !== 'pad') this.device = 'mouse';
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let act = P.has('Space') || P.has('Enter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let draw = P.has('KeyD'), hint = P.has('KeyH'), undo = P.has('KeyU') || P.has('KeyZ');
+    let auto = P.has('KeyF'), deal = P.has('KeyN');
+    let up = K.has('ArrowUp'), down = K.has('ArrowDown'), left = K.has('ArrowLeft'), right = K.has('ArrowRight');
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) act = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      if (tap(2)) draw = true;
+      if (tap(3)) hint = true;
+      if (tap(4)) undo = true;
+      if (tap(5)) auto = true;
+      // D-pad or left stick as a cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.draw = draw; this.hint = hint; this.undo = undo; this.auto = auto; this.deal = deal;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', x: '□', y: '△', lb: 'L1', rb: 'R1', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', x: 'X', y: 'Y', lb: 'LB', rb: 'RB', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let drawMode = load('neonSolitaire.draw', '1') === '3' ? 3 : 1;
+let showClock = load('neonSolitaire.clock', '0') === '1';
+const stats = {
+  won: { 1: Number(load('neonSolitaire.won1', 0)) || 0, 3: Number(load('neonSolitaire.won3', 0)) || 0 },
+  best: { 1: Number(load('neonSolitaire.best1', 0)) || 0, 3: Number(load('neonSolitaire.best3', 0)) || 0 },
+};
+Sfx.muted = load('neonSolitaire.muted', '0') === '1';
+const toast = { text: '', t: 0 };
+
+function showToast(text, t = 2.2) { toast.text = text; toast.t = t; }
+function saveStats() {
+  save('neonSolitaire.won1', stats.won[1]); save('neonSolitaire.won3', stats.won[3]);
+  save('neonSolitaire.best1', stats.best[1]); save('neonSolitaire.best3', stats.best[3]);
+}
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = 'play'; setState('paused'); G.held = null; G.press = null; Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { G.held = null; G.press = null; clearFx(); setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonSolitaire.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function setDraw(n) { drawMode = n; save('neonSolitaire.draw', n); }
+function setColors(n) { colors = n; save('neonSolitaire.colors', n); buildFaces(); }
+function setClock(v) { showClock = v; save('neonSolitaire.clock', v ? 1 : 0); }
+
+// ============================================================
+// 2. Cards, piles and the rules
+// ============================================================
+// cards[id]: id = suit * 13 + rank - 1. x/y is where it is drawn, lx/ly its place on the table, tx/ty where it is heading.
+const cards = [];
+for (let id = 0; id < 52; id++) {
+  const suit = (id / 13) | 0;
+  cards.push({ id, suit, rank: (id % 13) + 1, red: SUITS[suit].red, up: false,
+    x: colX(0), y: TOPY, lx: colX(0), ly: TOPY, tx: colX(0), ty: TOPY, z: 0, flip: 0, wait: 0, drift: false, held: false, spark: false });
+}
+// PILES: 0 deck (stock), 1 drawn cards (waste), 2..5 foundations, 6..12 the seven columns. Last item = top card.
+const PILES = [];
+for (let i = 0; i < NPILES; i++) PILES.push([]);
+
+const topOf = (p, S = PILES) => { const a = S[p]; return a[a.length - 1]; };
+const cardName = c => `${RANK_NAMES[c.rank]} of ${SUITS[c.suit].name}`;
+
+function canFoundation(c, p, S = PILES) {
+  const a = S[p];
+  if (!a.length) return c.rank === 1;
+  const t = a[a.length - 1];
+  return t.suit === c.suit && c.rank === t.rank + 1;
+}
+function canTableau(c, p, S = PILES) {
+  const a = S[p];
+  if (!a.length) return c.rank === 13;
+  const t = a[a.length - 1];
+  return t.up && t.red !== c.red && c.rank === t.rank - 1;
+}
+function canDrop(list, p, S = PILES) {
+  if (!list.length) return false;
+  if (isFound(p)) return list.length === 1 && canFoundation(list[0], p, S);
+  if (isTab(p)) return canTableau(list[0], p, S);
+  return false;
+}
+// Face-up cards from idx to the top, each one lower and the other colour
+function isRun(p, idx, S = PILES) {
+  const a = S[p];
+  if (idx < 0 || idx >= a.length) return false;
+  for (let i = idx; i < a.length; i++) {
+    const c = a[i];
+    if (!c.up) return false;
+    if (i > idx) { const b = a[i - 1]; if (b.red === c.red || b.rank !== c.rank + 1) return false; }
+  }
+  return true;
+}
+function canPick(p, idx, S = PILES) {
+  const a = S[p];
+  if (p === STOCK || idx < 0 || idx >= a.length) return false;
+  if (p === WASTE || isFound(p)) return idx === a.length - 1;
+  return isRun(p, idx, S);
+}
+function legal(src, idx, dest, S = PILES) { return src !== dest && canPick(src, idx, S) && canDrop(S[src].slice(idx), dest, S); }
+function firstUp(p, S = PILES) { const a = S[p]; let i = 0; while (i < a.length && !a[i].up) i++; return i; }
+function maxDepth(p) {
+  const a = PILES[p];
+  if (!isTab(p) || !a.length) return 0;
+  return a.length - 1 - Math.min(firstUp(p), a.length - 1);
+}
+function isWon(S = PILES) { for (let f = F0; f < F0 + 4; f++) if (S[f].length !== 13) return false; return true; }
+
+// Every card that can become the top drawn card by drawing alone (nothing else changing)
+function reachable(S = PILES, draw = G.draw) {
+  const out = new Set(), s = S[STOCK].slice(), w = S[WASTE].slice();
+  if (w.length) out.add(w[w.length - 1]);
+  if (draw === 1) { for (const c of s) out.add(c); for (const c of w) out.add(c); return [...out]; }
+  const n = s.length + w.length;
+  let ss = s, ww = w;
+  for (let step = 0; step < 2 * (n + 2); step++) {
+    if (!ss.length) { if (!ww.length) break; ss = ww.reverse(); ww = []; continue; }
+    for (let i = 0, k = Math.min(3, ss.length); i < k; i++) ww.push(ss.pop());
+    out.add(ww[ww.length - 1]);
+  }
+  return [...out];
+}
+
+const toFoundation = (c, S = PILES) => { for (let f = F0; f < F0 + 4; f++) if (canFoundation(c, f, S)) return f; return -1; };
+const fitsTableau = (c, S = PILES) => { for (let d = T0; d < T0 + 7; d++) if (canTableau(c, d, S)) return true; return false; };
+
+// The most helpful move right now, { kind: 'move', src, idx, dest } or { kind: 'draw' }, or null when there is none.
+// The same rules decide when the "no more moves" card appears.
+function findHint(S = PILES, draw = G.draw) {
+  let best = null, kings = null;
+  const add = (pri, src, idx, dest) => { if (!best || pri > best.pri) best = { kind: 'move', pri, src, idx, dest }; };
+  // Is a King waiting for an empty column? (one with hidden cards under it, the top drawn card, or one in the deck)
+  const kingWaiting = skip => {
+    if (kings === null) {
+      kings = [];
+      for (let t = T0; t < T0 + 7; t++) { const a = S[t], f = firstUp(t, S); if (f > 0 && f < a.length && a[f].rank === 13) kings.push(t); }
+      for (const c of reachable(S, draw)) if (c.rank === 13) kings.push(-1);
+    }
+    return kings.some(t => t !== skip);
+  };
+  const w = topOf(WASTE, S), wi = S[WASTE].length - 1;
+  if (w) {
+    const f = toFoundation(w, S);
+    if (f >= 0) add(100, WASTE, wi, f);
+    for (let d = T0; d < T0 + 7; d++) if (canTableau(w, d, S)) add(S[d].length ? 60 : 58, WASTE, wi, d);
+  }
+  for (let t = T0; t < T0 + 7; t++) {
+    const a = S[t];
+    if (!a.length) continue;
+    const top = a[a.length - 1], fu = firstUp(t, S);
+    if (top.up) { const f = toFoundation(top, S); if (f >= 0) add(a.length - 1 === fu && fu > 0 ? 105 : 100, t, a.length - 1, f); }
+    for (let i = fu; i < a.length; i++) {
+      if (!canPick(t, i, S)) continue;
+      const lead = a[i];
+      for (let d = T0; d < T0 + 7; d++) {
+        if (d === t || !canTableau(lead, d, S)) continue;
+        if (i > 0 && !a[i - 1].up) add(80 + fu, t, i, d);                          // turns a hidden card over
+        else if (i > 0 && toFoundation(a[i - 1], S) >= 0) add(70, t, i, d);       // frees a card to go up
+        else if (i > 0 && w && w.red !== a[i - 1].red && w.rank === a[i - 1].rank - 1) add(40, t, i, d); // makes room for the drawn card
+        else if (i === 0 && S[d].length && lead.rank !== 13 && kingWaiting(t)) add(50, t, i, d); // clears a column for a King
+      }
+    }
+  }
+  if (best) return best;
+  if (S[STOCK].length || S[WASTE].length) {
+    for (const c of reachable(S, draw)) if (c !== w && (toFoundation(c, S) >= 0 || fitsTableau(c, S))) return { kind: 'draw', pri: 20 };
+  }
+  return null;
+}
+
+// Where a tap sends a card: a foundation first, then a column (one with cards before an empty one)
+function bestDest(src, idx) {
+  if (!canPick(src, idx)) return -1;
+  const list = PILES[src].slice(idx), c = list[0];
+  if (list.length === 1 && !isFound(src)) { const f = toFoundation(c); if (f >= 0) return f; }
+  let best = -1, bestScore = -1e9;
+  for (let d = T0; d < T0 + 7; d++) {
+    if (d === src || !canTableau(c, d)) continue;
+    const empty = !PILES[d].length;
+    if (empty && isTab(src) && idx === 0) continue; // a whole column into an empty one changes nothing
+    const score = (empty ? 0 : 100) - Math.abs(pileCol(d) - pileCol(src));
+    if (score > bestScore) { bestScore = score; best = d; }
+  }
+  return best;
+}
+
+// Auto-finish: the next card to send up (lowest first), 'draw', or null
+function nextFinishMove(S = PILES) {
+  let best = null;
+  const consider = p => {
+    const a = S[p];
+    if (!a.length) return;
+    const c = a[a.length - 1], f = toFoundation(c, S);
+    if (f >= 0 && (!best || c.rank < best.rank)) best = { src: p, idx: a.length - 1, dest: f, rank: c.rank };
+  };
+  consider(WASTE);
+  for (let t = T0; t < T0 + 7; t++) consider(t);
+  if (best) return best;
+  return S[STOCK].length || S[WASTE].length ? 'draw' : null;
+}
+function rawDraw(S, draw) {
+  const s = S[STOCK], w = S[WASTE];
+  if (!s.length) { while (w.length) s.push(w.pop()); return; }
+  for (let i = 0, n = Math.min(draw, s.length); i < n; i++) w.push(s.pop());
+}
+// Plays the finish on a copy, so auto-finish only starts when it will work
+function simulateFinish(S, draw) {
+  S = S.map(a => a.slice());
+  let idle = 0;
+  for (let guard = 0; guard < 3000; guard++) {
+    if (isWon(S)) return true;
+    const m = nextFinishMove(S);
+    if (!m) return false;
+    if (m === 'draw') { if (++idle > S[STOCK].length + S[WASTE].length + 3) return false; rawDraw(S, draw); }
+    else { S[m.dest].push(...S[m.src].splice(m.idx)); idle = 0; }
+  }
+  return false;
+}
+function canAutoFinish() {
+  if (PILES[STOCK].length || isWon()) return false;
+  for (let t = T0; t < T0 + 7; t++) for (const c of PILES[t]) if (!c.up) return false;
+  return simulateFinish(PILES, G.draw);
+}
+
+// Snapshots for undo: every pile as card ids (+64 when face up), plus the counters
+function encode() { return PILES.map(a => a.map(c => c.id + (c.up ? 64 : 0)).join(',')).join('|'); }
+function snapshot() { return { s: encode(), moves: G.moves, time: G.time, order: G.order, draw: G.draw }; }
+function restore(snap) {
+  const parts = snap.s.split('|');
+  for (let p = 0; p < NPILES; p++) {
+    const a = PILES[p];
+    a.length = 0;
+    if (!parts[p]) continue;
+    for (const v of parts[p].split(',')) {
+      const n = Number(v), c = cards[n & 63], up = n >= 64;
+      if (c.up !== up) { c.up = up; c.flip = 1; }
+      c.wait = 0; c.drift = false;
+      a.push(c);
+    }
+  }
+  G.moves = snap.moves; G.time = snap.time; G.order = snap.order; G.draw = snap.draw;
+}
+
+function shuffled() {
+  const o = [];
+  for (let i = 0; i < 52; i++) o.push(i);
+  for (let i = 51; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; const t = o[i]; o[i] = o[j]; o[j] = t; }
+  return o;
+}
+
+// ============================================================
+// 3. Play
+// ============================================================
+const G = {
+  started: false, phase: 'deal', phaseT: 0, dealDur: 1, draw: 1, order: [], moves: 0, time: 0, undo: [],
+  held: null,      // cards being carried: { src, idx, by: 'pointer' | 'cursor', offX, offY }
+  press: null,     // a pointer press that becomes a tap or a drag
+  cur: { pile: T0, depth: 0 },
+  hint: null, hintT: 0, stuckPending: 0, stuckKey: '', stuckShown: '',
+  lastTap: { pile: -1, t: -9 }, shake: null, finishT: 0, drift: [], winInfo: null,
+};
+
+function dealFrom(order) {
+  for (const a of PILES) a.length = 0;
+  for (const c of cards) { c.up = false; c.flip = 0; c.drift = false; c.held = false; c.spark = false; c.wait = 0; c.x = colX(0); c.y = TOPY; }
+  let k = 0, n = 0;
+  for (let r = 0; r < 7; r++) {
+    for (let col = r; col < 7; col++) {
+      const c = cards[order[k++]];
+      PILES[T0 + col].push(c);
+      c.wait = 0.2 + n++ * CFG.dealStep;
+      if (col === r) { c.up = true; c.flip = 1; }   // the last card dealt to each column lands face up
+    }
+  }
+  while (k < 52) PILES[STOCK].push(cards[order[k++]]);
+  G.drift.length = 0;
+  Object.assign(G, {
+    started: true, order: order.slice(), moves: 0, time: 0, held: null, press: null, hint: null, hintT: 0,
+    stuckPending: 0, stuckShown: '', shake: null, phase: 'deal', phaseT: 0, dealDur: 0.2 + n * CFG.dealStep + 0.35,
+    cur: { pile: T0, depth: 0 }, lastTap: { pile: -1, t: -9 }, winInfo: null,
+  });
+}
+
+// kind: 'fresh' (from the menus), 'new' or 'restart' (both can be undone)
+function newGame(kind) {
+  Sfx.init();
+  const keep = kind !== 'fresh' && G.started && G.moves > 0 && (G.phase === 'play' || G.phase === 'deal');
+  const prev = keep ? snapshot() : null;
+  const order = kind === 'restart' && G.order.length === 52 ? G.order : shuffled();
+  if (kind === 'fresh') G.undo.length = 0;
+  if (kind !== 'restart') G.draw = drawMode;
+  clearFx();
+  dealFrom(order);
+  if (prev) {
+    G.undo.push(prev);
+    showToast(kind === 'restart' ? 'Dealt again  ·  Undo brings your game back' : 'New deal  ·  Undo brings the last one back', 2.8);
+  }
+  if (state !== 'play') setState('play');
+}
+function canContinue() { return G.started && (G.phase === 'play' || G.phase === 'deal' || G.phase === 'finish') && G.draw === drawMode; }
+function startPlay() { if (canContinue()) { setState('play'); Sfx.blip(); } else newGame('fresh'); }
+
+// After every change: clear the hint, check for a win, an auto-finish, or a stuck table
+function afterChange() {
+  G.hint = null; G.hintT = 0; G.stuckPending = 0;
+  clampCursor();
+  layout(); // keep places fresh so another input in this same frame hits the right card
+  if (G.phase !== 'play') return;
+  if (isWon()) { startCelebrate(); return; }
+  if (canAutoFinish()) {
+    G.phase = 'finish'; G.finishT = 0.45; G.held = null; G.press = null;
+    showToast('Every card is showing: finishing for you');
+    return;
+  }
+  if (!findHint()) { G.stuckPending = CFG.stuckDelay; G.stuckKey = encode(); }
+}
+
+function doMove(src, idx, dest) {
+  if (!legal(src, idx, dest)) return false;
+  G.undo.push(snapshot());
+  const moving = PILES[src].splice(idx);
+  PILES[dest].push(...moving);
+  for (const c of moving) c.held = false;
+  let flipped = false;
+  if (isTab(src)) { const t = topOf(src); if (t && !t.up) { t.up = true; t.flip = 1; flipped = true; } }
+  G.moves++;
+  if (isFound(dest)) { Sfx.found(moving[0].rank); moving[0].spark = true; } else Sfx.place();
+  if (flipped) Sfx.flip();
+  afterChange();
+  return true;
+}
+
+function drawStock() {
+  const s = PILES[STOCK], w = PILES[WASTE];
+  if (!s.length && !w.length) { Sfx.nope(); showToast('The deck is empty'); return false; }
+  G.undo.push(snapshot());
+  if (!s.length) { // turn the drawn cards back over into the deck, same order as before
+    let i = 0;
+    while (w.length) { const c = w.pop(); c.up = false; c.flip = 1; c.wait = Math.min(0.25, i++ * 0.01); s.push(c); }
+    Sfx.recycle();
+  } else {
+    for (let i = 0, n = Math.min(G.draw, s.length); i < n; i++) { const c = s.pop(); c.up = true; c.flip = 1; c.wait = i * 0.06; w.push(c); }
+    Sfx.draw();
+  }
+  G.moves++;
+  afterChange();
+  return true;
+}
+
+function doUndo() {
+  if (G.phase !== 'play') return false;
+  G.held = null; G.press = null;
+  const s = G.undo.pop();
+  if (!s) { showToast('Nothing to undo yet'); Sfx.nope(); return false; }
+  restore(s);
+  Sfx.undo();
+  afterChange();
+  return true;
+}
+
+function showHint() {
+  if (G.phase !== 'play') return;
+  G.held = null;
+  const h = findHint();
+  G.hint = h; G.hintT = CFG.hintTime;
+  if (!h) { showToast('No helpful moves left  ·  try Undo or a new deal', 3); Sfx.soft(); return; }
+  Sfx.hint();
+  if (h.kind === 'draw') {
+    showToast(PILES[STOCK].length ? 'Hint: draw from the deck' : 'Hint: turn the deck over and draw again', 3.5);
+    G.cur = { pile: STOCK, depth: 0 };
+    return;
+  }
+  const c = PILES[h.src][h.idx];
+  const where = isFound(h.dest) ? 'up to its foundation' : PILES[h.dest].length ? `onto the ${cardName(topOf(h.dest))}` : 'into the empty space';
+  showToast(`Hint: move the ${cardName(c)} ${where}`, 3.5);
+  G.cur = { pile: h.src, depth: isTab(h.src) ? PILES[h.src].length - 1 - h.idx : 0 };
+}
+
+function autoMove(src, idx) {
+  const d = bestDest(src, idx);
+  if (d < 0) { G.shake = { pile: src, idx, t: 0.4 }; Sfx.nope(); return false; }
+  return doMove(src, idx, d);
+}
+
+function clampCursor() {
+  const p = G.cur.pile;
+  G.cur.depth = isTab(p) ? clamp(G.cur.depth, 0, maxDepth(p)) : 0;
+}
+
+// Controller / keyboard cursor: left/right between piles, up/down for depth in a column and between rows
+function moveCursor(dx, dy) {
+  const cur = G.cur, p = cur.pile, holding = !!G.held;
+  let np = p, nd = cur.depth;
+  if (dx) {
+    np = isTab(p) ? clamp(p + dx, T0, T0 + 6) : TOP_ROW[clamp(TOP_ROW.indexOf(p) + dx, 0, 5)];
+    if (np !== p) nd = 0;
+  } else if (dy < 0) {
+    if (isTab(p)) {
+      if (!holding && nd < maxDepth(p)) nd++;
+      else { np = topAbove(pileCol(p)); nd = 0; }
+    }
+  } else if (dy > 0) {
+    if (isTab(p)) { if (!holding && nd > 0) nd--; }
+    else { np = T0 + pileCol(p); nd = 0; }
+  }
+  if (np === p && nd === cur.depth) return;
+  cur.pile = np; cur.depth = nd;
+  Sfx.tick();
+}
+
+function cursorAct() {
+  const p = G.cur.pile;
+  if (G.held) {
+    const h = G.held;
+    if (p === h.src) { G.held = null; Sfx.drop(); return; }
+    G.held = null;
+    if (legal(h.src, h.idx, p)) { doMove(h.src, h.idx, p); G.cur.depth = 0; }
+    else Sfx.nope();   // the cards glide back home
+    return;
+  }
+  if (p === STOCK) { drawStock(); return; }
+  const a = PILES[p], idx = a.length - 1 - (isTab(p) ? G.cur.depth : 0);
+  if (!a.length || !canPick(p, idx)) { Sfx.nope(); return; }
+  G.held = { src: p, idx, by: 'cursor', offX: 0, offY: 0 };
+  G.hint = null;
+  Sfx.grab();
+}
+
+// What is under a point: { pile, idx } (idx -1 = the empty part of a pile), or null
+function hitTest(x, y) {
+  if (y >= TOPY && y <= TOPY + CH) {
+    const w = PILES[WASTE];
+    if (w.length) { const c = w[w.length - 1]; if (x >= c.lx && x <= c.lx + CW) return { pile: WASTE, idx: w.length - 1 }; }
+    for (const p of TOP_ROW) {
+      const px = pileX(p);
+      if (x >= px && x <= px + CW) return { pile: p, idx: PILES[p].length - 1 };
+    }
+    return null;
+  }
+  if (y >= TABY - 6) {
+    for (let t = T0; t < T0 + 7; t++) {
+      const px = pileX(t);
+      if (x < px || x > px + CW) continue;
+      const a = PILES[t];
+      for (let i = a.length - 1; i >= 0; i--) { const c = a[i]; if (y >= c.ly && y <= c.ly + CH) return { pile: t, idx: i }; }
+      return { pile: t, idx: -1 };
+    }
+  }
+  return null;
+}
+function dropRect(p) {
+  const a = PILES[p];
+  if (!a.length) return { x: pileX(p), y: pileY(p), w: CW, h: CH };
+  const c = a[a.length - 1];
+  return { x: c.lx, y: c.ly, w: CW, h: CH };
+}
+function runRect(p, idx) {
+  const a = PILES[p];
+  if (!a.length || idx < 0) return { x: pileX(p), y: pileY(p), w: CW, h: CH };
+  const c = a[idx], t = a[a.length - 1];
+  return { x: c.lx, y: c.ly, w: CW, h: t.ly + CH - c.ly };
+}
+// A dragged pile lands on the legal pile under the pointer, else the legal pile it overlaps most
+function dropTarget(px, py) {
+  const h = G.held, hit = hitTest(px, py);
+  if (hit && hit.pile !== h.src && legal(h.src, h.idx, hit.pile)) return hit.pile;
+  const lead = PILES[h.src][h.idx];
+  let best = -1, area = CW * CH * 0.12;
+  for (let p = F0; p < NPILES; p++) {
+    if (p === h.src || !legal(h.src, h.idx, p)) continue;
+    const r = dropRect(p);
+    const ox = Math.min(lead.tx + CW, r.x + r.w) - Math.max(lead.tx, r.x);
+    const oy = Math.min(lead.ty + CH, r.y + r.h) - Math.max(lead.ty, r.y);
+    if (ox > 0 && oy > 0 && ox * oy > area) { area = ox * oy; best = p; }
+  }
+  return best;
+}
+
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const UNDO_BTN = { x: PX, y: 76, w: PW, h: 52 };
+const HINT_BTN = { x: PX, y: 138, w: PW, h: 52 };
+const DEAL_BTN = { x: PX, y: 200, w: PW, h: 52 };
+const busy = () => G.phase === 'finish' || G.phase === 'celebrate';
+
+function tableInput() {
+  const I = Input, m = I.mouse;
+  if (m.clicked) {
+    if (inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+    if (inRect(m, SOUND_BTN)) { toggleSound(); return; }
+    if (inRect(m, UNDO_BTN)) { doUndo(); return; }
+    if (inRect(m, HINT_BTN)) { showHint(); return; }
+    if (inRect(m, DEAL_BTN)) { if (!busy()) newGame('new'); return; }
+  }
+  if (I.undo) doUndo();
+  if (I.hint) showHint();
+  if (I.deal && !busy()) { newGame('new'); return; }
+  if (G.phase !== 'play') { G.press = null; return; }
+
+  const pointerHeld = G.held && G.held.by === 'pointer';
+  if (!pointerHeld) {
+    // Controller and keyboard
+    if (I.draw) { G.held = null; drawStock(); }
+    const dy = I.navUp ? -1 : I.navDown ? 1 : 0, dx = dy ? 0 : I.navLeft ? -1 : I.navRight ? 1 : 0;
+    if (dx || dy) { moveCursor(dx, dy); G.hint = null; }
+    if (I.act) cursorAct();
+    if (I.back && G.held) { G.held = null; Sfx.drop(); }
+    if (I.auto) {
+      const h = G.held, p = h ? h.src : G.cur.pile;
+      G.held = null;
+      if (p === STOCK) drawStock();
+      else {
+        const a = PILES[p], idx = h ? h.idx : a.length - 1 - (isTab(p) ? G.cur.depth : 0);
+        if (a.length && canPick(p, idx)) autoMove(p, idx); else Sfx.nope();
+      }
+    }
+  } else if (I.back) { G.held = null; Sfx.drop(); }
+
+  // Mouse and touch: press, then either drag or tap
+  if (m.clicked) {
+    if (G.held && G.held.by === 'cursor') G.held = null;
+    G.press = null; G.hint = null;
+    const hit = hitTest(m.x, m.y);
+    if (hit) {
+      if (hit.pile === STOCK) G.press = { pile: STOCK, idx: -1, x: m.x, y: m.y, offX: 0, offY: 0 };
+      else if (hit.idx >= 0 && canPick(hit.pile, hit.idx)) {
+        const c = PILES[hit.pile][hit.idx];
+        G.press = { pile: hit.pile, idx: hit.idx, x: m.x, y: m.y, offX: m.x - c.lx, offY: m.y - c.ly };
+      }
+      G.cur = { pile: hit.pile, depth: isTab(hit.pile) && hit.idx >= 0 ? PILES[hit.pile].length - 1 - hit.idx : 0 };
+      clampCursor();
+    }
+  }
+  const pr = G.press;
+  if (pr && pr.pile !== STOCK && m.down && !G.held) {
+    const lim = m.type === 'touch' ? CFG.dragStartTouch : CFG.dragStart;
+    if (Math.hypot(m.x - pr.x, m.y - pr.y) > lim) {
+      G.held = { src: pr.pile, idx: pr.idx, by: 'pointer', offX: pr.offX, offY: pr.offY };
+      Sfx.grab();
+    }
+  }
+  if (m.released) {
+    G.press = null;
+    if (G.held && G.held.by === 'pointer') {
+      const h = G.held, d = dropTarget(m.x, m.y);
+      G.held = null;
+      if (d >= 0) doMove(h.src, h.idx, d);
+      else { const over = hitTest(m.x, m.y); if (over && over.pile !== h.src) Sfx.nope(); else Sfx.drop(); }
+    } else if (pr) {
+      if (pr.pile === STOCK) drawStock();
+      else if (G.lastTap.pile === pr.pile && time - G.lastTap.t < CFG.doubleTap) { /* the second click of a double-click */ }
+      else {
+        const ok = autoMove(pr.pile, pr.idx);
+        G.lastTap = ok ? { pile: pr.pile, t: time } : { pile: -1, t: -9 };
+      }
+    }
+  } else if (G.held && G.held.by === 'pointer' && !m.down) { G.held = null; G.press = null; } // pointer lost (window blur)
+}
+
+function startCelebrate() {
+  G.phase = 'celebrate'; G.phaseT = 0; G.held = null; G.press = null; G.hint = null; G.stuckPending = 0;
+  G.undo.length = 0;
+  const key = G.draw === 3 ? 3 : 1, t = Math.max(1, Math.round(G.time));
+  const isBest = !stats.best[key] || t < stats.best[key];
+  stats.won[key]++;
+  if (isBest) stats.best[key] = t;
+  saveStats();
+  G.winInfo = { time: t, moves: G.moves, draw: key, isBest, best: stats.best[key], won: stats.won[1] + stats.won[3] };
+  // Cards leave the foundations one by one (Kings first) and float softly upward
+  G.drift.length = 0;
+  let i = 0;
+  for (let r = 13; r >= 1; r--) {
+    for (let f = 0; f < 4; f++) {
+      const c = PILES[F0 + f].find(x => x.rank === r);
+      if (!c) continue;
+      G.drift.push({ c, x: c.x, y: c.y, vx: rand(-150, 150), vy: rand(60, 140), rot: 0, vr: rand(-0.5, 0.5), ph: rand(0, TAU), t: 0, wait: 0.3 + i++ * 0.07, a: 1 });
+    }
+  }
+  Sfx.win();
+}
+
+function finishStep() {
+  const mv = nextFinishMove();
+  if (mv === 'draw') { drawStock(); return; }
+  if (!mv) { G.phase = 'play'; return; }
+  doMove(mv.src, mv.idx, mv.dest);
+  if (isWon()) startCelebrate();
+}
+
+function updatePlay(dt) {
+  tableInput();
+  if (state !== 'play') return; // paused from the on-screen button
+  G.phaseT += dt;
+  if (G.phase === 'play' && G.moves > 0) G.time += dt;
+  if (G.phase === 'deal' && G.phaseT >= G.dealDur) { G.phase = 'play'; G.phaseT = 0; afterChange(); }
+  if (G.phase === 'finish') { G.finishT -= dt; if (G.finishT <= 0) { G.finishT = CFG.finishStep; finishStep(); } }
+  if (G.phase === 'celebrate' && G.phaseT > 2.4) { G.phase = 'done'; setState('win'); }
+  if (G.hintT > 0) { G.hintT -= dt; if (G.hintT <= 0) G.hint = null; }
+  if (G.shake) { G.shake.t -= dt; if (G.shake.t <= 0) G.shake = null; }
+  if (G.stuckPending > 0) {
+    G.stuckPending -= dt;
+    if (G.stuckPending <= 0 && G.phase === 'play' && !G.held) {
+      const key = encode();
+      if (key === G.stuckKey && G.stuckShown !== key) { G.stuckShown = key; setState('stuck'); Sfx.soft(); }
+    }
+  }
+}
+
+// ============================================================
+// Card motion: every frame each card heads smoothly toward its place
+// ============================================================
+function layout() {
+  for (let p = 0; p < NPILES; p++) {
+    const a = PILES[p], n = a.length, x0 = pileX(p), y0 = pileY(p);
+    if (isTab(p)) {
+      const downs = firstUp(p), ups = n - downs;
+      let dg = CFG.downGap, ug = CFG.upGap;
+      const avail = TAB_BOTTOM - TABY - CH, steps = Math.max(1, ups - 1);
+      if (downs * dg + Math.max(0, ups - 1) * ug > avail) {
+        ug = (avail - downs * dg) / steps;
+        if (ug < 18) { dg = 7; ug = (avail - downs * dg) / steps; }
+        ug = clamp(ug, 10, CFG.upGap);
+      }
+      let y = y0;
+      for (let i = 0; i < n; i++) { const c = a[i]; c.lx = x0; c.ly = y; c.z = p * 64 + i; y += c.up ? ug : dg; }
+    } else if (p === WASTE) {
+      const fan = G.draw === 3 ? Math.min(3, n) : 1;
+      for (let i = 0; i < n; i++) { const c = a[i], k = i - (n - fan); c.lx = x0 + (k > 0 ? k * CFG.fanGap : 0); c.ly = y0; c.z = p * 64 + i; }
+    } else if (p === STOCK) {
+      for (let i = 0; i < n; i++) { const c = a[i], o = Math.min(2, (i / 8) | 0); c.lx = x0 - o; c.ly = y0 - o; c.z = p * 64 + i; }
+    } else {
+      for (let i = 0; i < n; i++) { const c = a[i]; c.lx = x0; c.ly = y0; c.z = p * 64 + i; }
+    }
+    for (let i = 0; i < n; i++) { const c = a[i]; c.tx = c.lx; c.ty = c.ly; c.held = false; }
+  }
+  const h = G.held;
+  if (!h) return;
+  const a = PILES[h.src];
+  if (h.idx < 0 || h.idx >= a.length) { G.held = null; return; }
+  let ax, ay;
+  if (h.by === 'pointer') { ax = Input.mouse.x - h.offX; ay = Input.mouse.y - h.offY; }
+  else if (G.cur.pile === h.src) { ax = a[h.idx].lx; ay = a[h.idx].ly - 16; }
+  else {
+    const p = G.cur.pile, b = PILES[p];
+    if (!b.length) { ax = pileX(p); ay = pileY(p) - 16; }
+    else { const t = b[b.length - 1]; ax = t.lx; ay = t.ly + (isTab(p) ? CFG.upGap : 0) - 16; }
+  }
+  for (let i = h.idx; i < a.length; i++) { const c = a[i]; c.held = true; c.tx = ax; c.ty = ay + (i - h.idx) * 26; }
+}
+
+function updateCards(dt) {
+  for (const c of cards) {
+    if (c.drift) continue;
+    if (c.wait > 0) { c.wait -= dt; if (c.wait <= 0 && G.phase === 'deal') Sfx.deal(); continue; }
+    const k = c.held ? (G.held && G.held.by === 'pointer' ? CFG.follow : CFG.hover) : CFG.glide;
+    const f = 1 - Math.exp(-k * dt);
+    c.x += (c.tx - c.x) * f; c.y += (c.ty - c.y) * f;
+    if (Math.abs(c.tx - c.x) < 0.3 && Math.abs(c.ty - c.y) < 0.3) { c.x = c.tx; c.y = c.ty; }
+    if (c.flip > 0) c.flip = Math.max(0, c.flip - dt / 0.22);
+    if (c.spark && Math.abs(c.tx - c.x) + Math.abs(c.ty - c.y) < 6) { c.spark = false; sparkle(c); }
+  }
+}
+
+function updateDrift(dt) {
+  for (const d of G.drift) {
+    if (d.wait > 0) { d.wait -= dt; if (d.wait <= 0) d.c.drift = true; continue; }
+    d.t += dt;
+    d.vy = Math.max(d.vy - 42 * dt, -58);
+    d.x += (d.vx + Math.sin(d.t * 1.3 + d.ph) * 22) * dt;
+    if ((d.x < 8 && d.vx < 0) || (d.x > PX - CW - 20 && d.vx > 0)) d.vx = -d.vx * 0.6; // stay over the table
+    d.y += d.vy * dt;
+    d.vx *= Math.pow(0.5, dt);
+    d.rot += d.vr * dt;
+    if (d.y < -CH - 30) { // float back in from below, dimmer, like slow lanterns
+      d.y = H + rand(20, 200); d.x = rand(12, PX - CW - 24); d.vy = rand(-46, -26); d.vx = rand(-10, 10); d.a = rand(0.35, 0.6);
+    }
+  }
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 80 : 200, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(24, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 22); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: 1 + (i % 4) });
+}
+function burst(x, y, ci, n, speed, life = 0.7, size = 7) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+function sparkle(c) {
+  const x = c.tx + CW / 2, y = c.ty + CH / 2;
+  ring(x, y, 20, 70, 0.5, SUIT_COLORS[colors][c.suit], 1.6);
+  burst(x, y, 0, LOW_RES ? 4 : 9, 110, 0.6, 7);
+}
+function clearFx() { parts.clear(); rings.clear(); }
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 40 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const o of rings.items) { if (o.active) { o.life -= dt; if (o.life <= 0) o.active = false; } }
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function titleItems() {
+  const resume = canContinue();
+  return [
+    { id: 'play', label: resume ? 'Continue' : 'Play',
+      hint: resume ? `Carry on with your deal (${G.moves} moves so far).` : `A fresh deal, ${drawMode === 1 ? 'one card' : 'three cards'} at a time from the deck.` },
+    { id: 'draw', label: 'Draw', value: drawMode === 1 ? '1 card' : '3 cards', cycle: () => setDraw(drawMode === 1 ? 3 : 1),
+      hint: drawMode === 1 ? 'Draw 1: the relaxed way. Turn the deck as often as you like.' : 'Draw 3: a gentle challenge. Turn the deck as often as you like.' },
+    { id: 'suits', label: 'Suits', value: colors === 4 ? '4 colours' : '2 colours', cycle: () => setColors(colors === 4 ? 2 : 4),
+      hint: colors === 4 ? 'Every suit has its own colour: easier to tell apart.' : 'Classic red and white suits. Try 4 colours for clearer suits.' },
+    { id: 'clock', label: 'Clock', value: showClock ? 'Shown' : 'Hidden', cycle: () => setClock(!showClock),
+      hint: 'Show the time while you play. Best times are saved either way.' },
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Rules, controls and helpers.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() {
+  return [{ id: 'resume', label: 'Resume' }, { id: 'new', label: 'New deal' }, { id: 'restart', label: 'Restart this deal' }, soundItem(), { id: 'quit', label: 'Quit to menu' }];
+}
+function stuckItems() {
+  return [{ id: 'undo', label: 'Undo last move' }, { id: 'restart', label: 'Restart this deal' }, { id: 'new', label: 'New deal' }, { id: 'keep', label: 'Keep looking' }];
+}
+function winItems() { return [{ id: 'again', label: 'New deal' }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+  if (state !== 'title' && state !== 'howto') { layout(); updateCards(dt); updateDrift(dt); }
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'play') startPlay();
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 5; Sfx.blip(); }
+      break;
+    case 'play':
+      // Esc puts held cards back first; a second Esc pauses
+      if (Input.pause && !(Input.back && G.held)) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'new') newGame('new');
+      else if (id === 'restart') newGame('restart');
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'stuck': {
+      if (Input.pause || Input.back) { state = 'play'; Sfx.blip(); break; }
+      const id = menuInput(stuckItems());
+      if (id === 'undo') { state = 'play'; doUndo(); }
+      else if (id === 'restart') newGame('restart');
+      else if (id === 'new') newGame('new');
+      else if (id === 'keep') state = 'play';
+      break;
+    }
+    case 'win':
+      if (stateT > 1) {
+        const id = menuInput(winItems());
+        if (id === 'again') newGame('fresh');
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.12 + 0.09 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// One card at (x, y); a flip squeezes it sideways and swaps the face halfway through
+function drawCard(c, x, y) {
+  const p = c.flip, faceUp = p > 0.5 ? !c.up : c.up;
+  const spr = faceUp ? faceSprites[c.id] : backSprite;
+  if (p > 0) {
+    const s = Math.max(0.04, Math.abs(1 - 2 * p)), w = (CW + PADS * 2) * s;
+    ctx.drawImage(spr, x + CW / 2 - w / 2, y - PADS, w, CH + PADS * 2);
+  } else ctx.drawImage(spr, x - PADS, y - PADS, CW + PADS * 2, CH + PADS * 2);
+}
+function shakeX(p, i) {
+  const s = G.shake;
+  if (!s || s.pile !== p || i < s.idx) return 0;
+  return Math.sin(s.t * 46) * 6 * (s.t / 0.4);
+}
+
+function outline(r, color, alpha, w = 2, pad = 3) {
+  rrPath(r.x - pad, r.y - pad, r.w + pad * 2, r.h + pad * 2, 11);
+  ctx.globalAlpha = alpha; glowStroke(color, w); ctx.globalAlpha = 1;
+}
+function cursorRect() {
+  const p = G.cur.pile, a = PILES[p];
+  if (isTab(p)) return runRect(p, a.length ? a.length - 1 - G.cur.depth : -1);
+  return dropRect(p);
+}
+
+function renderMarks() {
+  const dev = Input.device, keyish = dev === 'kb' || dev === 'pad', pulse = 0.5 + 0.5 * Math.sin(time * 4);
+  const h = G.held;
+  if (h) { // legal places glow softly while cards are carried
+    for (let p = F0; p < NPILES; p++) if (p !== h.src && legal(h.src, h.idx, p)) outline(dropRect(p), CFG.color.good, 0.3 + 0.25 * pulse, 1.6, 4);
+  }
+  const hint = G.hint;
+  if (hint && G.phase === 'play' && !h) {
+    const a = 0.55 + 0.45 * Math.sin(time * 5);
+    if (hint.kind === 'draw') outline(dropRect(STOCK), CFG.color.warn, a, 2.4, 4);
+    else { outline(runRect(hint.src, hint.idx), CFG.color.warn, a, 2.4, 4); outline(dropRect(hint.dest), CFG.color.warn, a * 0.8, 2, 6); }
+  }
+  if (dev === 'mouse' && !h && G.phase === 'play' && !Input.mouse.down) {
+    const hit = hitTest(Input.mouse.x, Input.mouse.y);
+    if (hit && (hit.pile === STOCK || canPick(hit.pile, hit.idx))) outline(hit.pile === STOCK ? dropRect(STOCK) : runRect(hit.pile, hit.idx), '#ffffff', 0.35, 1.3, 3);
+  }
+  if (keyish && G.phase === 'play') {
+    if (!h) outline(cursorRect(), '#ffffff', 0.6 + 0.35 * pulse, 2.4, 4);
+  }
+}
+
+// Controller / keyboard: an outline around the carried cards, green when they can land here
+function renderHeldMark(held) {
+  const h = G.held, keyish = Input.device === 'kb' || Input.device === 'pad';
+  if (!h || h.by !== 'cursor' || !keyish || !held.length || state !== 'play') return;
+  const ok = G.cur.pile !== h.src && legal(h.src, h.idx, G.cur.pile), c0 = held[0], last = held[held.length - 1];
+  outline({ x: c0.x, y: c0.y, w: CW, h: last.y - c0.y + CH }, ok ? CFG.color.good : '#ffffff', 0.65 + 0.3 * Math.sin(time * 4), 2.4, 5);
+}
+
+function renderCards() {
+  const flying = [], held = [];
+  for (let p = 0; p < NPILES; p++) {
+    const a = PILES[p], from = isTab(p) ? 0 : Math.max(0, a.length - 4);
+    for (let i = 0; i < a.length; i++) {
+      const c = a[i];
+      if (c.drift) continue;
+      if (c.held) { held.push(c); continue; }
+      if (c.wait > 0 || Math.abs(c.x - c.tx) + Math.abs(c.y - c.ty) > 1.5) { flying.push(c); continue; }
+      if (i < from) continue; // stacked cards hidden under the top few
+      drawCard(c, c.x + shakeX(p, i), c.y);
+    }
+  }
+  flying.sort((a, b) => a.z - b.z);
+  for (const c of flying) drawCard(c, c.x, c.y);
+  return held;
+}
+
+function drawHeld(held) {
+  if (!held.length) return;
+  const c0 = held[0], last = held[held.length - 1];
+  ctx.globalAlpha = 0.8;
+  ctx.drawImage(shadowSprite, c0.x - 14, c0.y - 10, CW + 40, last.y - c0.y + CH + 40);
+  ctx.globalAlpha = 1;
+  for (const c of held) drawCard(c, c.x, c.y);
+}
+
+function drawDrift() {
+  for (const d of G.drift) {
+    if (d.wait > 0) continue;
+    const fade = clamp((d.y + CH) / 160, 0, 1);
+    ctx.globalAlpha = d.a * fade * (state === 'win' ? 0.45 : 1);
+    if (ctx.globalAlpha <= 0.01) continue;
+    ctx.save();
+    ctx.translate(d.x + CW / 2, d.y + CH / 2); ctx.rotate(d.rot);
+    ctx.drawImage(faceSprites[d.c.id], -CW / 2 - PADS, -CH / 2 - PADS, CW + PADS * 2, CH + PADS * 2);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.8;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? 'rgba(143,216,255,0.16)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.accent, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+// Big panel buttons for mouse and touch, with the matching key or button shown on the right
+function panelButton(r, label, icon, key, enabled) {
+  const hover = enabled && Input.device === 'mouse' && inRect(Input.mouse, r);
+  ctx.globalAlpha = enabled ? 1 : 0.45;
+  rrPath(r.x, r.y, r.w, r.h, 14);
+  ctx.fillStyle = hover ? 'rgba(143,216,255,0.16)' : 'rgba(20,26,52,0.62)'; ctx.fill();
+  ctx.globalAlpha *= hover ? 1 : 0.6; glowStroke(CFG.color.accent, 1.2); ctx.globalAlpha = enabled ? 1 : 0.45;
+  const cx = r.x + 28, cy = r.y + r.h / 2;
+  ctx.strokeStyle = CFG.color.text; ctx.fillStyle = CFG.color.text; ctx.lineWidth = 2.4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (icon === 'undo') {
+    ctx.beginPath(); ctx.moveTo(cx - 5, cy - 5); ctx.bezierCurveTo(cx + 11, cy - 7, cx + 12, cy + 9, cx - 3, cy + 9); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx - 11, cy - 5); ctx.lineTo(cx - 4, cy - 11); ctx.lineTo(cx - 4, cy + 1); ctx.closePath(); ctx.fill();
+  } else if (icon === 'hint') {
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = -Math.PI / 2 + i * Math.PI / 4, d = i % 2 ? 3.5 : 11;
+      if (i) ctx.lineTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d); else ctx.moveTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d);
+    }
+    ctx.closePath(); ctx.fillStyle = CFG.color.warn; ctx.fill();
+  } else {
+    ctx.lineWidth = 2;
+    rrPath(cx - 11, cy - 11, 14, 19, 3); ctx.stroke();
+    rrPath(cx - 3, cy - 7, 14, 19, 3); ctx.fillStyle = '#141a34'; ctx.fill(); ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  text(label, r.x + 54, cy + 1, `700 19px ${SANS}`, CFG.color.text);
+  if (key) { ctx.textAlign = 'right'; text(key, r.x + r.w - 14, cy + 1, `700 14px ${SANS}`, CFG.color.dim); }
+  ctx.globalAlpha = 1;
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return [`D-pad: move  ·  ${NN.a}: pick up / drop`, `${NN.x}: draw  ·  ${NN.y}: hint  ·  ${NN.lb}: undo`, `${NN.rb}: send to best spot`, `${NN.b}: cancel  ·  ${NN.start}: pause`];
+    case 'mouse': return ['Drag cards to move them', 'Click a card: best spot', 'Click the deck to draw', 'Esc or ‖ button: pause'];
+    case 'touch': return ['Drag cards to move them', 'Tap a card: best spot', 'Tap the deck to draw', '‖ button: pause'];
+    default: return ['Arrows: move  ·  Space: pick up', 'D: draw  ·  H: hint  ·  U: undo', 'F: send to best spot', 'Esc: cancel or pause'];
+  }
+}
+
+function drawPanel() {
+  const C = CFG.color, NN = padNames(), pad = Input.device === 'pad', kb = Input.device === 'kb';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  glowText(`Draw ${G.draw}`, PX + 2, 30, `800 22px ${SANS}`, C.title);
+  text(G.draw === 1 ? 'relaxed' : 'a little trickier', PX + 2, 54, `500 13px ${SANS}`, C.dim);
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  panelButton(UNDO_BTN, 'Undo', 'undo', pad ? NN.lb : kb ? 'U' : '', G.undo.length > 0 && G.phase === 'play');
+  panelButton(HINT_BTN, 'Hint', 'hint', pad ? NN.y : kb ? 'H' : '', G.phase === 'play');
+  panelButton(DEAL_BTN, 'New deal', 'deal', kb ? 'N' : '', !busy());
+  ctx.textAlign = 'left';
+  text('MOVES', PX + 4, 284, `800 12px ${SANS}`, C.faint);
+  text(String(G.moves), PX + 4, 310, `800 26px ${MONO}`, C.text);
+  if (showClock) {
+    text('TIME', PX + 104, 284, `800 12px ${SANS}`, C.faint);
+    text(fmtTime(G.time), PX + 104, 310, `800 26px ${MONO}`, C.text);
+  }
+  const won = stats.won[1] + stats.won[3], best = stats.best[G.draw];
+  text('GAMES WON', PX + 4, 352, `800 12px ${SANS}`, C.faint);
+  text(String(won), PX + 4, 376, `700 19px ${MONO}`, C.dim);
+  if (best) {
+    text('BEST TIME', PX + 104, 352, `800 12px ${SANS}`, C.faint);
+    text(fmtTime(best), PX + 104, 376, `700 19px ${MONO}`, C.dim);
+  }
+  ctx.fillStyle = 'rgba(131,144,189,0.18)'; ctx.fillRect(PX, 404, PW, 1);
+  controlLines().forEach((s, i) => text(s, PX + 2, 428 + i * 22, `500 13px ${SANS}`, i === 0 ? C.dim : C.faint));
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  ctx.drawImage(tableCanvas, 0, 0, W, H);
+  const held = renderCards();
+  drawFx();
+  if (state === 'play') renderMarks();
+  drawHeld(held);
+  renderHeldMark(held);
+  drawPanel();
+  if (state !== 'win') drawDrift();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 340, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(255,122,147,0.10)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 54, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 90, y, `700 16px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  // Cards drifting slowly behind the menu
+  for (let i = 0; i < 10; i++) {
+    const x = ((i * 131 + time * (8 + (i % 3) * 4)) % (W + 200)) - 100;
+    const y = 50 + ((i * 197) % 400) + Math.sin(time * 0.5 + i) * 14;
+    const spr = i % 4 === 0 ? backSprite : faceSprites[(i * 17 + 12) % 52];
+    ctx.globalAlpha = 0.14 + (i % 3) * 0.05;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(Math.sin(time * 0.3 + i * 1.7) * 0.3);
+    ctx.drawImage(spr, -CW / 2 - PADS, -CH / 2 - PADS, CW + PADS * 2, CH + PADS * 2);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 400);
+  shade.addColorStop(0, 'rgba(5,7,15,0.85)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON SOLITAIRE', W / 2, 70, `800 58px ${SANS}`, CFG.color.title);
+  text('calm patience, one card at a time', W / 2, 112, `500 16px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), y0 = 164, gap = 40;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap + 4, `500 15px ${SANS}`, CFG.color.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, y0 + items.length * gap + 28, `500 13px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 24, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  const best = stats.best[drawMode];
+  text(`Won ${stats.won[1] + stats.won[3]}  ·  Best (Draw ${drawMode}) ${best ? fmtTime(best) : '–'}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, CFG.color.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 36, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Move the cursor', 'D-pad / left stick', 'Arrow keys', '–'],
+    ['Pick up / put down', NN.a, 'Space or Enter', 'Drag and drop'],
+    ['Send to the best spot', NN.rb, 'F', 'Tap or double-click a card'],
+    ['Draw from the deck', NN.x, 'D', 'Tap the deck'],
+    ['Hint', NN.y, 'H', 'Hint button'],
+    ['Undo', NN.lb, 'U or Z', 'Undo button'],
+    ['Cancel / pause', `${NN.b} / ${NN.start}`, 'Esc / P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [224, 244, 424, 588];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 72, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 72, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 72, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 96 + i * 23;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 282, W - 120, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 306, `800 12px ${SANS}`, C.faint);
+    lines.forEach((s, i) => text(s, x, 332 + i * 23, `500 15px ${SANS}`, C.text));
+  };
+  col('THE AIM', 60, [
+    'Move all 52 cards up to the',
+    'four piles at the top: one per',
+    'suit, from Ace up to King.',
+    'Hidden cards turn over when',
+    'you clear what covers them.',
+  ]);
+  col('BUILDING', 330, [
+    'In the columns, put each card',
+    'on one a step higher in the',
+    'other colour (red on white).',
+    'Only a King fills a space.',
+    'Turn the deck any number',
+    'of times.',
+  ]);
+  // A tiny example run beside the building rules
+  const ex = [8, 20, 45];
+  ex.forEach((id, i) => ctx.drawImage(faceSprites[id], 560 - PADS * 0.5, 330 + i * 20 - PADS * 0.5, (CW + PADS * 2) * 0.5, (CH + PADS * 2) * 0.5));
+  col('HELPERS', 650, [
+    'Undo as often as you like.',
+    'Hint glows on a good move.',
+    'Tap a card to send it home.',
+    'Once every card is showing,',
+    'the game finishes itself.',
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 22, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the table
+function panelCard(x, y, w, h, color = CFG.color.title, solid = 0.96) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = `rgba(7,10,24,${solid})`; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(color, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  panelCard(W / 2 - 240, 60, 480, 420);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 118, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time.', W / 2, 160, `500 15px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 214, true, 48);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 448, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawStuck() {
+  overlay(Math.min(0.5, stateT * 1.5));
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  panelCard(W / 2 - 258, 80, 516, 390, CFG.color.accent);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('A quiet moment', W / 2, 134, `800 38px ${SANS}`, CFG.color.accent);
+  text('No more helpful moves turned up on this deal.', W / 2, 176, `500 16px ${SANS}`, CFG.color.text);
+  text('Undo a few steps, or try a fresh one.', W / 2, 200, `500 16px ${SANS}`, CFG.color.dim);
+  drawMenu(stuckItems(), 256, true, 48);
+  const NN = padNames();
+  text(usingPad() ? `${NN.b}: keep looking` : Input.device === 'touch' ? 'Tap an option' : 'Esc: keep looking', W / 2, 438, `500 13px ${SANS}`, CFG.color.faint);
+  ctx.globalAlpha = 1;
+}
+
+function drawWin() {
+  overlay(Math.min(0.5, stateT * 1.2));
+  drawDrift();
+  const r = G.winInfo || { time: 0, moves: 0, draw: 1, isBest: false, best: 0, won: 0 }, C = CFG.color;
+  ctx.globalAlpha = Math.min(1, stateT * 2.5);
+  panelCard(W / 2 - 240, 70, 480, 400, CFG.color.title, 1);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(r.isBest ? 'New best time!' : 'Lovely game', W / 2, 124, `800 46px ${SANS}`, r.isBest ? C.warn : C.title);
+  text('ALL 52 CARDS HOME', W / 2, 168, `800 12px ${SANS}`, C.faint);
+  text(fmtTime(r.time), W / 2, 206, `800 44px ${MONO}`, C.text);
+  text(`${r.moves} moves  ·  Draw ${r.draw}`, W / 2, 248, `600 17px ${SANS}`, C.dim);
+  text(`Best time ${fmtTime(r.best)}  ·  Games won ${r.won}`, W / 2, 276, `500 15px ${SANS}`, C.faint);
+  drawMenu(winItems(), 344, stateT > 1);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 15px ${SANS}`;
+  const inPlay = state === 'play', x = inPlay ? 374 : W / 2, y = inPlay ? H - 26 : H - 54;
+  const w = ctx.measureText(toast.text).width + 36;
+  rrPath(x - w / 2, y - 16, w, 32, 16);
+  ctx.fillStyle = 'rgba(10,14,32,0.94)'; ctx.fill();
+  ctx.globalAlpha *= 0.5; glowStroke(CFG.color.accent, 1); ctx.globalAlpha = Math.min(1, toast.t * 3);
+  text(toast.text, x, y, `600 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    else if (state === 'stuck') drawStuck();
+    else if (state === 'win') drawWin();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

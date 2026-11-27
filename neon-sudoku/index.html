@@ -1,0 +1,1823 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Sudoku</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const N = 9, NN = 81;                           // a 9 x 9 board
+const CELL = 52;                                // cell size
+const BW = N * CELL;                            // board width and height
+const BX = 226, BY = 36;                        // board top-left corner
+const BCX = BX + BW / 2, BCY = BY + BW / 2;     // board centre
+const LX = 108, RX = 832;                       // centres of the left and right panels
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  // Puzzle making. Work is cut into small steps so a frame never stalls:
+  // frameBudget ms per frame on the "preparing" screen, idleBudget ms per frame in the background.
+  gen: { frameBudget: 7, idleBudget: 2.5, maxNodes: 3000, minPrep: 0.45 },
+  saveDelay: 1.5,       // seconds after a move before the board is saved
+  saveUndo: 200,        // how many undo steps are kept in the save
+  hintMsgTime: 7,       // seconds the hint's reason stays on screen
+  anim: { pop: 0.35, glow: 2.6, flash: 0.9, intro: 0.035, ripple: 0.07, rippleCell: 0.6, winHold: 2.3 },
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', title: '#9aa5ff', good: '#7dffc0', warn: '#ffd88a',
+    given: '#e8f0ff', player: '#7fe3ff', hinted: '#ffd88a', clash: '#ff9fb0', note: '#8a96c8', noteHi: '#e4ecff', padNote: '#b8c2ff',
+  },
+};
+// Difficulty: how many numbers are given, and whether simple steps ("singles") must be enough.
+const DIFFS = ['gentle', 'easy', 'medium', 'hard'];
+const DIFF = {
+  gentle: { label: 'Gentle', target: 48, min: 46, max: 50, singles: true, color: '#7dffc0', hint: 'Lots of numbers given. Every step is a simple one.' },
+  easy:   { label: 'Easy',   target: 40, min: 38, max: 42, singles: true, color: '#7fe3ff', hint: 'Fewer numbers given, still simple steps.' },
+  medium: { label: 'Medium', target: 33, min: 31, max: 35, singles: false, color: '#9aa5ff', hint: 'A little more thinking.' },
+  hard:   { label: 'Hard',   target: 27, min: 25, max: 29, singles: false, color: '#ffb38a', hint: 'Few numbers given. Take your time.' },
+};
+const SCALE = [392, 440, 523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66];  // one soft note per digit (pentatonic)
+const WIN_WORDS = ['Solved!', 'Beautifully done', 'Lovely work', 'All in place', 'Wonderful'];
+const RIPPLE = ['#7dffc0', '#7fe3ff', '#9aa5ff', '#c3a6ff', '#ffb38a', '#ffd88a'];
+
+// ============================================================
+// Helpers
+// ============================================================
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const rand = (a, b) => a + Math.random() * (b - a);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+function drop(key) { try { localStorage.removeItem(key); } catch (e) { /* storage blocked: ignore */ } }
+const fmt = n => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+function fmtTime(s) {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, ss = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+const nowMs = typeof performance !== 'undefined' && performance.now ? () => performance.now() : () => Date.now();
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; }
+  return a;
+}
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// 2. Sudoku core: cells are 0..80 (row * 9 + col), values 1..9, 0 = empty.
+//    Candidates are 9-bit masks: bit (d - 1) set means d is still possible.
+// ============================================================
+const ROW = new Uint8Array(NN), COL = new Uint8Array(NN), BOX = new Uint8Array(NN);
+const UNITS = [];      // 27 units: 9 rows, 9 columns, 9 boxes ({ type, cells })
+const UNITS_OF = [];   // the 3 unit indexes of each cell
+const PEERS = [];      // the 20 cells that share a unit with each cell
+const BITS = new Uint8Array(512);
+const ALL = 0x1ff;
+(function buildTables() {
+  for (let k = 0; k < NN; k++) {
+    const r = (k / 9) | 0, c = k % 9;
+    ROW[k] = r; COL[k] = c; BOX[k] = ((r / 3) | 0) * 3 + ((c / 3) | 0);
+  }
+  for (let i = 0; i < 9; i++) { const cells = []; for (let j = 0; j < 9; j++) cells.push(i * 9 + j); UNITS.push({ type: 'row', cells }); }
+  for (let i = 0; i < 9; i++) { const cells = []; for (let j = 0; j < 9; j++) cells.push(j * 9 + i); UNITS.push({ type: 'col', cells }); }
+  for (let i = 0; i < 9; i++) {
+    const r0 = ((i / 3) | 0) * 3, c0 = (i % 3) * 3, cells = [];
+    for (let j = 0; j < 9; j++) cells.push((r0 + ((j / 3) | 0)) * 9 + c0 + (j % 3));
+    UNITS.push({ type: 'box', cells });
+  }
+  for (let k = 0; k < NN; k++) {
+    UNITS_OF.push([ROW[k], 9 + COL[k], 18 + BOX[k]]);
+    const s = new Set();
+    for (const u of UNITS_OF[k]) for (const j of UNITS[u].cells) if (j !== k) s.add(j);
+    PEERS.push([...s]);
+  }
+  for (let m = 1; m < 512; m++) BITS[m] = BITS[m >> 1] + (m & 1);
+})();
+const digitOf = bit => 32 - Math.clz32(bit);   // single bit -> digit
+const bitOf = d => 1 << (d - 1);
+
+// Depth-first search with "fewest candidates first". Stops at `limit` solutions,
+// or gives up (aborted) after maxNodes guesses so one step never takes long.
+function solveCore(cells, limit, maxNodes, random) {
+  const g = Uint8Array.from(cells);
+  const rows = new Uint16Array(9), cols = new Uint16Array(9), boxes = new Uint16Array(9);
+  const empt = [];
+  for (let k = 0; k < NN; k++) {
+    const v = g[k];
+    if (!v) { empt.push(k); continue; }
+    const b = bitOf(v);
+    if ((rows[ROW[k]] | cols[COL[k]] | boxes[BOX[k]]) & b) return { count: 0, aborted: false, solution: null, nodes: 0 };
+    rows[ROW[k]] |= b; cols[COL[k]] |= b; boxes[BOX[k]] |= b;
+  }
+  let count = 0, nodes = 0, aborted = false, solution = null;
+  function rec(n) {
+    if (n === 0) { count++; if (!solution) solution = g.slice(); return count >= limit; }
+    if (++nodes > maxNodes) { aborted = true; return true; }
+    let bi = 0, bm = 0, bc = 10;
+    for (let i = 0; i < n; i++) {
+      const k = empt[i], m = ALL & ~(rows[ROW[k]] | cols[COL[k]] | boxes[BOX[k]]), c = BITS[m];
+      if (c < bc) { bc = c; bi = i; bm = m; if (c < 2) break; }
+    }
+    if (bc === 0) return false;
+    const k = empt[bi]; empt[bi] = empt[n - 1]; empt[n - 1] = k;
+    const r = ROW[k], c = COL[k], x = BOX[k];
+    let m = bm, opts = null, oi = 0;
+    if (random) { opts = []; for (let q = bm; q; q &= q - 1) opts.push(q & -q); shuffle(opts); }
+    for (;;) {
+      let b;
+      if (opts) { if (oi >= opts.length) break; b = opts[oi++]; } else { if (!m) break; b = m & -m; m ^= b; }
+      g[k] = digitOf(b); rows[r] |= b; cols[c] |= b; boxes[x] |= b;
+      const stop = rec(n - 1);
+      rows[r] ^= b; cols[c] ^= b; boxes[x] ^= b; g[k] = 0;
+      if (stop) return true;
+    }
+    return false;
+  }
+  rec(empt.length);
+  return { count, aborted, solution, nodes };
+}
+function countSolutions(cells, limit = 2, maxNodes = Infinity) { return solveCore(cells, limit, maxNodes, false); }
+
+// A random full grid: three independent boxes on the diagonal, then a randomised solve.
+function makeSolution() {
+  for (;;) {
+    const g = new Uint8Array(NN);
+    for (const b of [0, 4, 8]) {
+      const ds = shuffle([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      UNITS[18 + b].cells.forEach((k, i) => { g[k] = ds[i]; });
+    }
+    const r = solveCore(g, 1, 20000, true);
+    if (r.solution) return r.solution;
+  }
+}
+
+// Can "singles" alone finish it? (a cell with one candidate, or a number with one place in a row, column or box)
+function singlesSolve(cells) {
+  const g = Uint8Array.from(cells);
+  const rows = new Uint16Array(9), cols = new Uint16Array(9), boxes = new Uint16Array(9);
+  let left = 0;
+  for (let k = 0; k < NN; k++) {
+    const v = g[k];
+    if (!v) { left++; continue; }
+    const b = bitOf(v);
+    if ((rows[ROW[k]] | cols[COL[k]] | boxes[BOX[k]]) & b) return false;
+    rows[ROW[k]] |= b; cols[COL[k]] |= b; boxes[BOX[k]] |= b;
+  }
+  const cand = k => ALL & ~(rows[ROW[k]] | cols[COL[k]] | boxes[BOX[k]]);
+  const used = u => (u < 9 ? rows[u] : u < 18 ? cols[u - 9] : boxes[u - 18]);
+  const place = (k, b) => { g[k] = digitOf(b); rows[ROW[k]] |= b; cols[COL[k]] |= b; boxes[BOX[k]] |= b; left--; };
+  let progress = true;
+  while (left && progress) {
+    progress = false;
+    for (let k = 0; k < NN; k++) {
+      if (g[k]) continue;
+      const m = cand(k);
+      if (!m) return false;
+      if (BITS[m] === 1) { place(k, m); progress = true; }
+    }
+    for (let u = 0; u < 27; u++) {
+      for (let need = ALL & ~used(u); need; need &= need - 1) {
+        const b = need & -need;
+        if (used(u) & b) continue;
+        let at = -1, n = 0;
+        for (const k of UNITS[u].cells) {
+          if (!g[k] && (cand(k) & b)) { n++; at = k; if (n > 1) break; }
+        }
+        if (n === 0) return false;
+        if (n === 1) { place(at, b); progress = true; }
+      }
+    }
+  }
+  return left === 0;
+}
+
+// Every single the player could spot right now; returns the one nearest the cursor.
+// `known` holds only numbers that are certainly right; `allowed[k]` marks cells we may fill.
+function findDeduction(known, cursor, allowed) {
+  const rows = new Uint16Array(9), cols = new Uint16Array(9), boxes = new Uint16Array(9);
+  for (let k = 0; k < NN; k++) {
+    const v = known[k];
+    if (v) { const b = bitOf(v); rows[ROW[k]] |= b; cols[COL[k]] |= b; boxes[BOX[k]] |= b; }
+  }
+  const cand = k => ALL & ~(rows[ROW[k]] | cols[COL[k]] | boxes[BOX[k]]);
+  const found = [];
+  for (let k = 0; k < NN; k++) {
+    if (known[k] || !allowed[k]) continue;
+    const m = cand(k);
+    if (BITS[m] === 1) found.push({ k, d: digitOf(m), why: 'cell' });
+  }
+  for (let u = 0; u < 27; u++) {
+    const U = UNITS[u];
+    let usedM = 0;
+    for (const k of U.cells) if (known[k]) usedM |= bitOf(known[k]);
+    for (let need = ALL & ~usedM; need; need &= need - 1) {
+      const b = need & -need;
+      let at = -1, n = 0;
+      for (const k of U.cells) if (!known[k] && (cand(k) & b)) { n++; at = k; }
+      if (n === 1 && allowed[at]) found.push({ k: at, d: digitOf(b), why: U.type });
+    }
+  }
+  let best = null, bd = 1e9;
+  for (const f of found) {
+    const dd = Math.abs(ROW[f.k] - ROW[cursor]) + Math.abs(COL[f.k] - COL[cursor]);
+    if (dd < bd) { bd = dd; best = f; }
+  }
+  return best;
+}
+
+// Marks every number that appears twice in a row, column or box (never says whether a number is "wrong").
+function computeConflicts(val, out) {
+  out.fill(0);
+  const first = new Int8Array(10);
+  for (const U of UNITS) {
+    first.fill(-1);
+    for (const k of U.cells) {
+      const v = val[k];
+      if (!v) continue;
+      if (first[v] >= 0) { out[k] = 1; out[first[v]] = 1; } else first[v] = k;
+    }
+  }
+  return out;
+}
+
+// Makes a puzzle in small steps (a generator yields after each check). Numbers are taken away in
+// mirrored pairs, then one by one, and each removal is kept only if the answer stays unique
+// (and, for Gentle and Easy, if singles alone can still solve it).
+function* makeJob(diffId) {
+  const D = DIFF[diffId], maxNodes = CFG.gen.maxNodes;
+  for (let attempt = 1; ; attempt++) {
+    const sol = makeSolution();
+    yield;
+    const grid = sol.slice();
+    let count = NN;
+    const tryRemove = cells => {
+      const keep = cells.map(k => grid[k]);
+      for (const k of cells) grid[k] = 0;
+      let ok = !D.singles || singlesSolve(grid);
+      if (ok) { const r = countSolutions(grid, 2, maxNodes); ok = r.count === 1 && !r.aborted; }
+      if (ok) { count -= cells.length; return true; }
+      cells.forEach((k, i) => { grid[k] = keep[i]; });
+      return false;
+    };
+    for (const k of shuffle([...Array(41).keys()])) {
+      if (count <= D.target) break;
+      const pair = k === 40 ? [40] : [k, 80 - k];
+      if (count - pair.length < D.min) continue;
+      tryRemove(pair);
+      yield;
+    }
+    if (count > D.target) {
+      for (const k of shuffle([...Array(NN).keys()])) {
+        if (count <= D.target) break;
+        if (!grid[k]) continue;
+        tryRemove([k]);
+        yield;
+      }
+    }
+    if (count >= D.min && count <= D.max) return { given: grid, sol, diff: diffId, clues: count, attempts: attempt };
+  }
+}
+function generatePuzzle(diffId) {   // all at once (used by tests)
+  const job = makeJob(diffId);
+  for (;;) { const r = job.next(); if (r.done) return r.value; }
+}
+
+// Runs puzzle making a few milliseconds per frame and keeps one ready puzzle per difficulty.
+const Gen = {
+  job: null, jobDiff: null, ready: {},
+  want(d) {
+    if (this.ready[d] || (this.job && this.jobDiff === d)) return;
+    this.job = makeJob(d); this.jobDiff = d;
+  },
+  has(d) { return !!this.ready[d]; },
+  take(d) { const p = this.ready[d] || null; delete this.ready[d]; return p; },
+  run(budget) {
+    if (!this.job) return;
+    const t0 = nowMs();
+    do {
+      const r = this.job.next();
+      if (r.done) { this.ready[this.jobDiff] = r.value; this.job = null; this.jobDiff = null; return; }
+    } while (nowMs() - t0 < budget);
+  },
+};
+
+// ============================================================
+// Canvas + art (board, digits and background are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, boardBase = null, boardLines = null;
+let digitSpr = [], noteSpr = [], dotSprites = [];
+const ST_GIVEN = 0, ST_PLAYER = 1, ST_HINT = 2, ST_CLASH = 3, ST_PADNOTE = 4;
+const DOT_WHITE = 0, DOT_PLAYER = 1, DOT_HINT = 2, DOT_GOOD = 3, DOT_TITLE = 4, DOT_NOTE = 5;
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function drawDigitSprite(d, color, weight, glowA) {
+  const { c, g } = layer(CELL, CELL), s = String(d), x = CELL / 2, y = CELL / 2 + 2;
+  g.font = `${weight} 32px ${SANS}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.lineJoin = 'round'; g.strokeStyle = color;
+  g.globalAlpha = glowA * 0.45; g.lineWidth = 10; g.strokeText(s, x, y);   // wide faint glow
+  g.globalAlpha = glowA; g.lineWidth = 4; g.strokeText(s, x, y);
+  g.globalAlpha = 1; g.fillStyle = color; g.fillText(s, x, y);
+  return c;
+}
+function drawNoteSprite(d, color) {
+  const { c, g } = layer(18, 18);
+  g.font = `700 14px ${SANS}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = color; g.fillText(String(d), 9, 10);
+  return c;
+}
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+function buildArt() {
+  const C = CFG.color;
+  // Background: deep blue gradient with a few soft colour clouds
+  let L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[140, 110, 300, '#3a5cff', 0.1], [830, 440, 320, '#7a5cff', 0.08], [880, 70, 220, '#20c0d0', 0.06], [80, 480, 240, '#3ad0a0', 0.05]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  // Board base: dark rounded panel with softly alternating 3x3 boxes
+  L = layer(BW + 40, BW + 40); g = L.g;
+  g.translate(20, 20);
+  rr(g, -10, -10, BW + 20, BW + 20, 16); g.fillStyle = 'rgba(8,11,26,0.9)'; g.fill();
+  for (let b = 0; b < 9; b++) {
+    const x = (b % 3) * 3 * CELL, y = ((b / 3) | 0) * 3 * CELL;
+    g.fillStyle = b % 2 ? 'rgba(120,150,255,0.03)' : 'rgba(120,150,255,0.065)';
+    g.fillRect(x, y, CELL * 3, CELL * 3);
+  }
+  boardBase = L.c;
+  // Board lines: faint cell lines, glowing box lines
+  L = layer(BW + 40, BW + 40); g = L.g;
+  g.translate(20, 20);
+  g.beginPath();
+  for (let i = 1; i < 9; i++) {
+    if (i % 3 === 0) continue;
+    g.moveTo(i * CELL + 0.5, 0); g.lineTo(i * CELL + 0.5, BW);
+    g.moveTo(0, i * CELL + 0.5); g.lineTo(BW, i * CELL + 0.5);
+  }
+  g.strokeStyle = 'rgba(131,144,189,0.24)'; g.lineWidth = 1; g.stroke();
+  g.beginPath();
+  for (const i of [3, 6]) {
+    g.moveTo(i * CELL, 2); g.lineTo(i * CELL, BW - 2);
+    g.moveTo(2, i * CELL); g.lineTo(BW - 2, i * CELL);
+  }
+  g.lineCap = 'round'; g.strokeStyle = C.title;
+  g.globalAlpha = 0.14; g.lineWidth = 8; g.stroke();
+  g.globalAlpha = 0.8; g.lineWidth = 2; g.stroke();
+  g.globalAlpha = 1;
+  boardLines = L.c;
+  // Digits in each style, notes, and glow dots
+  const styles = [[C.given, 800, 0.1], [C.player, 700, 0.22], [C.hinted, 700, 0.24], [C.clash, 700, 0.22], [C.padNote, 600, 0.14]];
+  digitSpr = styles.map(([col, wt, ga]) => { const a = [null]; for (let d = 1; d <= 9; d++) a.push(drawDigitSprite(d, col, wt, ga)); return a; });
+  noteSpr = [C.note, C.noteHi].map(col => { const a = [null]; for (let d = 1; d <= 9; d++) a.push(drawNoteSprite(d, col)); return a; });
+  dotSprites = ['#ffffff', C.player, C.hinted, C.good, C.title, C.note].map(drawDot);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine bells only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) { // a soft airy swell
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  place(d)  { if (this.ok('place', 0.03)) { this.bell(SCALE[d - 1], 0.065, 0, 0.6); this.tone(SCALE[d - 1] / 2, SCALE[d - 1] / 2, 0.3, 'triangle', 0.02); } },
+  clash()   { if (this.ok('place', 0.03)) { this.tone(330, 330, 0.22, 'sine', 0.035); this.tone(294, 294, 0.3, 'sine', 0.025, 0.09); } },
+  note(d)   { if (this.ok('note', 0.03)) { const f = SCALE[d - 1] * 2; this.tone(f, f, 0.12, 'sine', 0.022); } },
+  erase()   { if (this.ok('erase', 0.05)) this.tone(520, 380, 0.16, 'sine', 0.035); },
+  undo()    { if (this.ok('undo', 0.05)) this.tone(440, 560, 0.15, 'sine', 0.035); },
+  notesOn() { if (this.ok('notes', 0.05)) this.tone(660, 880, 0.1, 'sine', 0.035); },
+  notesOff(){ if (this.ok('notes', 0.05)) this.tone(880, 660, 0.1, 'sine', 0.035); },
+  hint()    { if (this.ok('hint', 0.2)) { this.bell(1046.5, 0.045, 0, 0.8); this.bell(1318.51, 0.035, 0.09, 0.9); this.noise(0.6, 0.012, 2600); } },
+  unit()    { if (this.ok('unit', 0.15)) [2, 4, 6].forEach((n, i) => this.bell(SCALE[n], 0.04, 0.1 + i * 0.08, 0.8)); },
+  done()    { if (this.ok('done', 0.2)) this.bell(1567.98, 0.03, 0.14, 0.7); },
+  win()     {
+    if (!this.ok()) return;
+    [0, 1, 2, 3, 4, 5, 6, 7, 8].forEach((n, i) => this.bell(SCALE[n], 0.045, i * 0.12, 1.1));
+    [2, 4, 6].forEach(n => this.bell(SCALE[n], 0.035, 1.2, 1.8));
+  },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select()  { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()    { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, pause: false, mute: false, select: false, back: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+  digit: 0, erase: false, notes: false, undo: false, hint: false, prevDigit: false, nextDigit: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow') || e.code === 'Backspace') e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play' && !G.won) pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let act = P.has('Space') || P.has('Enter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+    let digit = 0;
+    for (let d = 1; d <= 9; d++) if (P.has('Digit' + d) || P.has('Numpad' + d)) digit = d;
+    let erase = P.has('Digit0') || P.has('Numpad0') || P.has('Backspace') || P.has('Delete');
+    let notes = P.has('KeyN'), undo = P.has('KeyU') || P.has('KeyZ'), hint = P.has('KeyH');
+    let prevDigit = false, nextDigit = false;
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) act = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) { back = true; erase = true; }
+      if (tap(2)) notes = true;
+      if (tap(3)) hint = true;
+      if (tap(4)) prevDigit = true;
+      if (tap(5)) nextDigit = true;
+      if (tap(6)) undo = true;
+      // D-pad or left stick as a cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+    this.digit = digit; this.erase = erase; this.notes = notes; this.undo = undo; this.hint = hint;
+    this.prevDigit = prevDigit; this.nextDigit = nextDigit;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', x: '□', y: '△', lb: 'L1', rb: 'R1', lt: 'L2', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', x: 'X', y: 'Y', lb: 'LB', rb: 'RB', lt: 'LT', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state, settings and saving
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let diff = DIFFS.includes(load('neonSudoku.diff', 'gentle')) ? load('neonSudoku.diff', 'gentle') : 'gentle';
+let showConf = load('neonSudoku.conflicts', '1') !== '0';
+let showTimer = load('neonSudoku.timer', '0') === '1';
+const solved = {};
+for (const d of DIFFS) solved[d] = Number(load('neonSudoku.solved.' + d, 0)) || 0;
+Sfx.muted = load('neonSudoku.muted', '0') === '1';
+const toast = { text: '', t: 0 };
+let prepDiff = 'gentle';
+let saveInfo = null;      // { diff, filled } of the saved board, shown on the title
+let saveDirtyT = -1;      // counts down to an automatic save after a move
+let armed = null;         // a menu item waiting for a second press
+
+function showToast(text) { toast.text = text; toast.t = 2.2; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; armed = null; }
+function pauseGame() { pausedFrom = state; setState('paused'); saveBoard(); Sfx.blip(); }
+function resumeGame() { state = pausedFrom; armed = null; Sfx.blip(); }
+function toTitle() { saveBoard(); clearFx(); setState('title'); Gen.want(diff); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonSudoku.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function toggleConf() { showConf = !showConf; save('neonSudoku.conflicts', showConf ? 1 : 0); }
+function toggleTimer() { showTimer = !showTimer; save('neonSudoku.timer', showTimer ? 1 : 0); }
+function cycleDiff(d) { diff = DIFFS[(DIFFS.indexOf(diff) + d + DIFFS.length) % DIFFS.length]; save('neonSudoku.diff', diff); Gen.want(diff); }
+
+// P is the puzzle (given numbers and the answer); G is the board as the player has it.
+let P = null;
+const G = {
+  val: new Uint8Array(NN), notes: new Uint16Array(NN), hinted: new Uint8Array(NN), conf: new Uint8Array(NN),
+  count: new Uint8Array(10), filled: 0, cursor: 40, digit: 1, notesMode: false,
+  undo: [], act: null, hints: 0, time: 0, won: false, winT: 0, winFrom: 40, winWord: '', introT: 0,
+  pop: new Float32Array(NN), glow: new Float32Array(NN), flashes: [], hintMsg: [], hintMsgT: 0,
+  banner: '', bannerSub: '', bannerColor: '#fff', bannerT: 0, bannerMax: 1, fullWarned: false,
+};
+const isFixed = k => P.given[k] !== 0 || G.hinted[k] !== 0;
+const cellX = k => BX + (COL[k] + 0.5) * CELL, cellY = k => BY + (ROW[k] + 0.5) * CELL;
+function cellAt(x, y) {
+  const c = Math.floor((x - BX) / CELL), r = Math.floor((y - BY) / CELL);
+  return r >= 0 && r < N && c >= 0 && c < N ? r * N + c : -1;
+}
+function banner(title, sub, color, t = 3.2) {
+  G.banner = title; G.bannerSub = sub; G.bannerColor = color; G.bannerT = G.bannerMax = t;
+}
+
+const digits81 = a => Array.from(a).join('');
+const parse81 = s => Uint8Array.from(s, ch => +ch);
+
+function saveBoard() {
+  saveDirtyT = -1;
+  if (!P || G.won) return;
+  const data = {
+    v: 1, diff: P.diff, clues: P.clues,
+    given: digits81(P.given), sol: digits81(P.sol), val: digits81(G.val), hinted: digits81(G.hinted),
+    notes: Array.from(G.notes), cursor: G.cursor, digit: G.digit, notesMode: G.notesMode, hints: G.hints, time: G.time,
+    undo: G.undo.slice(-CFG.saveUndo).map(a => ({ k: a.k, c: a.c, h: a.h || 0 })),
+  };
+  save('neonSudoku.save', JSON.stringify(data));
+  saveInfo = { diff: P.diff, filled: G.filled };
+}
+function clearBoard() { drop('neonSudoku.save'); saveInfo = null; saveDirtyT = -1; }
+function markDirty() { saveDirtyT = CFG.saveDelay; }
+
+// Reads and checks the saved board; anything odd means "no save".
+function readSave() {
+  let d;
+  try { d = JSON.parse(load('neonSudoku.save', 'null')); } catch (e) { return null; }
+  if (!d || typeof d !== 'object' || d.v !== 1 || !DIFF[d.diff]) return null;
+  const ok81 = (s, max) => typeof s === 'string' && s.length === NN && /^[0-9]+$/.test(s) && [...s].every(ch => +ch <= max);
+  if (!ok81(d.given, 9) || !ok81(d.sol, 9) || !ok81(d.val, 9) || !ok81(d.hinted, 1)) return null;
+  if (!Array.isArray(d.notes) || d.notes.length !== NN || !d.notes.every(n => Number.isInteger(n) && n >= 0 && n <= ALL)) return null;
+  const given = parse81(d.given), sol = parse81(d.sol), val = parse81(d.val), hinted = parse81(d.hinted);
+  for (let k = 0; k < NN; k++) {
+    if (!sol[k]) return null;
+    if (given[k] && (given[k] !== sol[k] || val[k] !== given[k])) return null;
+    if (hinted[k] && val[k] !== sol[k]) return null;
+  }
+  if (computeConflicts(sol, new Uint8Array(NN)).some(Boolean)) return null;
+  const int = (v, a, b) => Number.isInteger(v) && v >= a && v <= b;
+  let undo = Array.isArray(d.undo) ? d.undo : [];
+  const goodStep = a => a && int(a.k, 0, 80) && Number.isInteger(a.h) && Array.isArray(a.c) && a.c.length % 4 === 0 &&
+    a.c.every((v, i) => (i % 4 === 0 ? int(v, 0, 80) : i % 4 === 1 ? int(v, 0, 9) : i % 4 === 2 ? int(v, 0, ALL) : int(v, 0, 1)));
+  if (!undo.every(goodStep)) undo = [];
+  let filled = 0;
+  for (const v of val) if (v) filled++;
+  return {
+    diff: d.diff, clues: int(d.clues, 0, 81) ? d.clues : given.filter(Boolean).length, given, sol, val, hinted,
+    notes: Uint16Array.from(d.notes), cursor: int(d.cursor, 0, 80) ? d.cursor : 40, digit: int(d.digit, 1, 9) ? d.digit : 1,
+    notesMode: d.notesMode === true, hints: int(d.hints, 0, 81) ? d.hints : 0,
+    time: typeof d.time === 'number' && Number.isFinite(d.time) && d.time >= 0 ? d.time : 0,
+    undo: undo.map(a => ({ k: a.k, c: a.c.slice(), h: a.h })), filled,
+  };
+}
+
+// ============================================================
+// 3. Play: placing numbers, notes, undo, hints and winning
+// ============================================================
+function refresh() {
+  computeConflicts(G.val, G.conf);
+  G.count.fill(0);
+  let f = 0;
+  for (let k = 0; k < NN; k++) { const v = G.val[k]; if (v) { G.count[v]++; f++; } }
+  G.filled = f;
+}
+
+function nearestEmpty(k0) {
+  let best = k0, bd = 1e9;
+  for (let k = 0; k < NN; k++) {
+    if (G.val[k]) continue;
+    const d = Math.hypot(ROW[k] - ROW[k0], COL[k] - COL[k0]);
+    if (d < bd) { bd = d; best = k; }
+  }
+  return best;
+}
+
+function resetBoardFx() {
+  G.pop.fill(0); G.glow.fill(0); G.flashes.length = 0;
+  G.won = false; G.winT = 0; G.introT = 0; G.hintMsgT = 0; G.bannerT = 0; G.fullWarned = false; G.act = null;
+}
+
+function startPuzzle(p) {
+  P = p;
+  G.val.set(p.given); G.notes.fill(0); G.hinted.fill(0);
+  G.undo = []; G.hints = 0; G.time = 0; G.notesMode = false; G.digit = 1;
+  resetBoardFx();
+  G.cursor = nearestEmpty(40);
+  refresh();
+  clearFx();
+  setState('play');
+  saveBoard();
+  Gen.want(p.diff);
+  Sfx.init();
+}
+
+function continueSaved() {
+  const d = readSave();
+  if (!d) { clearBoard(); showToast('That saved puzzle could not be opened'); return; }
+  P = { given: d.given, sol: d.sol, diff: d.diff, clues: d.clues };
+  G.val.set(d.val); G.notes.set(d.notes); G.hinted.set(d.hinted);
+  G.undo = d.undo; G.hints = d.hints; G.time = d.time; G.notesMode = d.notesMode; G.digit = d.digit; G.cursor = d.cursor;
+  resetBoardFx();
+  refresh();
+  clearFx();
+  setState('play');
+  Gen.want(P.diff);
+}
+
+function newPuzzle(d) {
+  Sfx.init();
+  const p = Gen.take(d);
+  if (p) { startPuzzle(p); return; }
+  prepDiff = d;
+  Gen.want(d);
+  setState('preparing');
+}
+
+// Every change goes through begin / setCell / commit, which records exactly what it changed (for Undo).
+function begin(k) { G.act = { k: k === undefined ? G.cursor : k, c: [], seen: new Set(), h: 0 }; }
+function setCell(k, v, notes, hinted) {
+  const a = G.act;
+  if (!a.seen.has(k)) { a.seen.add(k); a.c.push(k, G.val[k], G.notes[k], G.hinted[k]); }
+  G.val[k] = v; G.notes[k] = notes; G.hinted[k] = hinted;
+}
+function commit() {
+  const a = G.act;
+  G.act = null;
+  let changed = false;
+  for (let i = 0; i < a.c.length; i += 4) {
+    const k = a.c[i];
+    if (G.val[k] !== a.c[i + 1] || G.notes[k] !== a.c[i + 2] || G.hinted[k] !== a.c[i + 3]) { changed = true; break; }
+  }
+  if (!changed) return null;
+  const step = { k: a.k, c: a.c, h: a.h };
+  G.undo.push(step);
+  markDirty();
+  return step;
+}
+// A number goes in: tidy that number out of the notes around it
+function fill(k, d, hinted) {
+  setCell(k, d, 0, hinted);
+  const b = bitOf(d);
+  for (const j of PEERS[k]) if (G.notes[j] & b) setCell(j, G.val[j], G.notes[j] & ~b, G.hinted[j]);
+}
+
+function placeDigit(d) {
+  if (!P || G.won) return;
+  const k = G.cursor;
+  G.digit = d;
+  if (isFixed(k)) { Sfx.tick(); return; }
+  if (G.notesMode) { toggleNote(k, d); return; }
+  begin();
+  if (G.val[k] === d) { setCell(k, 0, 0, 0); commit(); Sfx.erase(); afterChange(k, false); return; }
+  fill(k, d, 0);
+  commit();
+  G.pop[k] = 1;
+  afterChange(k, true);
+}
+
+function toggleNote(k, d) {
+  if (G.val[k]) { Sfx.tick(); showToast('Notes go in empty cells'); return; }
+  begin();
+  setCell(k, 0, G.notes[k] ^ bitOf(d), 0);
+  commit();
+  Sfx.note(d);
+}
+
+function eraseCell() {
+  if (!P || G.won) return;
+  const k = G.cursor;
+  if (isFixed(k) || (!G.val[k] && !G.notes[k])) { Sfx.tick(); return; }
+  begin(); setCell(k, 0, 0, 0); commit();
+  Sfx.erase();
+  afterChange(k, false);
+}
+
+function toggleNotes() {
+  if (!P || G.won) return;
+  G.notesMode = !G.notesMode;
+  if (G.notesMode) Sfx.notesOn(); else Sfx.notesOff();
+  markDirty();
+}
+
+function undoMove() {
+  if (!P || G.won) return;
+  const a = G.undo.pop();
+  if (!a) { showToast('Nothing to undo'); Sfx.tick(); return; }
+  for (let i = a.c.length - 4; i >= 0; i -= 4) {
+    const k = a.c[i];
+    G.val[k] = a.c[i + 1]; G.notes[k] = a.c[i + 2]; G.hinted[k] = a.c[i + 3];
+  }
+  G.hints -= a.h || 0;
+  G.cursor = a.k;
+  G.fullWarned = false;
+  refresh(); markDirty();
+  Sfx.undo();
+}
+
+function giveHint() {
+  if (!P || G.won) return;
+  const sol = P.sol, val = G.val;
+  const known = new Uint8Array(NN), allowed = new Uint8Array(NN), wrong = [];
+  let empties = 0;
+  for (let k = 0; k < NN; k++) {
+    if (!val[k]) { empties++; allowed[k] = 1; } else if (val[k] === sol[k]) known[k] = val[k]; else wrong.push(k);
+  }
+  let k = -1, lines = null;
+  const ded = empties ? findDeduction(known, G.cursor, allowed) : null;
+  if (ded) {
+    k = ded.k;
+    const d = ded.d, place = { row: 'row', col: 'column', box: 'box' }[ded.why];
+    lines = ded.why === 'cell' ? [`Only ${d} fits`, 'in this cell.'] : [`${d} has one place left`, `in this ${place}.`];
+  } else if (wrong.length) {
+    wrong.sort((a, b) => G.conf[b] - G.conf[a] || (Math.abs(ROW[a] - ROW[G.cursor]) + Math.abs(COL[a] - COL[G.cursor])) - (Math.abs(ROW[b] - ROW[G.cursor]) + Math.abs(COL[b] - COL[G.cursor])));
+    k = wrong[0];
+    lines = [`This cell should`, `be a ${sol[k]}.`];
+  } else if (empties) {
+    // No simple step anywhere: fill the empty cell with the fewest possibilities
+    let bc = 99;
+    for (let j = 0; j < NN; j++) {
+      if (val[j]) continue;
+      let m = ALL;
+      for (const p of PEERS[j]) if (known[p]) m &= ~bitOf(known[p]);
+      const c = BITS[m] * 100 + Math.abs(ROW[j] - ROW[G.cursor]) + Math.abs(COL[j] - COL[G.cursor]);
+      if (c < bc) { bc = c; k = j; }
+    }
+    lines = [`Here is a ${sol[k]}`, 'to help you along.'];
+  }
+  if (k < 0) return;
+  begin(k);
+  fill(k, sol[k], 1);
+  G.act.h = 1;
+  commit();
+  G.hints++;
+  G.cursor = k; G.digit = sol[k];
+  G.glow[k] = 1; G.pop[k] = 1;
+  G.hintMsg = lines; G.hintMsgT = CFG.hintMsgTime;
+  ring(cellX(k), cellY(k), 6, CELL * 0.95, 0.9, CFG.color.hinted, 2);
+  Sfx.hint();
+  afterChange(k, true, true);
+}
+
+// Clears every number you placed (one undoable step, so Undo brings it all back)
+function restartPuzzle() {
+  begin();
+  for (let k = 0; k < NN; k++) if (!P.given[k] && (G.val[k] || G.notes[k] || G.hinted[k])) setCell(k, 0, 0, 0);
+  G.act.h = -G.hints;         // undo gives the hint count back
+  const step = commit();
+  if (!step) { showToast('Nothing to clear yet'); return; }
+  G.hints = 0;
+  G.notesMode = false; G.fullWarned = false; G.bannerT = 0;
+  refresh();
+  for (let k = 0; k < NN; k++) G.pop[k] = 0;
+  G.introT = 0;
+  showToast('Fresh start. Undo brings your numbers back.');
+  Sfx.erase();
+}
+
+function afterChange(k, placed, quiet) {
+  refresh();
+  if (placed) {
+    const d = G.val[k];
+    if (!quiet) { if (G.conf[k] && showConf) Sfx.clash(); else Sfx.place(d); }
+    burst(cellX(k), cellY(k), G.hinted[k] ? DOT_HINT : DOT_PLAYER, LOW_RES ? 3 : 6, 90, 0.5, 6);
+    let units = 0;
+    if (G.filled < NN) for (const u of UNITS_OF[k]) {   // (the final number gets the big ripple instead)
+      const cells = UNITS[u].cells;
+      if (cells.every(j => G.val[j] === P.sol[j])) { G.flashes.push({ cells, t: 1 }); units++; }
+    }
+    if (units) Sfx.unit();
+    if (G.count[d] === 9) Sfx.done();
+  }
+  checkWin(k);
+}
+
+function checkWin(k) {
+  if (G.filled < NN) { G.fullWarned = false; return; }
+  for (let i = 0; i < NN; i++) {
+    if (G.val[i] !== P.sol[i]) {
+      if (!G.fullWarned) {
+        G.fullWarned = true;
+        banner('Nearly there', showConf ? 'A few numbers clash. Look for the soft red cells.' : 'A few numbers clash. A hint can help.', CFG.color.warn);
+      }
+      return;
+    }
+  }
+  winPuzzle(k);
+}
+
+function winPuzzle(k) {
+  G.won = true; G.winT = 0; G.winFrom = k; G.bannerT = 0; G.hintMsgT = 0;
+  solved[P.diff]++;
+  save('neonSudoku.solved.' + P.diff, solved[P.diff]);
+  clearBoard();
+  G.winWord = WIN_WORDS[(solved[P.diff] - 1) % WIN_WORDS.length];
+  Sfx.win();
+}
+
+function stepPlay(dt) {
+  if (!G.won) G.time += dt;
+  G.introT += dt;
+  const A = CFG.anim;
+  for (let k = 0; k < NN; k++) {
+    if (G.pop[k] > 0) G.pop[k] = Math.max(0, G.pop[k] - dt / A.pop);
+    if (G.glow[k] > 0) G.glow[k] = Math.max(0, G.glow[k] - dt / A.glow);
+  }
+  for (let i = G.flashes.length - 1; i >= 0; i--) {
+    G.flashes[i].t -= dt / A.flash;
+    if (G.flashes[i].t <= 0) G.flashes.splice(i, 1);
+  }
+  if (G.hintMsgT > 0) G.hintMsgT = Math.max(0, G.hintMsgT - dt);
+  if (G.bannerT > 0) G.bannerT = Math.max(0, G.bannerT - dt);
+  if (saveDirtyT > 0) { saveDirtyT -= dt; if (saveDirtyT <= 0) saveBoard(); }
+  if (G.won) {
+    const prev = G.winT;
+    G.winT += dt;
+    const ox = cellX(G.winFrom), oy = cellY(G.winFrom);
+    [0, 0.35, 0.7].forEach((at, i) => { if (prev < at && G.winT >= at) ring(ox, oy, 10, BW * 1.1, 1.6, RIPPLE[i * 2], 2.5); });
+    if (!LOW_RES) {
+      for (let k = 0; k < NN; k++) {
+        const t0 = Math.hypot(ROW[k] - ROW[G.winFrom], COL[k] - COL[G.winFrom]) * A.ripple;
+        if (prev < t0 && G.winT >= t0) burst(cellX(k), cellY(k), 1 + (k % 4), 1, 60, 0.9, 7);
+      }
+    }
+    if (G.winT >= A.winHold) setState('won');
+  }
+}
+
+// ============================================================
+// Buttons and the play-screen input
+// ============================================================
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const PAD = [];
+for (let i = 0; i < 9; i++) PAD.push({ x: 719 + (i % 3) * 78, y: 70 + ((i / 3) | 0) * 78, w: 70, h: 70, d: i + 1 });
+const TOOLS = [
+  { id: 'notes', label: 'Notes', x: 719, y: 312, w: 109, h: 50 },
+  { id: 'erase', label: 'Erase', x: 836, y: 312, w: 109, h: 50 },
+  { id: 'undo', label: 'Undo', x: 719, y: 370, w: 109, h: 50 },
+  { id: 'hint', label: 'Hint', x: 836, y: 370, w: 109, h: 50 },
+];
+function toolAction(id) {
+  if (id === 'notes') toggleNotes();
+  else if (id === 'erase') eraseCell();
+  else if (id === 'undo') undoMove();
+  else if (id === 'hint') giveHint();
+}
+
+function playInput() {
+  const I = Input, m = I.mouse;
+  if (m.clicked && !G.won) {
+    if (inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+    if (inRect(m, SOUND_BTN)) { toggleSound(); return; }
+  }
+  if (G.won) return;
+  const dr = I.navUp ? -1 : I.navDown ? 1 : 0, dc = dr ? 0 : I.navLeft ? -1 : I.navRight ? 1 : 0;
+  if (dr || dc) {   // the cursor wraps around the edges
+    G.cursor = ((ROW[G.cursor] + dr + N) % N) * N + (COL[G.cursor] + dc + N) % N;
+    Sfx.tick();
+  }
+  if (I.prevDigit || I.nextDigit) { G.digit = ((G.digit - 1 + (I.nextDigit ? 1 : -1) + 9) % 9) + 1; Sfx.tick(); }
+  if (I.digit) placeDigit(I.digit);
+  if (I.act) {
+    // A on a printed number picks that number; anywhere else it places the chosen number
+    if (isFixed(G.cursor)) { G.digit = G.val[G.cursor]; Sfx.tick(); } else placeDigit(G.digit);
+  }
+  if (I.erase) eraseCell();
+  if (I.notes) toggleNotes();
+  if (I.undo) undoMove();
+  if (I.hint) giveHint();
+  if (m.clicked) {
+    const k = cellAt(m.x, m.y);
+    if (k >= 0) { if (k !== G.cursor) Sfx.tick(); G.cursor = k; }
+    else {
+      const b = PAD.find(r => inRect(m, r));
+      if (b) placeDigit(b.d);
+      else { const t = TOOLS.find(r => inRect(m, r)); if (t) toolAction(t.id); }
+    }
+  }
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 120 : 300, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(32, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 24); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: 1 + (i % 5) });
+}
+function burst(x, y, ci, n, speed, life = 0.7, size = 7) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+function clearFx() { parts.clear(); rings.clear(); }
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 30 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    o.life -= dt;
+    if (o.life <= 0) o.active = false;
+  }
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function confItem() {
+  return { id: 'conf', label: 'Show conflicts', value: showConf ? 'On' : 'Off', cycle: () => toggleConf(), hint: 'Softly mark numbers that clash in a row, column or box.' };
+}
+function titleItems() {
+  const items = [];
+  if (saveInfo) items.push({ id: 'continue', label: 'Continue', hint: `Your ${DIFF[saveInfo.diff].label} puzzle: ${saveInfo.filled} of 81 filled.` });
+  const sure = armed === 'new';
+  items.push({ id: 'new', label: sure ? 'New puzzle: sure?' : 'New puzzle', warn: sure,
+    hint: sure ? 'Press again to replace your saved puzzle.' : `A fresh ${DIFF[diff].label} puzzle.` });
+  items.push({ id: 'diff', label: 'Difficulty', value: DIFF[diff].label, cycle: d => cycleDiff(d), hint: `${DIFF[diff].hint}  Solved: ${solved[diff]}.` });
+  items.push(confItem());
+  items.push({ id: 'timer', label: 'Timer', value: showTimer ? 'On' : 'Off', cycle: () => toggleTimer(), hint: 'Show a quiet clock while you play.' });
+  items.push(soundItem());
+  items.push({ id: 'howto', label: 'How to Play', hint: 'Controls, helpers and tips.' });
+  items.push({ id: 'games', label: 'All Games', hint: 'Back to the game picker.' });
+  return items;
+}
+function pauseItems() {
+  const sure = armed === 'new';
+  return [
+    { id: 'resume', label: 'Resume' },
+    { id: 'restart', label: 'Restart puzzle' },
+    { id: 'new', label: sure ? 'New puzzle: sure?' : 'New puzzle', warn: sure },
+    confItem(), soundItem(),
+    { id: 'quit', label: 'Quit to menu' },
+  ];
+}
+function wonItems() { return [{ id: 'next', label: 'Next puzzle' }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length, before = menuSel;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  if (menuSel !== before) armed = null;
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+function arm(id) { armed = id; Sfx.blip(); }
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+  Gen.run(state === 'preparing' ? CFG.gen.frameBudget : CFG.gen.idleBudget);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'continue') continueSaved();
+      else if (id === 'new') { if (saveInfo && armed !== 'new') arm('new'); else newPuzzle(diff); }
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) {
+        setState('title'); menuSel = titleItems().findIndex(it => it.id === 'howto'); Sfx.blip();
+      }
+      break;
+    case 'preparing':
+      if (Input.back) { toTitle(); break; }
+      Gen.want(prepDiff);
+      if (Gen.has(prepDiff) && stateT >= CFG.gen.minPrep) startPuzzle(Gen.take(prepDiff));
+      break;
+    case 'play':
+      if (Input.pause && !G.won) { pauseGame(); break; }
+      playInput();
+      if (state !== 'play') break; // paused from the on-screen button
+      stepPlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') { resumeGame(); restartPuzzle(); }
+      else if (id === 'new') { if (armed !== 'new') arm('new'); else newPuzzle(P.diff); }
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'won':
+      if (stateT > 0.8) {
+        const id = menuInput(wonItems());
+        if (id === 'next') newPuzzle(P.diff);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.12 + 0.09 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function cellPath(k, inset, r = 9) {
+  rrPath(BX + COL[k] * CELL + inset, BY + ROW[k] * CELL + inset, CELL - inset * 2, CELL - inset * 2, r);
+}
+
+const bump = new Float32Array(NN), flashLv = new Float32Array(NN);   // per-cell ripple and flash levels (reused every frame)
+function renderBoard() {
+  const C = CFG.color, A = CFG.anim, k0 = G.cursor, live = state === 'play' && !G.won;
+  ctx.drawImage(boardBase, BX - 20, BY - 20, BW + 40, BW + 40);
+  const hiD = G.val[k0] || G.digit;
+  const r0 = ROW[k0], c0 = COL[k0], b0 = BOX[k0];
+  // Cell fills: clashes, same number, and the cursor's row, column and box
+  if (!G.won) {
+    for (let k = 0; k < NN; k++) {
+      const v = G.val[k];
+      let fill = null;
+      if (showConf && G.conf[k]) fill = 'rgba(255,120,150,0.18)';
+      else if (hiD && v === hiD) fill = 'rgba(127,227,255,0.15)';
+      else if (ROW[k] === r0 || COL[k] === c0 || BOX[k] === b0) fill = 'rgba(154,165,255,0.07)';
+      if (fill) { ctx.fillStyle = fill; ctx.fillRect(BX + COL[k] * CELL + 1, BY + ROW[k] * CELL + 1, CELL - 2, CELL - 2); }
+      if (G.glow[k] > 0) {
+        ctx.fillStyle = hexA(C.hinted, G.glow[k] * (0.22 + 0.1 * Math.sin(time * 5)));
+        ctx.fillRect(BX + COL[k] * CELL + 1, BY + ROW[k] * CELL + 1, CELL - 2, CELL - 2);
+      }
+    }
+  }
+  if (G.flashes.length) {   // a row, column or box was just finished (overlaps never stack up)
+    flashLv.fill(0);
+    for (const f of G.flashes) { const a = Math.sin(f.t * Math.PI); for (const k of f.cells) if (a > flashLv[k]) flashLv[k] = a; }
+    for (let k = 0; k < NN; k++) {
+      if (flashLv[k] <= 0) continue;
+      ctx.fillStyle = hexA(C.good, 0.18 * flashLv[k]);
+      ctx.fillRect(BX + COL[k] * CELL + 1, BY + ROW[k] * CELL + 1, CELL - 2, CELL - 2);
+    }
+  }
+  // The completion ripple
+  bump.fill(0);
+  if (G.won) {
+    for (let k = 0; k < NN; k++) {
+      const dd = Math.hypot(ROW[k] - ROW[G.winFrom], COL[k] - COL[G.winFrom]);
+      const p = (G.winT - dd * A.ripple) / A.rippleCell;
+      if (p > 0 && p < 1) {
+        const a = Math.sin(p * Math.PI);
+        bump[k] = a;
+        ctx.fillStyle = hexA(RIPPLE[Math.floor(dd) % RIPPLE.length], 0.32 * a);
+        ctx.fillRect(BX + COL[k] * CELL + 1, BY + ROW[k] * CELL + 1, CELL - 2, CELL - 2);
+      }
+    }
+    if (state === 'won') { ctx.fillStyle = hexA(C.good, 0.05); ctx.fillRect(BX, BY, BW, BW); }
+  }
+  ctx.drawImage(boardLines, BX - 20, BY - 20, BW + 40, BW + 40);
+
+  // Numbers and notes
+  const third = CELL / 3;
+  for (let k = 0; k < NN; k++) {
+    const v = G.val[k], x = cellX(k), y = cellY(k);
+    const a = clamp((G.introT - Math.hypot(ROW[k] - 4, COL[k] - 4) * A.intro) / 0.3, 0, 1);
+    if (a <= 0) continue;
+    ctx.globalAlpha = a;
+    if (v) {
+      const st = P.given[k] ? ST_GIVEN : G.hinted[k] ? ST_HINT : (showConf && G.conf[k]) ? ST_CLASH : ST_PLAYER;
+      const s = CELL * (1 + 0.2 * Math.sin(G.pop[k] * Math.PI) + 0.2 * bump[k]);
+      ctx.drawImage(digitSpr[st][v], x - s / 2, y - s / 2, s, s);
+    } else if (G.notes[k]) {
+      const n = G.notes[k], x0 = BX + COL[k] * CELL, y0 = BY + ROW[k] * CELL;
+      for (let d = 1; d <= 9; d++) {
+        if (!(n & bitOf(d))) continue;
+        const nx = x0 + ((d - 1) % 3) * third + third / 2, ny = y0 + (((d - 1) / 3) | 0) * third + third / 2;
+        const hi = d === hiD && !G.won;
+        if (hi) {
+          ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = a * 0.5;
+          ctx.drawImage(dotSprites[DOT_PLAYER], nx - 10, ny - 10, 20, 20);
+          ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = a;
+        }
+        ctx.drawImage(noteSpr[hi ? 1 : 0][d], nx - 9, ny - 9, 18, 18);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // Soft pulsing border
+  rrPath(BX - 10, BY - 10, BW + 20, BW + 20, 16);
+  ctx.globalAlpha = 0.45 + 0.12 * Math.sin(time * 0.8) + (G.won ? 0.3 : 0);
+  glowStroke(G.won ? C.good : DIFF[P.diff].color, G.won ? 2.5 : 1.5);
+  ctx.globalAlpha = 1;
+
+  if (live) {
+    if (Input.device === 'mouse' && !Input.mouse.down) {
+      const hk = cellAt(Input.mouse.x, Input.mouse.y);
+      if (hk >= 0 && hk !== k0) { cellPath(hk, 3); ctx.globalAlpha = 0.35; glowStroke('#ffffff', 1.2); ctx.globalAlpha = 1; }
+    }
+    cellPath(k0, 2);
+    ctx.globalAlpha = 0.7 + 0.3 * Math.sin(time * 4);
+    glowStroke(G.notesMode ? C.warn : '#ffffff', 2.2);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.8;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? 'rgba(154,165,255,0.16)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+function toolKey(id) {
+  if (Input.device === 'pad') {
+    const NN = padNames();
+    return { notes: NN.x, erase: NN.b, undo: NN.lt, hint: NN.y }[id];
+  }
+  if (Input.device === 'kb') return { notes: 'N', erase: '0', undo: 'U', hint: 'H' }[id];
+  return '';
+}
+
+function drawPad() {
+  const C = CFG.color, I = Input, hov = I.device === 'mouse' && state === 'play';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const b of PAD) {
+    const left = 9 - G.count[b.d], active = b.d === G.digit, hover = hov && inRect(I.mouse, b);
+    rrPath(b.x, b.y, b.w, b.h, 14);
+    ctx.fillStyle = active ? 'rgba(127,227,255,0.14)' : hover ? 'rgba(154,165,255,0.14)' : 'rgba(20,26,52,0.65)';
+    ctx.fill();
+    ctx.globalAlpha = active ? 1 : hover ? 0.9 : 0.42;
+    glowStroke(active ? C.player : C.title, active ? 2 : 1.2);
+    ctx.globalAlpha = left === 0 ? 0.35 : 1;
+    const st = G.notesMode ? ST_PADNOTE : active ? ST_PLAYER : ST_GIVEN, s = G.notesMode ? 40 : 50;
+    ctx.drawImage(digitSpr[st][b.d], b.x + b.w / 2 - s / 2, b.y + 30 - s / 2, s, s);
+    ctx.globalAlpha = 1;
+    const cy = b.y + b.h - 13;
+    if (left > 0) text(`${left} left`, b.x + b.w / 2, cy, `600 13px ${SANS}`, C.dim);
+    else if (left === 0) { // a small check mark
+      ctx.beginPath(); ctx.moveTo(b.x + b.w / 2 - 7, cy); ctx.lineTo(b.x + b.w / 2 - 2, cy + 5); ctx.lineTo(b.x + b.w / 2 + 8, cy - 5);
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round'; glowStroke(C.good, 2); ctx.lineCap = 'butt';
+    } else text(`${-left} extra`, b.x + b.w / 2, cy, `600 13px ${SANS}`, C.clash);
+  }
+  for (const t of TOOLS) {
+    const on = t.id === 'notes' && G.notesMode, hover = hov && inRect(I.mouse, t);
+    rrPath(t.x, t.y, t.w, t.h, 14);
+    ctx.fillStyle = on ? hexA(C.warn, 0.16) : hover ? 'rgba(154,165,255,0.14)' : 'rgba(20,26,52,0.65)';
+    ctx.fill();
+    ctx.globalAlpha = on ? 1 : hover ? 0.9 : 0.42;
+    glowStroke(on ? C.warn : C.title, on ? 2 : 1.2);
+    ctx.globalAlpha = 1;
+    const label = t.id === 'notes' ? (G.notesMode ? 'Notes: On' : 'Notes: Off') : t.label, key = toolKey(t.id);
+    if (key) {
+      text(label, t.x + t.w / 2, t.y + 19, `700 16px ${SANS}`, on ? C.warn : C.text);
+      text(key, t.x + t.w / 2, t.y + 37, `700 12px ${SANS}`, C.faint);
+    } else text(label, t.x + t.w / 2, t.y + t.h / 2 + 1, `700 16px ${SANS}`, on ? C.warn : C.text);
+  }
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return [`D-pad: move  ·  ${NN.lb} / ${NN.rb}: number`, `${NN.a}: place  ·  ${NN.b}: erase`, `${NN.start}: pause`];
+    case 'mouse': return ['Click a cell, then a number', 'Keys work too: 1–9, N, H, U', 'Esc or the ‖ button: pause'];
+    case 'touch': return ['Tap a cell, then a number', 'Notes, Erase, Undo and Hint', 'are just above'];
+    default: return ['Arrows: move  ·  1–9: place', '0: erase  ·  N: notes  ·  H: hint', 'U: undo  ·  Esc: pause'];
+  }
+}
+
+function drawHUD() {
+  const C = CFG.color, D = DIFF[P.diff];
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(D.label.toUpperCase(), LX, 60, `800 28px ${SANS}`, D.color);
+  text(`${P.clues} clues  ·  no rush`, LX, 92, `500 14px ${SANS}`, C.dim);
+  text('FILLED', LX, 138, `800 12px ${SANS}`, C.faint);
+  text(`${G.filled} / 81`, LX, 166, `800 28px ${MONO}`, C.text);
+  rrPath(LX - 80, 188, 160, 8, 4); ctx.fillStyle = 'rgba(131,144,189,0.18)'; ctx.fill();
+  const p = G.filled / NN;
+  if (p > 0.03) { rrPath(LX - 80, 188, 160 * p, 8, 4); ctx.fillStyle = D.color; ctx.fill(); }
+  let y = 236;
+  if (showTimer) {
+    text('TIME', LX, y, `800 12px ${SANS}`, C.faint);
+    text(fmtTime(G.time), LX, y + 28, `700 24px ${MONO}`, C.text);
+    y += 72;
+  }
+  text('SOLVED', LX, y, `800 12px ${SANS}`, C.faint);
+  text(String(solved[P.diff]), LX, y + 28, `700 24px ${SANS}`, C.dim);
+  y += 76;
+  if (G.notesMode && !G.won) {
+    rrPath(LX - 72, y - 17, 144, 34, 17); ctx.fillStyle = hexA(C.warn, 0.14); ctx.fill();
+    glowStroke(C.warn, 1.5);
+    text('NOTES ON', LX, y + 1, `800 15px ${SANS}`, C.warn);
+  }
+  y += 52;
+  if (G.hintMsgT > 0 && G.hintMsg.length) {
+    ctx.globalAlpha = Math.min(1, G.hintMsgT);
+    G.hintMsg.forEach((s, i) => text(s, LX, y + i * 22, `600 15px ${SANS}`, C.hinted));
+    ctx.globalAlpha = 1;
+  }
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  drawPad();
+  ctx.textAlign = 'center';
+  controlLines().forEach((s, i) => text(s, RX, 452 + i * 21, `500 13px ${SANS}`, i === 0 ? C.dim : C.faint));
+}
+
+function drawBanner() {
+  if (G.bannerT <= 0) return;
+  const a = Math.min(1, G.bannerT * 2, (G.bannerMax - G.bannerT) * 5);
+  ctx.globalAlpha = a;
+  rrPath(BCX - 210, BCY - 50, 420, 100, 20);
+  ctx.fillStyle = 'rgba(6,9,22,0.9)'; ctx.fill();
+  glowStroke(G.bannerColor, 1.5);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(G.banner, BCX, BCY - 14, `800 30px ${SANS}`, G.bannerColor);
+  text(G.bannerSub, BCX, BCY + 22, `500 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  renderBoard();
+  drawFx();
+  drawHUD();
+  drawBanner();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52, h = 40, w = 330) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const C = CFG.color;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(154,165,255,0.10)'; ctx.fill();
+      glowStroke(it.warn ? C.warn : C.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = it.warn ? C.warn : sel ? C.text : C.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 104, y, `700 16px ${SANS}`, sel ? C.warn : C.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawTitle() {
+  const C = CFG.color;
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  // Big numbers drifting slowly behind the menu
+  for (let i = 0; i < 12; i++) {
+    const x = ((i * 137 + time * (8 + (i % 3) * 4)) % (W + 160)) - 80;
+    const y = 50 + ((i * 193) % 440) + Math.sin(time * 0.6 + i) * 16;
+    const s = 74 + (i % 3) * 18;
+    ctx.globalAlpha = 0.14 + (i % 3) * 0.05;
+    ctx.drawImage(digitSpr[[ST_PLAYER, ST_HINT, ST_GIVEN, ST_PADNOTE][i % 4]][(i * 4) % 9 + 1], x - s / 2, y - s / 2, s, s);
+  }
+  ctx.globalAlpha = 1;
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 400);
+  shade.addColorStop(0, 'rgba(5,7,15,0.85)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON SUDOKU', W / 2, 64, `800 60px ${SANS}`, C.title);
+  text('a calm number puzzle', W / 2, 106, `500 16px ${SANS}`, C.dim);
+  const items = titleItems(), gap = 38, y0 = 152 + (8 - items.length) * 19;
+  drawMenu(items, y0, true, gap, 34);
+  const it = items[menuSel] || items[0], NN = padNames();
+  const yh = y0 + (items.length - 1) * gap + 36;
+  text(it.hint, W / 2, yh, `500 15px ${SANS}`, it.warn ? C.warn : C.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, yh + 24, `500 13px ${SANS}`, C.faint);
+
+  const yb = H - 24, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? C.good : C.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, C.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, C.dim);
+  ctx.textAlign = 'right';
+  let total = 0;
+  for (const d of DIFFS) total += solved[d];
+  text(`Solved ${fmt(total)}`, W - 24, yb, `600 12px ${MONO}`, C.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, C.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 40, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Choose a cell', 'D-pad / left stick', 'Arrows / W A S D', 'Click or tap it'],
+    ['Place a number', `${NN.lb} / ${NN.rb} choose, ${NN.a} place`, '1 – 9', 'Tap it on the number pad'],
+    ['Notes on / off', NN.x, 'N', 'Notes button'],
+    ['Erase', NN.b, '0 or Backspace', 'Erase button'],
+    ['Undo', NN.lt, 'U or Z', 'Undo button'],
+    ['Hint', NN.y, 'H', 'Hint button'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [216, 236, 470, 640];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 80, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 80, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 80, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 106 + i * 23;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 292, W - 120, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 316, `800 12px ${SANS}`, C.faint);
+    lines.forEach((s, i) => text(s, x, 342 + i * 21, `500 15px ${SANS}`, C.text));
+  };
+  col('THE PUZZLE', 60, [
+    'Fill the grid so every row,',
+    'column and 3×3 box holds',
+    'each number 1 to 9 once.',
+    'Every puzzle has exactly one',
+    'answer. Gentle and Easy',
+    'never need guessing.',
+  ]);
+  col('HELPERS', 350, [
+    'Notes: jot small candidates.',
+    'Placing a number tidies the',
+    'notes around it.',
+    'Same numbers glow together.',
+    'The pad shows how many of',
+    'each number are left.',
+    `${NN.a} on a printed number picks it.`,
+  ]);
+  col('TAKE IT EASY', 660, [
+    'No clock unless you want one,',
+    'and no mistake limit.',
+    'Clashing numbers glow softly',
+    '(Show conflicts, on the menu).',
+    'Undo anything, any time.',
+    'Hint fills a cell you could',
+    'work out next. Your board',
+    'saves itself.',
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 20, `600 14px ${SANS}`, C.dim);
+}
+
+function drawPreparing() {
+  const C = CFG.color, D = DIFF[prepDiff];
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // A small 3x3 grid that lights up cell by cell, like slow breathing
+  const s = 30, g = 8, x0 = W / 2 - (3 * s + 2 * g) / 2, y0 = 170;
+  for (let i = 0; i < 9; i++) {
+    const a = 0.5 + 0.5 * Math.sin(time * 2.4 - i * 0.7);
+    rrPath(x0 + (i % 3) * (s + g), y0 + ((i / 3) | 0) * (s + g), s, s, 8);
+    ctx.fillStyle = hexA(D.color, 0.06 + a * 0.22); ctx.fill();
+    ctx.globalAlpha = 0.35 + a * 0.6; glowStroke(D.color, 1.5); ctx.globalAlpha = 1;
+  }
+  glowText(`Preparing a ${D.label} puzzle…`, W / 2, 330, `800 30px ${SANS}`, C.text);
+  text('Each one has exactly one answer.', W / 2, 370, `500 16px ${SANS}`, C.dim);
+  text(usingPad() ? `${padNames().b}: back` : Input.device === 'touch' ? '' : 'Esc: back', W / 2, H - 30, `500 13px ${SANS}`, C.faint);
+}
+
+// A calm card behind a menu so it never competes with the board
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.95)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.55);
+  card(W / 2 - 240, 40, 480, 460);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 92, `800 46px ${SANS}`, CFG.color.text);
+  text('Your board is saved. Take your time.', W / 2, 134, `500 15px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 190, true, 46, 38);
+  const NN = padNames();
+  const foot = armed === 'new' ? 'Press New puzzle again to start a fresh one.'
+    : usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound';
+  text(foot, W / 2, 466, `500 13px ${SANS}`, armed === 'new' ? CFG.color.warn : CFG.color.faint);
+}
+
+function drawWon() {
+  const C = CFG.color, D = DIFF[P.diff];
+  overlay(Math.min(0.55, stateT * 1.5));
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 240, 78, 480, 350);
+  glowText(G.winWord, W / 2, 132, `800 50px ${SANS}`, D.color);
+  text(`${D.label}  ·  ${P.clues} clues`, W / 2, 180, `600 16px ${SANS}`, C.dim);
+  const bits = [G.hints === 0 ? 'No hints used' : G.hints === 1 ? '1 hint used' : `${G.hints} hints used`];
+  if (showTimer) bits.push(`Time ${fmtTime(G.time)}`);
+  text(bits.join('   ·   '), W / 2, 220, `600 17px ${SANS}`, C.text);
+  text(`${D.label} puzzles solved: ${solved[P.diff]}`, W / 2, 254, `500 15px ${SANS}`, C.dim);
+  drawMenu(wonItems(), 330, stateT > 0.8);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 14px ${SANS}`;
+  const inPlay = state === 'play';
+  const x = inPlay ? LX : W / 2, y = inPlay ? H - 30 : H - 52, w = Math.min(inPlay ? 206 : 600, ctx.measureText(toast.text).width + 32);
+  rrPath(x - w / 2, y - 14, w, 28, 14);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  text(toast.text, x, y, `600 14px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else if (state === 'preparing') drawPreparing();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'won') drawWon();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return;
+  if (state === 'play' && !G.won) pauseGame(); else saveBoard();
+});
+addEventListener('pagehide', () => saveBoard());
+addEventListener('resize', resize);
+Input.init();
+resize();
+{ const s = readSave(); saveInfo = s ? { diff: s.diff, filled: s.filled } : null; }
+Gen.want(diff);
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

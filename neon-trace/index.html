@@ -1,0 +1,1846 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Trace</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  rampLevels: 30,                          // levels it takes to grow from the smallest figures to the richest
+  size: { first: [5, 6], last: [25, 35] }, // lines per figure: [fewest, most] at level 1 and at the end of the ramp
+  board: { x: 236, y: 78, w: 488, h: 388 },// where figures are drawn
+  maxSpacing: 132,                         // largest gap between neighbouring dots (small figures)
+  hitFrac: 0.42,                           // how close the pointer must come to a dot, as a share of the dot gap
+  solveDelay: 2.0,                         // seconds of celebration before the "complete" card
+  lightTime: 0.14,                         // seconds for light to flow along a new line
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', title: '#bff27a', good: '#7dffc0', warn: '#ffd88a',
+  },
+  // Lit lines shift through these colours from the first line to the last
+  trail: ['#bff27a', '#6ff0c8', '#5cd5ff', '#8fa8ff', '#c08cff', '#ff8fd0'],
+};
+const NOTES = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98]; // C major pentatonic
+const WIN_WORDS = ['Lovely!', 'Beautiful', 'All lit up', 'Nicely traced', 'Smooth line', 'Wonderful', 'So calm'];
+// Eight directions, clockwise from "right" (y grows downward)
+const DIR8 = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const fmt = n => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);  // smooth in and out
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+function mixHex(a, b, t) {
+  const p = parseInt(a.slice(1), 16), q = parseInt(b.slice(1), 16);
+  const ch = s => Math.round(((p >> s) & 255) + (((q >> s) & 255) - ((p >> s) & 255)) * t);
+  return '#' + ((1 << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)).toString(16).slice(1);
+}
+function angDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= TAU;
+  while (d < -Math.PI) d += TAU;
+  return d;
+}
+// A small seeded random generator (mulberry32), so each level number always makes the same figure
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas + art (background, glow dots and the unlit figure are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, figCanvas = null;
+let dotSprites = [];                         // one per trail colour, then white, then gold
+const DOT_WHITE = CFG.trail.length, DOT_GOLD = CFG.trail.length + 1;
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  const L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[140, 110, 300, '#3a5cff', 0.09], [830, 440, 320, '#a64dff', 0.07], [880, 70, 220, '#40d0a0', 0.05], [80, 480, 240, '#ff4fa8', 0.04]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  dotSprites = [...CFG.trail, '#ffffff', CFG.color.warn].map(drawDot);
+  buildFigure();
+}
+
+// The figure before it is lit: dim glass tubes and hollow dots
+function buildFigure() {
+  if (!PZ) { figCanvas = null; return; }
+  const L = layer(W, H), g = L.g;
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  g.beginPath();
+  for (const e of PZ.edges) {
+    const a = PZ.nodes[e.a], b = PZ.nodes[e.b];
+    g.moveTo(a.px, a.py); g.lineTo(b.px, b.py);
+  }
+  g.strokeStyle = 'rgba(120,140,220,0.08)'; g.lineWidth = 18; g.stroke();
+  g.strokeStyle = '#222a4c'; g.lineWidth = 8; g.stroke();
+  g.strokeStyle = '#59658f'; g.lineWidth = 2.5; g.stroke();
+  for (const n of PZ.nodes) {
+    g.beginPath(); g.arc(n.px, n.py, 9, 0, TAU);
+    g.fillStyle = '#0c1126'; g.fill();
+    g.strokeStyle = '#7f8cbc'; g.lineWidth = 2.5; g.stroke();
+  }
+  figCanvas = L.c;
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine bells only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) { // a soft airy swell
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  // Each new line rings a little higher as the figure fills up
+  trace(p) {
+    if (!this.ok('trace', 0.04)) return;
+    const f = NOTES[clamp(Math.floor(p * NOTES.length), 0, NOTES.length - 1)];
+    this.bell(f, 0.075, 0, 0.45);
+    this.tone(f / 2, f / 2, 0.25, 'triangle', 0.02);
+  },
+  start()  { if (this.ok('start', 0.05)) { this.tone(440, 440, 0.12, 'sine', 0.045); this.tone(659.25, 659.25, 0.16, 'sine', 0.04, 0.05); } },
+  undo()   { if (this.ok('undo', 0.04)) this.tone(520, 410, 0.12, 'sine', 0.045); },
+  reset()  { if (this.ok('reset', 0.2)) { this.tone(660, 330, 0.35, 'sine', 0.045); this.noise(0.4, 0.015, 1400); } },
+  hint()   { if (this.ok('hint', 0.2)) { this.bell(1318.51, 0.035, 0, 0.5); this.bell(1567.98, 0.03, 0.09, 0.6); } },
+  stuck()  { if (this.ok('stuck', 0.4)) { this.tone(392, 392, 0.22, 'sine', 0.04); this.tone(349.23, 349.23, 0.32, 'sine', 0.035, 0.16); } },
+  solve()  {
+    if (!this.ok('solve', 0.5)) return;
+    [261.63, 329.63, 392, 493.88, 587.33, 783.99].forEach((f, i) => this.bell(f, 0.06, i * 0.09, 1.8));
+    this.noise(1.2, 0.022, 1800, 0.1);
+  },
+  nope()   { if (this.ok('nope', 0.1)) { this.tone(392, 392, 0.14, 'sine', 0.04, 0.02); this.tone(330, 330, 0.2, 'sine', 0.035, 0.12); } },
+  tick()   { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select() { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()   { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+// Keys that draw in eight directions (arrows, W A S D, Q E Z C, X, numpad)
+const DIR_KEYS = {
+  ArrowUp: [0, -1], KeyW: [0, -1], Numpad8: [0, -1],
+  ArrowDown: [0, 1], KeyS: [0, 1], KeyX: [0, 1], Numpad2: [0, 1],
+  ArrowLeft: [-1, 0], KeyA: [-1, 0], Numpad4: [-1, 0],
+  ArrowRight: [1, 0], KeyD: [1, 0], Numpad6: [1, 0],
+  KeyQ: [-1, -1], Numpad7: [-1, -1], KeyE: [1, -1], Numpad9: [1, -1],
+  KeyZ: [-1, 1], Numpad1: [-1, 1], KeyC: [1, 1], Numpad3: [1, 1],
+};
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD', ...Object.keys(DIR_KEYS)]);
+function keyDir(set) { for (const c of set) { const d = DIR_KEYS[c]; if (d) return d; } return null; }
+
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  p8: -1, p8T: 0, p8Done: true,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, padAct: false, pause: false, mute: false, select: false, back: false,
+  undo: false, hint: false, reset: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+  kdir: null, kdirFresh: null, padVec: null, padStep8: -1,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code === 'Backspace' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+      if (e.pointerType === 'mouse' && !m.down) this.device = 'mouse';
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let act = P.has('Space') || P.has('Enter') || P.has('NumpadEnter') || P.has('Numpad5');
+    let padAct = false;
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space') || P.has('NumpadEnter');
+    let back = P.has('Escape') || P.has('Backspace');
+    let undo = P.has('Backspace') || P.has('KeyU');
+    let hint = P.has('KeyH');
+    let reset = P.has('KeyR');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+    this.kdir = keyDir(K);        // with key repeat: moves the start cursor
+    this.kdirFresh = keyDir(P);   // no repeat: draws one line per press
+    let padVec = null, step8 = -1;
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) { act = true; padAct = true; }
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) { back = true; undo = true; }
+      if (tap(2)) reset = true;
+      if (tap(3)) hint = true;
+      // D-pad or left stick as a menu cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      // Eight-way aim for the board: D-pad combos (up + right = diagonal) or the stick's angle
+      let vx = (on(15) ? 1 : 0) - (on(14) ? 1 : 0), vy = (on(13) ? 1 : 0) - (on(12) ? 1 : 0);
+      if (!vx && !vy && this.ls.m > 0.45) { vx = this.ls.x; vy = this.ls.y; }
+      if (vx || vy) padVec = { x: vx, y: vy };
+      const d8 = padVec ? (Math.round(Math.atan2(vy, vx) / (Math.PI / 4)) + 8) % 8 : -1;
+      // Cursor steps wait a moment for the direction to settle, so a two-button diagonal moves once, diagonally
+      if (fresh) { this.p8 = d8; this.p8T = 0; this.p8Done = true; }
+      else if (d8 !== this.p8) { this.p8 = d8; this.p8T = 0; this.p8Done = false; }
+      else if (d8 >= 0) {
+        this.p8T += dt;
+        if (!this.p8Done) { if (this.p8T >= 0.07) { step8 = d8; this.p8Done = true; this.p8T = 0; } }
+        else if (this.p8T > 0.38) { this.p8T = 0.14; step8 = d8; }
+      }
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.padAct = padAct; this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.undo = undo; this.hint = hint; this.reset = reset;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+    this.padVec = padVec; this.padStep8 = step8;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', x: '□', y: '△', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', x: 'X', y: 'Y', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let level = clamp(Math.floor(Number(load('neonTrace.level', 1)) || 1), 1, 999999);     // the next figure to play
+let bestLevel = Math.max(level, clamp(Math.floor(Number(load('neonTrace.best', 1)) || 1), 1, 999999));
+let solvedCount = Math.max(0, Math.floor(Number(load('neonTrace.solved', 0)) || 0));
+let showStarts = load('neonTrace.startDots', '0') === '1';
+Sfx.muted = load('neonTrace.muted', '0') === '1';
+const toast = { text: '', t: 0 };
+let resultInfo = null;
+let restartArm = 0;     // "Restart from level 1" asks for a second press
+
+function showToast(text) { toast.text = text; toast.t = 2; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); G.dragging = false; Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { clearFx(); G.dragging = false; setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonTrace.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function toggleStarts() {
+  showStarts = !showStarts;
+  save('neonTrace.startDots', showStarts ? 1 : 0);
+}
+function hasSavedTrail() {
+  try { const d = JSON.parse(load('neonTrace.trail', 'null')); return !!d && d.level === level && Array.isArray(d.t) && d.t.length > 0; } catch (e) { return false; }
+}
+
+// ============================================================
+// 2. Puzzle: figures, rules and the solver
+// ============================================================
+// A figure is dots (nodes) on a small lattice joined by straight lines (edges) to their 8 neighbours.
+// Every figure comes from one unbroken walk, so it can always be drawn in one line.
+const pairKey = (a, b) => (a < b ? a * 1024 + b : b * 1024 + a);
+
+// How many lines a level's figure has: grows from 5-6 to 25-35 over CFG.rampLevels levels
+function levelRange(lv) {
+  const t = clamp((lv - 1) / CFG.rampLevels, 0, 1);
+  const [a0, b0] = CFG.size.first, [a1, b1] = CFG.size.last;
+  return { lo: Math.round(a0 + (a1 - a0) * t), hi: Math.round(b0 + (b1 - b0) * t) };
+}
+
+function latticeFor(E, mode) {
+  if (mode === 'turn') return E <= 7 ? [3, 3] : E <= 12 ? [5, 3] : E <= 20 ? [5, 5] : [7, 5];
+  let c, r;
+  if (E <= 7) { c = 3; r = 3; }
+  else if (E <= 11) { c = 4; r = 3; }
+  else if (E <= 16) { c = 4; r = 4; }
+  else if (E <= 22) { c = 5; r = 4; }
+  else if (E <= 28) { c = 5; r = 5; }
+  else { c = 6; r = 5; }
+  if (mode === 'mirror' && c % 2 === 0) c++;   // a mirror figure needs a middle column of dots
+  return [c, r];
+}
+
+// One random walk that never repeats a line. Returns [x1, y1, x2, y2] lines, or null if it got stuck.
+// 'mirror' walks the left half from a dot on the middle column and adds its mirror image;
+// 'turn' walks the top half from the centre dot and adds the half-turned copy.
+// Either way the walk's start gets an even number of lines, so the figure has 0 or 2 odd dots.
+function genWalk(rng, cols, rows, target, mode) {
+  const cx = (cols - 1) / 2, cy = (rows - 1) / 2;
+  const id = (x, y) => y * cols + x;
+  const T = mode === 'mirror' ? (x, y) => [cols - 1 - x, y] : mode === 'turn' ? (x, y) => [cols - 1 - x, rows - 1 - y] : null;
+  const inHalf = mode === 'mirror' ? (x) => x <= cx : mode === 'turn' ? (x, y) => y < cy || (y === cy && x <= cx) : () => true;
+  const used = new Set(), diag = new Set(), deg = new Map(), visited = new Set();
+  const out = [], copy = [], cand = [], inc = new Map();
+  let x = mode === 'free' ? (rng() * cols) | 0 : cx;
+  let y = mode === 'turn' ? cy : (rng() * rows) | 0, ldx = 0, ldy = 0;
+  visited.add(id(x, y));
+  const cellOf = (x1, y1, x2, y2) => Math.min(x1, x2) + Math.min(y1, y2) * cols;
+  while (out.length < target) {
+    cand.length = 0;
+    let tot = 0;
+    for (const [dx, dy] of DIR8) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows || !inHalf(nx, ny)) continue;
+      const a = id(x, y), b = id(nx, ny), k = pairKey(a, b);
+      if (used.has(k)) continue;
+      let ta = -1, tb = -1, tk = -1, tl = null;
+      if (T) {
+        const p = T(x, y), q = T(nx, ny);
+        ta = id(p[0], p[1]); tb = id(q[0], q[1]); tk = pairKey(ta, tb); tl = [p[0], p[1], q[0], q[1]];
+        if (tk === k || used.has(tk)) continue;            // a line that is its own copy (along the mirror)
+      }
+      const cell = dx && dy ? cellOf(x, y, nx, ny) : -1;
+      const tcell = cell >= 0 && tl ? cellOf(tl[0], tl[1], tl[2], tl[3]) : -1;
+      if (cell >= 0 && (diag.has(cell) || tcell === cell || (tcell >= 0 && diag.has(tcell)))) continue; // no X crossings
+      inc.clear();
+      for (const v of T ? [a, b, ta, tb] : [a, b]) inc.set(v, (inc.get(v) || 0) + 1);
+      let over = false;
+      for (const [v, n] of inc) if ((deg.get(v) || 0) + n > 6) over = true;
+      if (over) continue;
+      let w = 1;
+      if (dx === ldx && dy === ldy) w *= 2.2;                 // straight runs look like real shapes
+      else if (dx * ldx + dy * ldy < 0) w *= 0.5;             // sharp turns back look spiky
+      if (visited.has(b)) w *= 1.6;                           // closing loops makes junctions
+      if (dx && dy) w *= 0.8;
+      cand.push({ nx, ny, dx, dy, k, tk, cell, tcell, tl, a, b, ta, tb, w });
+      tot += w;
+    }
+    if (!cand.length) return null;
+    let r = rng() * tot, c = cand[cand.length - 1];
+    for (const o of cand) { r -= o.w; if (r <= 0) { c = o; break; } }
+    used.add(c.k);
+    if (c.cell >= 0) diag.add(c.cell);
+    for (const v of T ? [c.a, c.b, c.ta, c.tb] : [c.a, c.b]) deg.set(v, (deg.get(v) || 0) + 1);
+    if (T) { used.add(c.tk); if (c.tcell >= 0) diag.add(c.tcell); copy.push(c.tl); }
+    visited.add(c.b);
+    out.push([x, y, c.nx, c.ny]);
+    x = c.nx; y = c.ny; ldx = c.dx; ldy = c.dy;
+  }
+  return out.concat(copy);
+}
+
+// The widest empty gap inside a figure's box: the farthest any spot is from its nearest line
+function emptiestGap(raw, x0, x1, y0, y1) {
+  let worst = 0;
+  for (let x = x0; x <= x1 + 1e-9; x += 0.25) {
+    for (let y = y0; y <= y1 + 1e-9; y += 0.25) {
+      let best = 99;
+      for (const [ax, ay, bx, by] of raw) {
+        const dx = bx - ax, dy = by - ay, t = clamp(((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy), 0, 1);
+        const d = Math.hypot(ax + dx * t - x, ay + dy * t - y);
+        if (d < best) { best = d; if (best <= worst) break; }
+      }
+      if (best > worst) worst = best;
+    }
+  }
+  return worst;
+}
+const GAP_LIMIT = { free: 1.0, freeSmall: 0.9, mirror: 1.42, turn: 1.6 };   // larger empty gaps look unfinished
+
+// Is this a pleasant figure? Enough directions, not too thin, balanced, no big empty gaps, real junctions.
+function rawOk(raw, E, mode = 'free') {
+  if (raw.length !== E) return false;
+  const deg = new Map();
+  let cls = 0, mx = 0, my = 0, x0 = 99, x1 = -1, y0 = 99, y1 = -1;
+  for (const [a, b, c, d] of raw) {
+    const dx = c - a, dy = d - b;
+    cls |= dx === 0 ? 1 : dy === 0 ? 2 : dx * dy > 0 ? 4 : 8;
+    mx += (a + c) / 2; my += (b + d) / 2;
+    x0 = Math.min(x0, a, c); x1 = Math.max(x1, a, c); y0 = Math.min(y0, b, d); y1 = Math.max(y1, b, d);
+    const k1 = b * 64 + a, k2 = d * 64 + c;
+    deg.set(k1, (deg.get(k1) || 0) + 1); deg.set(k2, (deg.get(k2) || 0) + 1);
+  }
+  const nCls = (cls & 1) + ((cls >> 1) & 1) + ((cls >> 2) & 1) + ((cls >> 3) & 1);
+  if (nCls < (E >= 8 ? 3 : 2)) return false;
+  const sw = x1 - x0, sh = y1 - y0, midX = (x0 + x1) / 2, midY = (y0 + y1) / 2;
+  if (Math.min(sw, sh) < 1) return false;
+  if (E >= 12 && (sw < 2 || sh < 2)) return false;
+  if (Math.max(sw, sh) > 3 * Math.min(sw, sh)) return false;
+  if (Math.abs(mx / E - midX) > 0.15 * sw + 0.1) return false;
+  if (Math.abs(my / E - midY) > 0.15 * sh + 0.1) return false;
+  if (E >= 10) { // every quarter of the figure gets a fair share of its lines
+    const q = [0, 0, 0, 0];
+    for (const [a, b, c, d] of raw) {
+      const ex = (a + c) / 2, ey = (b + d) / 2;
+      const wl = ex < midX ? 1 : ex > midX ? 0 : 0.5, wt = ey < midY ? 1 : ey > midY ? 0 : 0.5;
+      q[0] += wl * wt; q[1] += (1 - wl) * wt; q[2] += wl * (1 - wt); q[3] += (1 - wl) * (1 - wt);
+    }
+    if (Math.min(...q) < E * 0.13) return false;
+  }
+  let junctions = 0;
+  for (const v of deg.values()) if (v >= 3) junctions++;
+  if (junctions < (E >= 16 ? 2 : E >= 7 ? 1 : 0)) return false;
+  const limit = mode === 'free' && E < 20 ? GAP_LIMIT.freeSmall : GAP_LIMIT[mode];
+  return E < 7 || emptiestGap(raw, x0, x1, y0, y1) <= limit + 1e-9;
+}
+
+function buildPuzzle(raw, cols, rows) {
+  const map = new Map(), nodes = [], edges = [];
+  const nodeOf = (gx, gy) => {
+    const k = gy * cols + gx;
+    let i = map.get(k);
+    if (i === undefined) { i = nodes.length; map.set(k, i); nodes.push({ gx, gy, px: 0, py: 0 }); }
+    return i;
+  };
+  for (const [x1, y1, x2, y2] of raw) edges.push({ a: nodeOf(x1, y1), b: nodeOf(x2, y2) });
+  const adj = nodes.map(() => []), edgeKey = new Map();
+  edges.forEach((e, i) => {
+    adj[e.a].push({ to: e.b, e: i }); adj[e.b].push({ to: e.a, e: i });
+    edgeKey.set(pairKey(e.a, e.b), i);
+  });
+  const odd = [];
+  adj.forEach((l, i) => { if (l.length % 2) odd.push(i); });
+  const pz = { level, cols, rows, nodes, edges, adj, odd, edgeKey, sym: false, attempts: 0, relaxed: false };
+  pz.colors = trailColors(edges.length);
+  return layoutPuzzle(pz, CFG.board, CFG.maxSpacing);
+}
+
+// Centre the figure's bounding box in `box`, as large as fits
+function layoutPuzzle(pz, box, maxS) {
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const n of pz.nodes) { x0 = Math.min(x0, n.gx); x1 = Math.max(x1, n.gx); y0 = Math.min(y0, n.gy); y1 = Math.max(y1, n.gy); }
+  const bw = Math.max(1, x1 - x0), bh = Math.max(1, y1 - y0);
+  const S = Math.min(box.w / bw, box.h / bh, maxS);
+  const cx = box.x + box.w / 2, cy = box.y + box.h / 2, mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+  for (const n of pz.nodes) { n.px = cx + (n.gx - mx) * S; n.py = cy + (n.gy - my) * S; }
+  pz.S = S; pz.hitR = clamp(S * CFG.hitFrac, 24, 46); pz.cx = cx; pz.cy = cy;
+  return pz;
+}
+
+// Colour of the i-th lit line, plus the nearest glow sprite for it
+function trailColors(E) {
+  const P = CFG.trail, out = [];
+  out.pal = [];
+  for (let i = 0; i < E; i++) {
+    const pos = (E > 1 ? i / (E - 1) : 0) * (P.length - 1), j = Math.floor(pos);
+    out.push(mixHex(P[j], P[Math.min(j + 1, P.length - 1)], pos - j));
+    out.pal.push(Math.round(pos));
+  }
+  return out;
+}
+
+function levelSeed(lv) { return (Math.imul(lv, 2654435761) ^ Math.imul(lv + 0x51ed, 0x85ebca6b) ^ 0x5bd1e995) >>> 0; }
+
+// The figure for a level number: always the same one for the same number
+function generateLevel(lv) {
+  const rng = makeRng(levelSeed(lv));
+  const { lo, hi } = levelRange(lv);
+  let E = lo + Math.floor(rng() * (hi - lo + 1));
+  const roll = rng();
+  let mode = roll < 0.42 ? 'mirror' : roll < 0.68 ? 'turn' : 'free';
+  if (mode !== 'free' && E % 2) { if (E + 1 <= hi) E++; else if (E - 1 >= lo) E--; else mode = 'free'; }
+  let [cols, rows] = latticeFor(E, mode);
+  let raw = null, attempts = 0, relaxed = false;
+  for (attempts = 1; attempts <= 1500; attempts++) {
+    const r = genWalk(rng, cols, rows, mode === 'free' ? E : E / 2, mode);
+    if (!r) continue;
+    if (rawOk(r, E, mode)) { raw = r; break; }
+    if (attempts > 1200) { raw = r; relaxed = true; break; }
+  }
+  if (!raw) { // never expected: a plain walk on a roomier lattice
+    mode = 'free'; relaxed = true; cols = 7; rows = 5;
+    while (!raw) raw = genWalk(rng, cols, rows, E, 'free');
+  }
+  const pz = buildPuzzle(raw, cols, rows);
+  pz.level = lv; pz.mode = mode; pz.sym = mode !== 'free'; pz.attempts = attempts; pz.relaxed = relaxed;
+  return pz;
+}
+
+// Can every remaining line still be drawn in one go from dot `cur`? (cur = -1: no start chosen yet)
+// Euler: the remaining lines must be connected, with 0 odd dots, or 2 odd dots one of which is `cur`.
+function completable(pz, cur, used) {
+  const nN = pz.nodes.length, deg = new Array(nN).fill(0);
+  let rem = 0;
+  for (let i = 0; i < pz.edges.length; i++) if (!used[i]) { rem++; deg[pz.edges[i].a]++; deg[pz.edges[i].b]++; }
+  if (!rem) return true;
+  let odd = 0, oddHasCur = false, any = -1;
+  for (let i = 0; i < nN; i++) {
+    if (deg[i] & 1) { odd++; if (i === cur) oddHasCur = true; }
+    if (deg[i] && any < 0) any = i;
+  }
+  let from = cur;
+  if (cur < 0) { if (odd !== 0 && odd !== 2) return false; from = any; }
+  else if (!deg[cur] || !(odd === 0 || (odd === 2 && oddHasCur))) return false;
+  const seenN = new Uint8Array(nN), seenE = new Uint8Array(pz.edges.length), stack = [from];
+  seenN[from] = 1;
+  let reached = 0;
+  while (stack.length) {
+    const n = stack.pop();
+    for (const o of pz.adj[n]) {
+      if (used[o.e]) continue;
+      if (!seenE[o.e]) { seenE[o.e] = 1; reached++; }
+      if (!seenN[o.to]) { seenN[o.to] = 1; stack.push(o.to); }
+    }
+  }
+  return reached === rem;
+}
+
+// The moves from `cur` that keep the rest drawable (Fleury's rule, checked directly)
+function goodMoves(pz, cur, used) {
+  const out = [];
+  for (const o of pz.adj[cur]) {
+    if (used[o.e]) continue;
+    used[o.e] = 1;
+    if (completable(pz, o.to, used)) out.push(o);
+    used[o.e] = 0;
+  }
+  return out;
+}
+
+function validStarts(pz) { return pz.odd.length ? pz.odd.slice() : pz.nodes.map((_, i) => i); }
+function dirAngle(pz, a, b) { const A = pz.nodes[a], B = pz.nodes[b]; return Math.atan2(B.gy - A.gy, B.gx - A.gx); }
+
+// Prefer carrying straight on; otherwise the first good move
+function pickMove(pz, prev, cur, moves) {
+  if (prev >= 0) {
+    const a = dirAngle(pz, prev, cur);
+    for (const m of moves) if (Math.abs(angDiff(dirAngle(pz, cur, m.to), a)) < 0.01) return m;
+  }
+  return moves[0];
+}
+
+// A full drawing of the figure from `start`, as a list of dots (or null if `start` can't work)
+function solvePath(pz, start) {
+  const used = new Uint8Array(pz.edges.length), path = [start];
+  if (!completable(pz, start, used)) return null;
+  let prev = -1, cur = start;
+  for (let i = 0; i < pz.edges.length; i++) {
+    const moves = goodMoves(pz, cur, used);
+    if (!moves.length) return null;
+    const m = pickMove(pz, prev, cur, moves);
+    used[m.e] = 1; path.push(m.to); prev = cur; cur = m.to;
+  }
+  return path;
+}
+
+// The dot a cursor lands on when pushed in direction (dx, dy): nearest dot inside a wide cone
+function cursorTarget(pz, from, dx, dy) {
+  const f = pz.nodes[from], a = Math.atan2(dy, dx);
+  let best = -1, bs = Infinity;
+  for (let i = 0; i < pz.nodes.length; i++) {
+    if (i === from) continue;
+    const n = pz.nodes[i], vx = n.gx - f.gx, vy = n.gy - f.gy, d = Math.hypot(vx, vy);
+    const ang = Math.abs(angDiff(Math.atan2(vy, vx), a));
+    if (ang > Math.PI * 0.375 + 1e-6) continue;
+    const s = d + ang * 2.2;
+    if (s < bs) { bs = s; best = i; }
+  }
+  return best;
+}
+
+// ============================================================
+// 3. Play: drawing, undo, reset, hints
+// ============================================================
+let PZ = null;
+const G = {
+  trail: [], tEdges: [], used: new Uint8Array(0), litT: [],
+  phase: 'trace', phaseT: 0, doneAt: 0, introT: 1,
+  cursor: 0, aim: -1, dragging: false, lastP: { x: 0, y: 0 },
+  hint: null, hintsUsed: 0, undos: 0, stuck: false, backup: null,
+  msg: '', msgT: 0, shimAcc: 0,
+};
+const curNode = () => (G.trail.length ? G.trail[G.trail.length - 1] : -1);
+const prevNode = () => (G.trail.length >= 2 ? G.trail[G.trail.length - 2] : -1);
+function edgeBetween(a, b) { const i = PZ.edgeKey.get(pairKey(a, b)); return i === undefined ? -1 : i; }
+function canMove(n) {
+  const c = curNode();
+  if (c < 0 || n < 0 || n >= PZ.nodes.length) return false;
+  const e = edgeBetween(c, n);
+  return e >= 0 && !G.used[e];
+}
+function freeEdges(n) { return PZ.adj[n].filter(o => !G.used[o.e]); }
+function flashMsg(s, t = 1.8) { G.msg = s; G.msgT = t; }
+function nope(s) { Sfx.nope(); if (s) flashMsg(s); }
+
+function centreNode(pz) {
+  let best = 0, bd = Infinity;
+  pz.nodes.forEach((n, i) => { const d = Math.hypot(n.px - pz.cx, n.py - pz.cy); if (d < bd) { bd = d; best = i; } });
+  return best;
+}
+
+function usePuzzle(pz, restore) {
+  PZ = pz;
+  const E = pz.edges.length;
+  Object.assign(G, {
+    trail: [], tEdges: [], used: new Uint8Array(E), litT: new Array(E).fill(-9),
+    phase: 'trace', phaseT: 0, doneAt: 0, introT: 0,
+    cursor: centreNode(pz), aim: -1, dragging: false,
+    hint: null, hintsUsed: 0, undos: 0, stuck: false, backup: null, msg: '', msgT: 0, shimAcc: 0,
+  });
+  if (restore) restoreTrail();
+  buildFigure();
+}
+function loadLevel(lv, restore) { usePuzzle(generateLevel(lv), restore); }
+
+function saveTrail() {
+  if (PZ && G.phase === 'trace') save('neonTrace.trail', JSON.stringify({ level: PZ.level, t: G.trail }));
+}
+// Puts back a half-drawn figure saved earlier (each step is checked; anything odd is dropped)
+function restoreTrail() {
+  let d = null;
+  try { d = JSON.parse(load('neonTrace.trail', 'null')); } catch (e) { d = null; }
+  if (!d || d.level !== PZ.level || !Array.isArray(d.t) || !d.t.length) return;
+  replay(d.t);
+  if (G.tEdges.length >= PZ.edges.length) clearTrail();
+}
+function replay(list) {
+  if (!Number.isInteger(list[0]) || !startAt(list[0], true)) return;
+  for (let i = 1; i < list.length; i++) if (!Number.isInteger(list[i]) || !tryMove(list[i], true)) break;
+}
+function clearTrail() {
+  for (const e of G.tEdges) { G.used[e] = 0; G.litT[e] = -9; }
+  G.trail = []; G.tEdges = []; G.stuck = false; G.hint = null; G.aim = -1;
+}
+
+function startAt(n, quiet) {
+  if (G.phase !== 'trace' || n < 0 || n >= PZ.nodes.length || G.tEdges.length) return false;
+  G.trail = [n]; G.cursor = n; G.backup = null; G.hint = null; G.stuck = false;
+  G.stuck = freeEdges(n).length === 0;
+  G.aim = autoAim();
+  if (!quiet) {
+    saveTrail(); Sfx.start();
+    const p = PZ.nodes[n];
+    ring(p.px, p.py, 6, 30, 0.4, CFG.trail[0], 1.6);
+  }
+  return true;
+}
+
+function tryMove(n, quiet) {
+  if (G.phase !== 'trace' || !canMove(n)) return false;
+  const e = edgeBetween(curNode(), n);
+  G.used[e] = 1; G.litT[e] = quiet ? -9 : time;
+  G.trail.push(n); G.tEdges.push(e);
+  G.backup = null; G.hint = null;
+  const i = G.tEdges.length - 1, E = PZ.edges.length;
+  if (!quiet) {
+    const p = PZ.nodes[n];
+    Sfx.trace(G.tEdges.length / E);
+    ring(p.px, p.py, 6, 26, 0.35, PZ.colors[i], 1.5);
+    burst(p.px, p.py, PZ.colors.pal[i], LOW_RES ? 3 : 6, 90, 0.5, 6, 20);
+    saveTrail();
+  }
+  if (G.tEdges.length === E) { if (!quiet) solved(); return true; }
+  G.stuck = freeEdges(n).length === 0;
+  if (G.stuck && !quiet) Sfx.stuck();
+  G.aim = autoAim();
+  return true;
+}
+
+function undo() {
+  if (G.phase !== 'trace') return false;
+  if (G.tEdges.length) {
+    const e = G.tEdges.pop();
+    G.trail.pop(); G.used[e] = 0; G.litT[e] = -9;
+    G.undos++; G.stuck = false; G.hint = null; G.cursor = curNode();
+    G.aim = autoAim();
+    Sfx.undo(); saveTrail();
+    return true;
+  }
+  if (G.trail.length) { // only a start dot: lift it
+    G.cursor = G.trail[0]; G.trail = []; G.stuck = false; G.hint = null; G.aim = -1;
+    Sfx.undo(); saveTrail();
+    return true;
+  }
+  if (G.backup) { // undo right after a Reset brings the line back
+    const b = G.backup;
+    G.backup = null;
+    replay(b);
+    saveTrail(); Sfx.select(); showToast('Your line is back');
+    return true;
+  }
+  Sfx.tick();
+  return false;
+}
+
+function resetLevel() {
+  if (G.phase !== 'trace') return false;
+  if (!G.trail.length) { Sfx.tick(); return false; }
+  const bak = G.trail.slice();
+  G.cursor = G.trail[0];
+  clearTrail();
+  G.backup = bak;
+  saveTrail(); Sfx.reset();
+  showToast('Cleared  ·  Undo brings it back');
+  return true;
+}
+
+// Pre-aim for the controller: straight on if possible, or the only line left from here
+function autoAim() {
+  const c = curNode();
+  if (c < 0) return -1;
+  const free = freeEdges(c);
+  if (!free.length) return -1;
+  const p = prevNode();
+  if (p >= 0) {
+    const a = dirAngle(PZ, p, c);
+    for (const o of free) if (Math.abs(angDiff(dirAngle(PZ, c, o.to), a)) < 0.01) return o.e;
+  }
+  return free.length === 1 ? free[0].e : -1;
+}
+
+// The free line from the current dot closest to an angle (within maxRad), or -1
+function aimAt(ax, ay, maxRad) {
+  const c = curNode(), a = Math.atan2(ay, ax);
+  let best = -1, bd = maxRad + 1e-6;
+  for (const o of freeEdges(c)) {
+    const d = Math.abs(angDiff(dirAngle(PZ, c, o.to), a));
+    if (d < bd) { bd = d; best = o.e; }
+  }
+  return best;
+}
+const otherEnd = (e, n) => (PZ.edges[e].a === n ? PZ.edges[e].b : PZ.edges[e].a);
+
+// Fewest undos that make the figure drawable again (-1: the start dot itself can't work)
+function undosNeeded() {
+  const used = G.used.slice();
+  for (let k = 0; k <= G.tEdges.length; k++) {
+    if (k > 0) used[G.tEdges[G.tEdges.length - k]] = 0;
+    if (completable(PZ, G.trail[G.trail.length - 1 - k], used)) return k;
+  }
+  return -1;
+}
+function nearestStart(from) {
+  const starts = validStarts(PZ), f = PZ.nodes[from];
+  let best = starts[0], bd = Infinity;
+  for (const s of starts) { const n = PZ.nodes[s], d = Math.hypot(n.px - f.px, n.py - f.py); if (d < bd) { bd = d; best = s; } }
+  return best;
+}
+
+function requestHint() {
+  if (G.phase !== 'trace') return;
+  const c = curNode();
+  let h;
+  if (c < 0) {
+    h = { kind: 'start', node: nearestStart(G.cursor) };
+    G.cursor = h.node;
+  } else if (completable(PZ, c, G.used)) {
+    const m = pickMove(PZ, prevNode(), c, goodMoves(PZ, c, G.used));
+    h = { kind: 'edge', e: m.e, from: c, to: m.to };
+    G.aim = m.e;
+  } else {
+    const k = undosNeeded();
+    h = k < 0 ? { kind: 'reset', node: nearestStart(G.trail[0]) } : { kind: 'undo', k };
+  }
+  const same = G.hint && JSON.stringify(G.hint) === JSON.stringify(h);
+  if (!same) G.hintsUsed++;
+  G.hint = h;
+  Sfx.hint();
+}
+
+function solved() {
+  G.phase = 'done'; G.phaseT = 0; G.doneAt = time; G.aim = -1; G.dragging = false; G.hint = null; G.stuck = false;
+  resultInfo = { level: PZ.level, lines: PZ.edges.length, hints: G.hintsUsed, undos: G.undos, word: WIN_WORDS[(PZ.level - 1) % WIN_WORDS.length] };
+  level = PZ.level + 1;
+  bestLevel = Math.max(bestLevel, level);
+  solvedCount++;
+  save('neonTrace.level', level); save('neonTrace.best', bestLevel); save('neonTrace.solved', solvedCount);
+  save('neonTrace.trail', 'null');
+  Sfx.solve();
+  PZ.nodes.forEach((n, i) => ring(n.px, n.py, 6, 36, 0.9, CFG.trail[i % CFG.trail.length], 1.6));
+  ring(PZ.cx, PZ.cy, 20, 320, 1.3, CFG.color.title, 2);
+}
+
+function startPlay(restore) {
+  Sfx.init();
+  clearFx();
+  loadLevel(level, restore);
+  setState('play');
+}
+function restartGame() {
+  level = 1;
+  save('neonTrace.level', 1); save('neonTrace.trail', 'null');
+  startPlay(false);
+}
+
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const HINT_BTN = { x: 772, y: 148, w: 164, h: 56 };
+const UNDO_BTN = { x: 772, y: 216, w: 164, h: 56 };
+const RESET_BTN = { x: 772, y: 284, w: 164, h: 56 };
+
+function nodeNear(x, y, r) {
+  let best = -1, bd = r;
+  PZ.nodes.forEach((n, i) => { const d = Math.hypot(n.px - x, n.py - y); if (d < bd) { bd = d; best = i; } });
+  return best;
+}
+
+// Mouse and touch: press a dot, then drag through its neighbours
+function pointerInput() {
+  const m = Input.mouse;
+  if (m.clicked) {
+    G.dragging = false;
+    const n = nodeNear(m.x, m.y, PZ.hitR), c = curNode();
+    if (n >= 0) {
+      if (c < 0) { startAt(n); G.dragging = true; }
+      else if (n === c) G.dragging = true;
+      else if (canMove(n)) { tryMove(n); G.dragging = G.phase === 'trace'; }   // tap a neighbour to extend
+      else if (!G.tEdges.length) { startAt(n); G.dragging = true; }          // move the start dot
+      else if (n === prevNode()) { undo(); G.dragging = true; }              // tap the last dot to step back
+      else nope('Carry on from the bright dot');
+    }
+    G.lastP.x = m.x; G.lastP.y = m.y;
+  }
+  if (G.dragging && m.down && G.phase === 'trace') {
+    // Walk from the last pointer spot in small steps so a quick swipe never skips a dot
+    const dx = m.x - G.lastP.x, dy = m.y - G.lastP.y;
+    const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / 8));
+    for (let i = 1; i <= steps && G.phase === 'trace'; i++) dragAt(G.lastP.x + (dx * i) / steps, G.lastP.y + (dy * i) / steps);
+    G.lastP.x = m.x; G.lastP.y = m.y;
+  }
+  if (!m.down) G.dragging = false;
+}
+function dragAt(x, y) {
+  const c = curNode();
+  if (c < 0) return;
+  let best = -1, bd = PZ.hitR;
+  for (const o of PZ.adj[c]) {
+    if (G.used[o.e]) continue;
+    const n = PZ.nodes[o.to], d = Math.hypot(n.px - x, n.py - y);
+    if (d < bd) { bd = d; best = o.to; }
+  }
+  if (best >= 0) { tryMove(best); return; }
+  const p = prevNode();
+  if (p >= 0 && Math.hypot(PZ.nodes[p].px - x, PZ.nodes[p].py - y) < PZ.hitR) undo(); // drag back: retrace one step
+}
+
+function moveCursor(dx, dy) {
+  const t = cursorTarget(PZ, G.cursor, dx, dy);
+  if (t >= 0) { G.cursor = t; Sfx.tick(); }
+}
+
+// Keyboard and controller on the board
+function keyPadInput() {
+  const I = Input;
+  if (!G.trail.length) { // choosing a start dot
+    if (I.kdir) moveCursor(I.kdir[0], I.kdir[1]);
+    else if (I.padStep8 >= 0) moveCursor(DIR8[I.padStep8][0], DIR8[I.padStep8][1]);
+    if (I.act) startAt(G.cursor);
+    return;
+  }
+  // Keyboard: one press draws one line (exact direction, or the only line near it)
+  if (I.kdirFresh) {
+    const c = curNode(), a = Math.atan2(I.kdirFresh[1], I.kdirFresh[0]);
+    let exact = -1;
+    const near = [];
+    for (const o of freeEdges(c)) {
+      const d = Math.abs(angDiff(dirAngle(PZ, c, o.to), a));
+      if (d < 0.01) exact = o.to; else if (d < Math.PI / 4 + 0.01) near.push(o.to);
+    }
+    const t = exact >= 0 ? exact : near.length === 1 ? near[0] : -1;
+    if (t >= 0) tryMove(t);
+    else if (!G.stuck) nope(near.length > 1 ? 'Two lines that way: use Q E Z C for diagonals' : 'No line that way');
+    else Sfx.nope();
+  }
+  if (G.phase !== 'trace' || !G.trail.length) return;
+  // Controller: point at a line (it shows dashed), then A draws it
+  if (I.padVec) {
+    const e = aimAt(I.padVec.x, I.padVec.y, (50 * Math.PI) / 180);
+    if (e !== G.aim && e >= 0) Sfx.tick();
+    if (e >= 0) G.aim = e;
+    else if (!G.stuck) { G.aim = -1; flashMsg('No line that way', 0.25); }
+  }
+  if (I.padAct) {
+    if (G.aim >= 0 && !G.used[G.aim]) tryMove(otherEnd(G.aim, curNode()));
+    else nope(G.stuck ? '' : 'Point at a line, then press ' + padNames().a);
+  } else if (I.act && !I.padAct) {
+    nope(G.stuck ? '' : 'Arrows or Q E Z C draw the lines');
+  }
+}
+
+function playInput() {
+  const I = Input, m = I.mouse;
+  if (m.clicked && inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+  if (m.clicked && inRect(m, SOUND_BTN)) { toggleSound(); return; }
+  if (G.phase === 'done') {
+    if (G.phaseT > 0.5 && (I.act || I.select || m.clicked)) toWin();
+    return;
+  }
+  if (m.clicked && inRect(m, HINT_BTN)) { requestHint(); return; }
+  if (m.clicked && inRect(m, UNDO_BTN)) { undo(); return; }
+  if (m.clicked && inRect(m, RESET_BTN)) { resetLevel(); return; }
+  if (I.hint) requestHint();
+  if (I.undo) undo();
+  if (I.reset) resetLevel();
+  pointerInput();
+  if (G.phase === 'trace') keyPadInput();
+}
+
+function toWin() { setState('win'); Sfx.blip(); }
+
+function updatePlay(dt) {
+  G.phaseT += dt;
+  if (G.introT < 1) G.introT = Math.min(1, G.introT + dt / 0.6);
+  if (G.msgT > 0) G.msgT -= dt;
+  playInput();
+  if (state !== 'play') return; // paused from the on-screen button
+  if (G.phase === 'done') {
+    shimmer(dt, LOW_RES ? 30 : 70);
+    if (G.phaseT >= CFG.solveDelay) toWin();
+  }
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 120 : 300, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6, g: 40 }));
+const rings = new Pool(64, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 24); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: i % CFG.trail.length });
+}
+
+function burst(x, y, ci, n, speed, life = 0.7, size = 7, g = 40) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8); p.g = g;
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+// Soft sparkles rising off the finished figure
+function shimmer(dt, rate) {
+  if (!PZ || !G.tEdges.length) return;
+  G.shimAcc += dt * rate;
+  while (G.shimAcc >= 1) {
+    G.shimAcc -= 1;
+    const i = (Math.random() * G.tEdges.length) | 0, a = PZ.nodes[G.trail[i]], b = PZ.nodes[G.trail[i + 1]], t = Math.random();
+    const p = parts.get();
+    if (!p) return;
+    p.x = a.px + (b.px - a.px) * t; p.y = a.py + (b.py - a.py) * t;
+    p.vx = rand(-12, 12); p.vy = rand(-45, -15); p.g = -8;
+    p.max = p.life = rand(0.8, 1.5); p.ci = PZ.colors.pal[i]; p.size = rand(5, 10);
+  }
+}
+function clearFx() { parts.clear(); rings.clear(); }
+
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt), slow = Math.pow(0.5, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    const d = p.g < 0 ? slow : drag;
+    p.vx *= d; p.vy = p.vy * d + p.g * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    o.life -= dt;
+    if (o.life <= 0) o.active = false;
+  }
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function startsItem() {
+  return { id: 'dots', label: 'Start dots', value: showStarts ? 'On' : 'Off', cycle: () => toggleStarts(), hint: 'Glow on the dots where a full line can begin.' };
+}
+function titleItems() {
+  const saved = hasSavedTrail();
+  return [
+    { id: 'play', label: level > 1 || saved ? `Continue  ·  level ${level}` : 'Play  ·  level 1',
+      hint: saved ? 'Pick up your line where you left it.' : level > 1 ? `Your next figure is level ${level}.` : 'Begin with a small, simple figure.' },
+    { id: 'restart', label: restartArm > 0 ? 'Press again to restart' : 'Restart from level 1', hint: 'Back to the first, smallest figure. Your best level is kept.' },
+    startsItem(),
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Controls, the rules and a few tips.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() {
+  return [{ id: 'resume', label: 'Resume' }, { id: 'reset', label: 'Reset level' }, startsItem(), soundItem(), { id: 'quit', label: 'Quit to menu' }];
+}
+function winItems() { return [{ id: 'next', label: `Next figure  ·  level ${level}` }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (restartArm > 0) restartArm -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'play') startPlay(true);
+      else if (id === 'restart') {
+        if (level === 1 || restartArm > 0) { restartArm = 0; restartGame(); }
+        else { restartArm = 3; showToast('Press again to restart from level 1'); }
+      } else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 4; Sfx.blip(); }
+      break;
+    case 'play':
+      if (Input.pause) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'reset') { resumeGame(); resetLevel(); }
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'win':
+      shimmer(dt, LOW_RES ? 6 : 16);
+      if (stateT > 0.6) {
+        const id = menuInput(winItems());
+        if (id === 'next') startPlay(false);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); }
+function segPath(a, b, p = 1) { ctx.beginPath(); ctx.moveTo(a.px, a.py); ctx.lineTo(a.px + (b.px - a.px) * p, a.py + (b.py - a.py) * p); }
+function sprite(i, x, y, d) { ctx.drawImage(dotSprites[i], x - d / 2, y - d / 2, d, d); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.12 + 0.09 * Math.sin(time * 0.9 + m.ph);
+    sprite(m.ci, m.x, m.y, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// An animated dashed line between two dots (aim, hint)
+function dashLine(a, b, color, w, alpha) {
+  segPath(a, b);
+  ctx.setLineDash([10, 9]); ctx.lineDashOffset = -time * 32;
+  ctx.globalAlpha = alpha; glowStroke(color, w);
+  ctx.setLineDash([]); ctx.lineDashOffset = 0; ctx.globalAlpha = 1;
+}
+function pulseRing(n, r, color, w, alpha) {
+  circle(n.px, n.py, r);
+  ctx.globalAlpha = alpha; glowStroke(color, w); ctx.globalAlpha = 1;
+}
+
+function drawFigure() {
+  const P = PZ, N = P.nodes, c = curNode(), tracing = G.phase === 'trace' && state === 'play';
+  const finished = G.phase === 'done' || state === 'win';
+  ctx.globalAlpha = ease(G.introT);
+  ctx.drawImage(figCanvas, 0, 0, W, H);
+  ctx.globalAlpha = 1;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+  // Lines still free from the current dot glow a little brighter
+  if (tracing && c >= 0) {
+    ctx.beginPath();
+    for (const o of P.adj[c]) if (!G.used[o.e]) { ctx.moveTo(N[c].px, N[c].py); ctx.lineTo(N[o.to].px, N[o.to].py); }
+    ctx.strokeStyle = 'rgba(190,205,255,0.42)'; ctx.lineWidth = 3.5; ctx.stroke();
+  }
+
+  // Lit lines: light flows from dot to dot; the finished figure pulses in a slow wave
+  const dc = time - G.doneAt;
+  for (let i = 0; i < G.tEdges.length; i++) {
+    const e = G.tEdges[i], a = N[G.trail[i]], b = N[G.trail[i + 1]];
+    let w = 5, al = 1;
+    if (finished) {
+      const wave = Math.sin(dc * 4 - i * 0.45);
+      w = 5 + 2.2 * Math.max(0, wave) * Math.min(1, dc); al = 0.85 + 0.15 * wave;
+    }
+    segPath(a, b, clamp((time - G.litT[e]) / CFG.lightTime, 0, 1));
+    ctx.globalAlpha = al; glowStroke(P.colors[i], w);
+  }
+  ctx.globalAlpha = 1;
+
+  const h = tracing ? G.hint : null, pulse = 0.5 + 0.5 * Math.sin(time * 4);
+  // Hint "undo k steps": those lines turn amber
+  if (h && h.kind === 'undo') {
+    for (let i = G.tEdges.length - h.k; i < G.tEdges.length; i++) dashLine(N[G.trail[i]], N[G.trail[i + 1]], CFG.color.warn, 3, 0.9);
+  }
+  if (h && h.kind === 'edge') dashLine(N[h.from], N[h.to], CFG.color.warn, 3.5, 0.75 + 0.25 * pulse);
+  // Controller aim: the line A will draw
+  if (tracing && usingPad() && G.aim >= 0 && !G.used[G.aim] && c >= 0 && !(h && h.kind === 'edge' && h.e === G.aim)) {
+    const t = otherEnd(G.aim, c);
+    dashLine(N[c], N[t], '#ffffff', 3, 0.85);
+    pulseRing(N[t], 15, '#ffffff', 1.5, 0.5 + 0.3 * pulse);
+  }
+  // Rubber band from the bright dot to the finger / mouse while dragging
+  const m = Input.mouse;
+  if (tracing && G.dragging && m.down && c >= 0) {
+    ctx.beginPath(); ctx.moveTo(N[c].px, N[c].py); ctx.lineTo(m.x, m.y);
+    ctx.setLineDash([6, 8]); ctx.globalAlpha = 0.45; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  }
+
+  // Dots on the line take the colour of the line that reached them
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < G.trail.length; i++) {
+    const n = N[G.trail[i]], k = Math.max(0, i - 1);
+    ctx.globalAlpha = 0.5; sprite(P.colors.pal[k], n.px, n.py, 34);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  for (let i = 0; i < G.trail.length; i++) {
+    const n = N[G.trail[i]], k = Math.max(0, i - 1);
+    circle(n.px, n.py, 8); ctx.fillStyle = P.colors[k]; ctx.fill();
+    circle(n.px, n.py, 3.2); ctx.fillStyle = '#ffffff'; ctx.fill();
+  }
+
+  // Start dots (menu option): gold rings while nothing is drawn
+  if (showStarts && !G.tEdges.length && P.odd.length && !finished) {
+    for (const s of P.odd) pulseRing(N[s], 15 + 2 * pulse, CFG.color.warn, 2, 0.55 + 0.35 * pulse);
+  }
+  // Hint start dot
+  if (h && (h.kind === 'start' || h.kind === 'reset')) {
+    const n = N[h.node];
+    ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.35 + 0.3 * pulse;
+    sprite(DOT_GOLD, n.px, n.py, 70);
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+    pulseRing(n, 20 + 5 * pulse, CFG.color.warn, 2.5, 0.9);
+  }
+  // The bright dot: where the line carries on from
+  if (c >= 0 && !finished) {
+    const n = N[c], k = Math.max(0, G.trail.length - 2);
+    ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.55 + 0.25 * pulse;
+    sprite(P.colors.pal[k], n.px, n.py, 52 + 8 * pulse);
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+    circle(n.px, n.py, 5.5); ctx.fillStyle = '#ffffff'; ctx.fill();
+    pulseRing(n, 13, G.stuck ? CFG.color.warn : '#ffffff', 2, 0.75);
+  }
+  if (tracing && c < 0) {
+    // Cursor for keyboard / controller, hover ring for the mouse
+    const dev = Input.device;
+    if (dev === 'kb' || dev === 'pad') pulseRing(N[G.cursor], 17 + 2 * pulse, '#ffffff', 2.2, 0.85);
+    else if (dev === 'mouse' && !m.down) {
+      const k = nodeNear(m.x, m.y, P.hitR);
+      if (k >= 0) pulseRing(N[k], 16, '#ffffff', 2, 0.6);
+    }
+  } else if (tracing && Input.device === 'mouse' && !m.down) {
+    const k = nodeNear(m.x, m.y, P.hitR);
+    if (k >= 0 && canMove(k)) pulseRing(N[k], 15, '#ffffff', 1.6, 0.5);
+  }
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    circle(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p));
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = Math.min(1, (p.life / p.max) * 1.6);
+    sprite(p.ci, p.x, p.y, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? 'rgba(191,242,122,0.14)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+function drawIcon(kind, cx, cy, col) {
+  ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2.6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  if (kind === 'hint') { // a four-point sparkle
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4 - Math.PI / 2, d = i % 2 ? 3.4 : 11;
+      if (i) ctx.lineTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d); else ctx.moveTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d);
+    }
+    ctx.closePath(); ctx.fill();
+  } else if (kind === 'undo') { // a curved arrow turning back to the left
+    ctx.arc(cx + 2, cy + 3, 8, Math.PI, Math.PI * 2.35); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx - 11, cy - 1); ctx.lineTo(cx - 6, cy + 6); ctx.lineTo(cx - 1, cy - 1); ctx.stroke();
+  } else { // reset: a circle arrow
+    ctx.arc(cx, cy, 9, Math.PI * 0.3, Math.PI * 1.85); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx + 2, cy - 14); ctx.lineTo(cx + 8, cy - 8.5); ctx.lineTo(cx + 1, cy - 4); ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
+}
+
+function drawActionButton(r, icon, label, key, glow, enabled) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r) && enabled;
+  const C = CFG.color;
+  ctx.globalAlpha = enabled ? 1 : 0.45;
+  rrPath(r.x, r.y, r.w, r.h, 16);
+  ctx.fillStyle = glow ? 'rgba(255,216,138,0.13)' : hover ? 'rgba(191,242,122,0.13)' : 'rgba(18,24,50,0.7)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * (glow ? 0.65 + 0.35 * Math.sin(time * 5) : hover ? 1 : 0.5);
+  glowStroke(glow ? C.warn : C.title, glow ? 2 : 1.3);
+  ctx.globalAlpha = a;
+  const cy = r.y + r.h / 2, col = glow ? C.warn : C.text;
+  drawIcon(icon, r.x + 28, cy, col);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  text(label, r.x + 50, cy + 1, `700 20px ${SANS}`, col);
+  if (key) {
+    ctx.font = `700 13px ${SANS}`;
+    const w = Math.max(24, ctx.measureText(key).width + 12);
+    rrPath(r.x + r.w - 14 - w, cy - 12, w, 24, 8); ctx.fillStyle = 'rgba(131,144,189,0.14)'; ctx.fill();
+    ctx.textAlign = 'center';
+    text(key, r.x + r.w - 14 - w / 2, cy + 1, `700 13px ${SANS}`, C.dim);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function keyGlyphs() {
+  const NN = padNames();
+  if (Input.device === 'pad') return { hint: NN.y, undo: NN.b, reset: NN.x };
+  if (Input.device === 'touch') return { hint: '', undo: '', reset: '' };
+  return { hint: 'H', undo: 'U', reset: 'R' };
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return G.trail.length
+      ? ['Point the stick at a line,', `then ${NN.a} draws it`, `${NN.start}: pause  ·  ${NN.select}: sound`]
+      : ['D-pad / stick: pick a dot', `${NN.a}: start there`, `${NN.start}: pause  ·  ${NN.select}: sound`];
+    case 'mouse': return ['Drag through the dots', 'Drag back to undo a step', 'Esc or ‖ button: pause'];
+    case 'touch': return ['Drag through the dots', 'Lift any time: it stays', 'Drag back to undo a step'];
+    default: return G.trail.length
+      ? ['Arrows: draw a line', 'Q E Z C: diagonals', 'Esc: pause  ·  M: sound']
+      : ['Arrows: pick a dot', 'Space: start there', 'Esc: pause  ·  M: sound'];
+  }
+}
+
+function statusLine() {
+  const C = CFG.color, h = G.hint;
+  if (G.phase === 'done' || state === 'win') return [resultInfo ? resultInfo.word : '', C.title];
+  if (G.msgT > 0 && G.msg) return [G.msg, C.dim];
+  if (h) {
+    if (h.kind === 'start') return ['Hint: start on the glowing dot', C.warn];
+    if (h.kind === 'edge') return ['Hint: follow the glowing line', C.warn];
+    if (h.kind === 'undo') return [`Hint: this line can't finish  ·  undo ${h.k} step${h.k > 1 ? 's' : ''}`, C.warn];
+    return [G.tEdges.length ? 'Hint: start on the glowing dot  ·  press Reset' : 'Hint: start on the glowing dot instead', C.warn];
+  }
+  if (G.stuck) return ['No more lines from here  ·  Undo or Reset', C.warn];
+  if (!G.trail.length) {
+    if (showStarts) return [PZ.odd.length ? 'Start on one of the glowing dots' : 'Any dot can start this one', C.text];
+    return [Input.device === 'touch' || Input.device === 'mouse' ? 'Press a dot, then draw through the lines' : 'Pick a dot to start from', C.text];
+  }
+  if (!G.tEdges.length) return ['Draw every line once, without lifting off the figure', C.dim];
+  const left = PZ.edges.length - G.tEdges.length;
+  return [left === 1 ? 'Just 1 line to go' : `${left} lines to go`, C.dim];
+}
+
+function drawHUD() {
+  const C = CFG.color, LX = 118, RX = 854, E = PZ.edges.length, n = G.tEdges.length;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const [msg, col] = statusLine();
+  if (msg && state !== 'win') text(msg, W / 2, 40, `600 19px ${SANS}`, col);
+  // Left: level, progress, start info, hints
+  text('LEVEL', LX, 90, `800 13px ${SANS}`, C.faint);
+  glowText(String(PZ.level), LX, 130, `800 46px ${SANS}`, C.title);
+  text('LINES', LX, 192, `800 13px ${SANS}`, C.faint);
+  text(`${n} / ${E}`, LX, 222, `800 28px ${MONO}`, C.text);
+  rrPath(LX - 76, 246, 152, 9, 4.5); ctx.fillStyle = 'rgba(131,144,189,0.18)'; ctx.fill();
+  if (n) { rrPath(LX - 76, 246, Math.max(9, 152 * n / E), 9, 4.5); ctx.fillStyle = PZ.colors[n - 1]; ctx.fill(); }
+  text('START', LX, 300, `800 13px ${SANS}`, C.faint);
+  text(showStarts ? (PZ.odd.length ? 'a glowing dot' : 'any dot') : 'your choice', LX, 326, `600 17px ${SANS}`, showStarts ? C.warn : C.dim);
+  text('HINTS USED', LX, 380, `800 13px ${SANS}`, C.faint);
+  text(String(G.hintsUsed), LX, 406, `700 20px ${SANS}`, C.dim);
+  // Right: sound + pause, then Hint / Undo / Reset and the controls
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  const K = keyGlyphs(), h = G.hint, tracing = G.phase === 'trace';
+  drawActionButton(HINT_BTN, 'hint', 'Hint', K.hint, false, tracing);
+  drawActionButton(UNDO_BTN, 'undo', 'Undo', K.undo, tracing && (G.stuck || (h && h.kind === 'undo')), tracing && (G.trail.length > 0 || !!G.backup));
+  drawActionButton(RESET_BTN, 'reset', 'Reset', K.reset, tracing && ((G.stuck && n > 2) || (h && h.kind === 'reset' && n > 0)), tracing && G.trail.length > 0);
+  ctx.textAlign = 'center';
+  controlLines().forEach((s, i) => text(s, RX, 384 + i * 22, `500 14px ${SANS}`, i < 2 ? C.dim : C.faint));
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  drawFigure();
+  drawFx();
+  drawHUD();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 330, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(191,242,122,0.10)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 16px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+// Two small figures beside the title menu that keep drawing themselves
+let DEMOS = null;
+function demoFigures() {
+  if (DEMOS) return DEMOS;
+  DEMOS = [];
+  for (const [from, mode, box] of [[12, 'mirror', { x: 40, y: 170, w: 210, h: 250 }], [16, 'turn', { x: 710, y: 170, w: 210, h: 250 }]]) {
+    let pz = null;
+    for (let lv = from; lv < from + 60; lv++) { pz = generateLevel(lv); if (pz.mode === mode) break; }
+    layoutPuzzle(pz, box, 70);
+    pz.path = solvePath(pz, validStarts(pz)[0]) || [];
+    DEMOS.push(pz);
+  }
+  return DEMOS;
+}
+function drawDemos() {
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  demoFigures().forEach((pz, k) => {
+    const N = pz.nodes, E = pz.path.length - 1;
+    ctx.beginPath();
+    for (const e of pz.edges) { ctx.moveTo(N[e.a].px, N[e.a].py); ctx.lineTo(N[e.b].px, N[e.b].py); }
+    ctx.globalAlpha = 0.6; ctx.strokeStyle = '#2a3358'; ctx.lineWidth = 4; ctx.stroke();
+    if (E > 0) {
+      const prog = (time * 2 + k * 9) % (E + 6), fade = prog > E ? 1 - (prog - E) / 6 : 1;
+      for (let i = 0; i < Math.min(E, Math.ceil(prog)); i++) {
+        segPath(N[pz.path[i]], N[pz.path[i + 1]], Math.min(1, prog - i));
+        ctx.globalAlpha = 0.55 * fade; glowStroke(pz.colors[i], 3.5);
+      }
+    }
+  });
+  ctx.globalAlpha = 1;
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  drawDemos();
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 380);
+  shade.addColorStop(0, 'rgba(5,7,15,0.82)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON TRACE', W / 2, 78, `800 64px ${SANS}`, CFG.color.title);
+  text('draw the whole shape in one line', W / 2, 122, `500 16px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), y0 = 176, gap = 44;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap + 2, `500 15px ${SANS}`, CFG.color.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, y0 + items.length * gap + 26, `500 13px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 26, pad = Input.pad;
+  circle(30, yb, 4); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`Level ${fmt(level)}  ·  Best ${fmt(bestLevel)}  ·  Solved ${fmt(solvedCount)}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, CFG.color.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 40, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Pick a start dot', `D-pad / stick, then ${NN.a}`, 'Arrows, then Space', 'Press a dot'],
+    ['Draw a line', `Point at it, then ${NN.a}`, 'Arrows · Q E Z C · numpad', 'Drag through the dots'],
+    ['Undo a step', NN.b, 'U or Backspace', 'Drag back, or Undo'],
+    ['Hint', NN.y, 'H', 'Hint button'],
+    ['Reset the figure', NN.x, 'R', 'Reset button'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [212, 232, 440, 660];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 80, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 80, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 80, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 106 + i * 24;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 280, W - 120, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 304, `800 12px ${SANS}`, C.faint);
+    lines.forEach((s, i) => text(s, x, 330 + i * 23, `500 15px ${SANS}`, C.text));
+  };
+  col('THE PUZZLE', 60, [
+    'Draw every line of the figure',
+    'in one go: each line once,',
+    'with no gaps. Start on any dot.',
+    'Lift whenever you like: your',
+    'line stays. No timer, and',
+    'no way to lose.',
+  ]);
+  col('WITH A CONTROLLER', 360, [
+    'Point the stick or D-pad at a',
+    'line: it shows dashed. Press',
+    `${NN.a} to draw it. Straight on is`,
+    'aimed for you, so long runs',
+    `are just ${NN.a}, ${NN.a}, ${NN.a}. ${NN.b} steps back.`,
+  ]);
+  col('TIPS', 670, [
+    'A dot with an odd number',
+    'of lines must be where you',
+    'start or finish. Stuck? Undo,',
+    'or ask for a hint. Undo right',
+    'after Reset brings it back.',
+    'Start dots (menu) shows starts.',
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 22, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the figure
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.94)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  card(W / 2 - 240, 62, 480, 420);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 118, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time.', W / 2, 160, `500 15px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 214, true, 48);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 448, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawWin() {
+  overlay(Math.min(0.5, stateT * 1.2));
+  const r = resultInfo, C = CFG.color, NN = padNames();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 230, 104, 460, 330);
+  glowText(r.word, W / 2, 158, `800 46px ${SANS}`, C.title);
+  text(`Level ${r.level} complete`, W / 2, 204, `700 20px ${SANS}`, C.text);
+  text(`${r.lines} lines  ·  ${r.hints ? r.hints + (r.hints > 1 ? ' hints' : ' hint') : 'no hints'}`, W / 2, 236, `500 16px ${SANS}`, C.dim);
+  drawMenu(winItems(), 298, stateT > 0.6, 52);
+  text(usingPad() ? `${NN.a}: choose   ·   ${NN.b}: menu` : Input.device === 'touch' ? 'Tap an option' : Input.device === 'mouse' ? 'Click an option' : 'Enter: choose   ·   Esc: menu',
+    W / 2, 404, `500 13px ${SANS}`, C.faint);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 15px ${SANS}`;
+  const y = state === 'play' ? H - 24 : H - 52, w = ctx.measureText(toast.text).width + 34;
+  rrPath(W / 2 - w / 2, y - 14, w, 28, 14);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  text(toast.text, W / 2, y, `600 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'win') drawWin();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

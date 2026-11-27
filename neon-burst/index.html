@@ -1,0 +1,1788 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Burst</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const COLS = 12;                                   // bubbles per row
+const R = 18, D = R * 2;                           // bubble radius and diameter
+const ROW_H = R * Math.sqrt(3);                    // distance between rows (hex packing)
+const FW = (2 * COLS + 1) * R;                     // field width (shifted rows stick out by R)
+const FX = (W - FW) / 2, FY = 16;                  // field left edge and ceiling
+const DANGER_ROW = 12;                             // a bubble resting in this row (or lower) has crossed the line
+const ROWS = DANGER_ROW + 2;                       // rows stored (room to snap just past the line)
+const NCELL = ROWS * COLS;
+const WALL_L = FX + R, WALL_R = FX + FW - R, CEIL = FY + R;   // limits for a bubble's centre
+const DANGER_Y = CEIL + (DANGER_ROW - 1) * ROW_H + R + 3;     // the dashed line under the last safe row
+const LAUNCH_X = W / 2, LAUNCH_Y = 488;            // the launcher (every shot starts here)
+const STEP = 4;                                    // shots move in fixed 4 px steps: the same path at any speed or frame rate
+const HIT_R = D * 0.8;                             // a shot sticks when its centre gets this close to a bubble's centre
+const AIM_MAX = 1.36;                              // widest aim, in radians from straight up (about 78 degrees)
+const MAX_STEPS = 3000;                            // safety limit for one shot
+const STRIP_Y = LAUNCH_Y - 30;                     // touch: below this line, swipes fine-tune the aim
+const FLOOR_Y = H - 22;                            // dropped bubbles bounce once here
+const SPR = D + 18;                                // bubble sprite size (room for the glow)
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  shotSpeed: 1050,                                 // pixels per second
+  missesPerRow: 6,                                 // Classic: a new row pushes down after this many misses
+  points: { pop: 10, drop: 20, clear: 500 },       // per popped bubble, per dropped bubble, field-clear bonus (Classic: x level)
+  relax: { rows: 6, colors: 5 },                   // Relax fields
+  classicRows: level => Math.min(5 + level, 8),    // Classic: rows in a new field
+  classicColors: level => (level < 3 ? 5 : 6),     // Classic: colours in a new field
+  cluster: 0.45,                                   // chance a new field bubble copies a neighbour (pleasant groups)
+  // Aim speeds in radians per second (touch: radians per pixel of swipe)
+  aim: { slow: 0.45, fast: 1.3, ramp: 0.45, fine: 0.22, touch: 0.0035 },
+  // Animation times in seconds
+  anim: { intro: 0.8, push: 0.35, clear: 1.7, ending: 1.8, popWave: 0.045, pop: 0.26, reload: 0.12, slide: 0.07, load: 0.16 },
+  color: {
+    text: '#e8f0ff', dim: '#8d9ac6', faint: '#66729f', title: '#c6f36b', ui: '#8fd8ff', good: '#7dffc0', warn: '#ffd88a',
+  },
+};
+// Six bubble kinds. Each has its own colour AND its own symbol, so they're easy to tell apart.
+const BUBBLES = [
+  { color: '#4fe3ff', sym: 'ring' },
+  { color: '#ff6fcf', sym: 'diamond' },
+  { color: '#ffe066', sym: 'triangle' },
+  { color: '#6dff9e', sym: 'square' },
+  { color: '#a68bff', sym: 'plus' },
+  { color: '#ff9a5c', sym: 'star' },
+];
+const KINDS = BUBBLES.length;
+const NOTES = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98]; // C major pentatonic
+const DROP_WORDS = ['Nice drop', 'Lovely', 'Wonderful', 'Dreamy', 'Sublime'];
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const fmt = n => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+
+// Hex field: cell k = row * COLS + col. Every row has COLS cells; a "shifted" row sits R to the right.
+// `parity` flips each time a row is pushed in at the top, so every bubble keeps its place on screen.
+const rowOf = k => (k / COLS) | 0, colOf = k => k % COLS;
+const shiftOf = (r, parity) => (r + parity) & 1;
+const rowY = r => CEIL + r * ROW_H;
+const cellX = (k, parity) => WALL_L + colOf(k) * D + shiftOf(rowOf(k), parity) * R;
+const cellY = k => rowY(rowOf(k));
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas + art (bubbles, field and background are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, panelCanvas = null;
+let bubbleSprites = [], dotSprites = [];   // dotSprites[0..5] bubble colours, [6] white
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+// The white symbol inside a bubble (with a dark edge so it reads on every colour)
+function drawSymbol(g, sym, s) {
+  const dark = 'rgba(5,8,20,0.55)', light = 'rgba(255,255,255,0.95)';
+  g.lineJoin = 'round'; g.lineCap = 'round';
+  if (sym === 'ring') {
+    g.beginPath(); g.arc(0, 0, s * 0.7, 0, TAU);
+    g.strokeStyle = dark; g.lineWidth = s * 0.5 + 3; g.stroke();
+    g.strokeStyle = light; g.lineWidth = s * 0.5; g.stroke();
+    return;
+  }
+  g.beginPath();
+  if (sym === 'diamond') {
+    g.moveTo(0, -s * 1.08); g.lineTo(s * 0.8, 0); g.lineTo(0, s * 1.08); g.lineTo(-s * 0.8, 0); g.closePath();
+  } else if (sym === 'triangle') {
+    g.moveTo(0, -s * 1.02); g.lineTo(s * 0.98, s * 0.72); g.lineTo(-s * 0.98, s * 0.72); g.closePath();
+  } else if (sym === 'square') {
+    rr(g, -s * 0.76, -s * 0.76, s * 1.52, s * 1.52, s * 0.2);
+  } else if (sym === 'plus') {
+    const a = s * 0.32, L = s * 0.98;
+    const P = [[-a, -L], [a, -L], [a, -a], [L, -a], [L, a], [a, a], [a, L], [-a, L], [-a, a], [-L, a], [-L, -a], [-a, -a]];
+    P.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+    g.closePath();
+  } else { // star
+    for (let i = 0; i < 10; i++) {
+      const an = -Math.PI / 2 + i * Math.PI / 5, d = i % 2 ? s * 0.46 : s * 1.1;
+      if (i) g.lineTo(Math.cos(an) * d, Math.sin(an) * d); else g.moveTo(Math.cos(an) * d, Math.sin(an) * d);
+    }
+    g.closePath();
+  }
+  g.strokeStyle = dark; g.lineWidth = 3; g.stroke();
+  g.fillStyle = light; g.fill();
+}
+
+function drawBubbleSprite(t) {
+  const { c, g } = layer(SPR, SPR), col = BUBBLES[t].color, r = R - 1;
+  g.translate(SPR / 2, SPR / 2);
+  const halo = g.createRadialGradient(0, 0, r * 0.6, 0, 0, SPR / 2);
+  halo.addColorStop(0, hexA(col, 0.24)); halo.addColorStop(1, hexA(col, 0));
+  g.fillStyle = halo; g.fillRect(-SPR / 2, -SPR / 2, SPR, SPR);
+  const body = g.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r);
+  body.addColorStop(0, hexA(col, 0.78)); body.addColorStop(0.7, hexA(col, 0.34)); body.addColorStop(1, hexA(col, 0.5));
+  g.beginPath(); g.arc(0, 0, r, 0, TAU); g.fillStyle = body; g.fill();
+  // Neon rim: wide faint strokes under a thin bright one
+  g.strokeStyle = col;
+  g.globalAlpha = 0.14; g.lineWidth = 7; g.stroke();
+  g.globalAlpha = 0.3; g.lineWidth = 3.5; g.stroke();
+  g.globalAlpha = 1; g.lineWidth = 1.8; g.stroke();
+  drawSymbol(g, BUBBLES[t].sym, R * 0.42);
+  g.globalAlpha = 0.5; g.fillStyle = '#ffffff';
+  g.beginPath(); g.ellipse(-r * 0.45, -r * 0.52, r * 0.2, r * 0.11, -0.7, 0, TAU); g.fill();
+  g.globalAlpha = 1;
+  return c;
+}
+
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  let L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[120, 120, 300, '#3a5cff', 0.1], [850, 430, 320, '#a64dff', 0.08], [860, 80, 220, '#20c0d0', 0.06], [90, 470, 240, '#8fdc3c', 0.05]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  // Field: a dark panel, a little lighter near the launcher
+  L = layer(FW + 40, H - FY + 40); g = L.g;
+  g.translate(20, 20);
+  rr(g, -12, -12, FW + 24, H - FY + 40, 18);
+  const pg = g.createLinearGradient(0, 0, 0, H - FY);
+  pg.addColorStop(0, 'rgba(8,11,26,0.9)'); pg.addColorStop(1, 'rgba(14,19,42,0.9)');
+  g.fillStyle = pg; g.fill();
+  panelCanvas = L.c;
+  bubbleSprites = BUBBLES.map((_, t) => drawBubbleSprite(t));
+  dotSprites = [...BUBBLES.map(b => b.color), '#ffffff'].map(drawDot);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine bells only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) { // a soft airy swell
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  shoot()   { if (this.ok('shoot', 0.05)) { this.tone(520, 740, 0.14, 'sine', 0.045); this.noise(0.18, 0.012, 1400); } },
+  bounce()  { if (this.ok('bounce', 0.06)) this.tone(988, 988, 0.08, 'sine', 0.025); },
+  land()    { if (this.ok('land', 0.05)) this.tone(392, 330, 0.14, 'triangle', 0.05); },
+  pop(i)    { // rises up the scale as the pop spreads through a group
+    if (!this.ok('pop', 0.03)) return;
+    const f = NOTES[clamp(i, 0, NOTES.length - 1)];
+    this.bell(f, 0.09, 0, 0.45);
+  },
+  plink()   { if (this.ok('plink', 0.05)) { const f = NOTES[(Math.random() * NOTES.length) | 0] * 2; this.tone(f, f * 0.98, 0.18, 'sine', 0.022); } },
+  swap()    { if (this.ok('swap', 0.05)) { this.tone(440, 554, 0.1, 'sine', 0.04); this.tone(554, 440, 0.1, 'sine', 0.03, 0.08); } },
+  push()    { if (this.ok('push', 0.2)) { this.tone(262, 196, 0.45, 'sine', 0.05); this.noise(0.5, 0.018, 600); } },
+  room()    { if (this.ok('room', 0.3)) { this.bell(659.25, 0.05, 0, 0.7); this.bell(523.25, 0.045, 0.16, 0.9); } },
+  clear()   { if (this.ok('clear', 0.5)) [523.25, 659.25, 783.99, 1046.5, 1318.51].forEach((f, i) => this.bell(f, 0.06, i * 0.12, 1.1)); },
+  ending()  { if (this.ok('ending', 0.5)) [659.25, 587.33, 523.25].forEach((f, i) => this.bell(f, 0.05, i * 0.22, 1.2)); },
+  finish()  { if (this.ok()) [261.63, 329.63, 392, 493.88, 523.25].forEach((f, i) => this.bell(f, 0.06, i * 0.11, 1.5)); },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select()  { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()    { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 }, rs: { x: 0, y: 0, m: 0 },
+  act: false, pause: false, mute: false, select: false, back: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+  shoot: false, swap: false, aimCoarse: 0, aimFine: 0, digitalAim: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code === 'Tab' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+      if (e.pointerType === 'mouse' && !m.down) { m.type = 'mouse'; this.device = 'mouse'; } // hovering aims
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys, KK = this.keys;
+    let act = P.has('Space') || P.has('Enter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+    // In play: aim, shoot, swap
+    let shoot = P.has('Space') || P.has('Enter') || P.has('ArrowUp') || P.has('KeyW');
+    let swap = P.has('KeyS') || P.has('Tab') || P.has('ArrowDown');
+    const shift = KK.has('ShiftLeft') || KK.has('ShiftRight');
+    const kx = ((KK.has('ArrowRight') || KK.has('KeyD')) ? 1 : 0) - ((KK.has('ArrowLeft') || KK.has('KeyA')) ? 1 : 0);
+    let coarse = shift ? 0 : kx, fine = shift ? kx : 0, digital = coarse !== 0;
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      radial(pad.axes[2] || 0, pad.axes[3] || 0, 0.2, this.rs);
+      if (tap(0)) { act = true; shoot = true; }
+      if (tap(2) || tap(3)) swap = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      // Aim: D-pad left/right (ramped), left stick x (analog), right stick x (fine)
+      const dpx = (on(15) ? 1 : 0) - (on(14) ? 1 : 0);
+      if (dpx) { coarse = dpx; digital = true; } else if (this.ls.x) { coarse += this.ls.x * Math.abs(this.ls.x); digital = false; }
+      fine += this.rs.x;
+      // D-pad or left stick as a menu cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0 || this.rs.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    } else {
+      this.ls.x = this.ls.y = this.ls.m = 0;
+      this.rs.x = this.rs.y = this.rs.m = 0;
+    }
+    this.act = act; this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+    this.shoot = shoot; this.swap = swap;
+    this.aimCoarse = clamp(coarse, -1, 1); this.aimFine = clamp(fine, -1, 1); this.digitalAim = digital;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', x: '□', y: '△', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', x: 'X', y: 'Y', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let mode = 'relax';                                                    // 'relax' or 'classic'
+let relaxBest = Number(load('neonBurst.relaxBest', 0)) || 0;           // highest Relax score
+let classicBest = Number(load('neonBurst.classicBest', 0)) || 0;       // highest Classic score
+let classicLevel = Number(load('neonBurst.classicLevel', 0)) || 0;     // highest Classic level reached
+let totalPopped = Number(load('neonBurst.popped', 0)) || 0;            // bubbles popped or dropped, all time
+Sfx.muted = load('neonBurst.muted', '0') === '1';
+const toast = { text: '', t: 0 };
+let resultInfo = null;
+
+function showToast(text) { toast.text = text; toast.t = 2; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); G.touch = null; Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { saveProgress(); clearFx(); setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonBurst.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+
+// ============================================================
+// 2. Field logic. The field is a flat Int8Array: a colour index, or -1 for empty.
+// ============================================================
+// Neighbour lists for both parities, worked out once.
+const NB = [0, 1].map(parity => {
+  const all = [];
+  for (let k = 0; k < NCELL; k++) {
+    const r = rowOf(k), c = colOf(k), list = [];
+    const add = (rr2, cc) => { if (rr2 >= 0 && rr2 < ROWS && cc >= 0 && cc < COLS) list.push(rr2 * COLS + cc); };
+    add(r, c - 1); add(r, c + 1);
+    // A shifted row's neighbours above and below are at c and c+1; an unshifted row's at c-1 and c.
+    const lo = shiftOf(r, parity) ? c : c - 1;
+    for (const dr of [-1, 1]) { add(r + dr, lo); add(r + dr, lo + 1); }
+    all.push(list);
+  }
+  return all;
+});
+
+// The cell whose centre is closest to (x, y)
+function nearestCell(x, y, parity) {
+  const r0 = clamp(Math.round((y - CEIL) / ROW_H), 0, ROWS - 1);
+  let best = -1, bd = Infinity;
+  for (let r = r0 - 1; r <= r0 + 1; r++) {
+    if (r < 0 || r >= ROWS) continue;
+    const c0 = clamp(Math.round((x - WALL_L - shiftOf(r, parity) * R) / D), 0, COLS - 1);
+    for (let c = c0 - 1; c <= c0 + 1; c++) {
+      if (c < 0 || c >= COLS) continue;
+      const k = r * COLS + c, dx = cellX(k, parity) - x, dy = cellY(k) - y, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = k; }
+    }
+  }
+  return best;
+}
+
+const mark = new Int32Array(NCELL);
+let markId = 0;
+// Every same-coloured bubble connected to k, in ripple order. depthOut[i] = steps from k.
+function findCluster(g, parity, k, depthOut) {
+  const col = g[k];
+  if (depthOut) depthOut.length = 0;
+  if (col < 0) return [];
+  const id = ++markId, out = [k], nb = NB[parity];
+  mark[k] = id;
+  if (depthOut) depthOut.push(0);
+  for (let i = 0; i < out.length; i++) {
+    for (const n of nb[out[i]]) {
+      if (mark[n] !== id && g[n] === col) { mark[n] = id; out.push(n); if (depthOut) depthOut.push(depthOut[i] + 1); }
+    }
+  }
+  return out;
+}
+
+// Bubbles no longer connected to the ceiling (through any colour)
+function findFloating(g, parity) {
+  const id = ++markId, q = [], nb = NB[parity];
+  for (let c = 0; c < COLS; c++) if (g[c] >= 0) { mark[c] = id; q.push(c); }
+  for (let i = 0; i < q.length; i++) {
+    for (const n of nb[q[i]]) if (mark[n] !== id && g[n] >= 0) { mark[n] = id; q.push(n); }
+  }
+  const out = [];
+  for (let k = COLS; k < NCELL; k++) if (g[k] >= 0 && mark[k] !== id) out.push(k);
+  return out;
+}
+
+// Moves a shot `len` pixels, bouncing off the side walls
+function moveShot(s, len) {
+  const px = s.x, py = s.y;
+  s.x += s.dx * len; s.y += s.dy * len;
+  if (s.x < WALL_L || s.x > WALL_R) {
+    const wx = s.x < WALL_L ? WALL_L : WALL_R;
+    s.by = py + (s.y - py) * ((px - wx) / (px - s.x));   // where it touched the wall (for the guide)
+    s.bx = wx;
+    s.x = 2 * wx - s.x; s.dx = -s.dx; s.bounces++;
+  }
+}
+// The closest bubble within HIT_R of (x, y), or -1
+function touching(x, y, g, parity) {
+  let hit = -1, hd = HIT_R * HIT_R;
+  const r0 = Math.round((y - CEIL) / ROW_H);
+  for (let r = r0 - 1; r <= r0 + 1; r++) {
+    if (r < 0 || r >= ROWS) continue;
+    const c0 = Math.round((x - WALL_L - shiftOf(r, parity) * R) / D);
+    for (let c = c0 - 1; c <= c0 + 1; c++) {
+      if (c < 0 || c >= COLS) continue;
+      const k = r * COLS + c;
+      if (g[k] < 0) continue;
+      const dx = cellX(k, parity) - x, dy = cellY(k) - y, d = dx * dx + dy * dy;
+      if (d < hd) { hd = d; hit = k; }
+    }
+  }
+  return hit;
+}
+// Moves a shot one STEP, then checks bubbles and the ceiling. When it touches a bubble,
+// the step is replayed in 8 small pieces so it stops at the first touch (accurate contact).
+// Returns -2 while flying, -1 for the ceiling, or the cell of the bubble it touched.
+function stepShot(s, g, parity) {
+  const px = s.x, py = s.y, pdx = s.dx, pb = s.bounces;
+  moveShot(s, STEP);
+  let hit = touching(s.x, s.y, g, parity);
+  if (hit >= 0) {
+    s.x = px; s.y = py; s.dx = pdx; s.bounces = pb;
+    for (let i = 0; i < 8; i++) {
+      moveShot(s, STEP / 8);
+      const h = touching(s.x, s.y, g, parity);
+      if (h >= 0) { hit = h; break; }
+    }
+    return hit;
+  }
+  if (s.y <= CEIL) return -1;
+  return -2;
+}
+
+let snapFallbacks = 0;   // should stay 0: counted by the tests
+// Where a shot that stopped at (x, y) settles: the nearest free cell next to the bubble it hit,
+// or the nearest free top-row cell if it reached the ceiling.
+function snapCell(g, parity, x, y, hit) {
+  let best = -1, bd = Infinity;
+  const consider = k => {
+    if (g[k] >= 0) return;
+    const dx = cellX(k, parity) - x, dy = cellY(k) - y, d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = k; }
+  };
+  if (hit >= 0) for (const k of NB[parity][hit]) consider(k);
+  else for (let c = 0; c < COLS; c++) consider(c);
+  if (best >= 0) return best;
+  snapFallbacks++;
+  for (let k = 0; k < NCELL; k++) consider(k);
+  return best;
+}
+
+// Follows a shot from (x, y) at `aim` until it stops, with the exact same steps as a real shot.
+// `pts` (optional) gets the start, each wall bounce and the end point.
+const tmpShot = { x: 0, y: 0, dx: 0, dy: 0, bounces: 0, bx: 0, by: 0 };
+function traceShot(x, y, aim, g, parity, pts) {
+  const s = tmpShot;
+  s.x = x; s.y = y; s.dx = Math.sin(aim); s.dy = -Math.cos(aim); s.bounces = 0;
+  if (pts) { pts.length = 0; pts.push(x, y); }
+  let res = -1, n = 0;
+  for (; n < MAX_STEPS; n++) {
+    const b = s.bounces;
+    res = stepShot(s, g, parity);
+    if (pts && s.bounces !== b) pts.push(s.bx, s.by);
+    if (res !== -2) break;
+  }
+  if (res === -2) res = -1;   // safety: treat a runaway as reaching the ceiling
+  if (pts) pts.push(s.x, s.y);
+  return { k: snapCell(g, parity, s.x, s.y, res), hit: res, bounces: s.bounces, x: s.x, y: s.y, steps: n + 1 };
+}
+
+// A fresh field with soft clusters of colour
+function genField(rows, nColors, parity) {
+  const g = new Int8Array(NCELL).fill(-1);
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const k = r * COLS + c;
+      let col = (Math.random() * nColors) | 0;
+      if (Math.random() < CFG.cluster) {
+        const ns = NB[parity][k].filter(n => n < k && g[n] >= 0);
+        if (ns.length) col = g[pick(ns)];
+      }
+      g[k] = col;
+    }
+  }
+  return g;
+}
+
+// Moves every row down one and puts `row` on top. Returns the new parity (bubbles keep their x).
+function shiftDown(g, parity, row) {
+  g.copyWithin(COLS, 0, NCELL - COLS);
+  for (let c = 0; c < COLS; c++) g[c] = row[c];
+  return parity ^ 1;
+}
+
+function colorsOnBoard(g) {
+  const seen = [];
+  for (let k = 0; k < NCELL; k++) { const t = g[k]; if (t >= 0 && !seen.includes(t)) seen.push(t); }
+  return seen.sort((a, b) => a - b);
+}
+function lowestRow(g) {
+  for (let k = NCELL - 1; k >= 0; k--) if (g[k] >= 0) return rowOf(k);
+  return -1;
+}
+const isEmpty = g => lowestRow(g) < 0;
+
+// ============================================================
+// 3. Play: aiming, shots, pops, drops and the two modes
+// ============================================================
+let grid = new Int8Array(NCELL).fill(-1);
+const bump = new Float32Array(NCELL);     // a little wobble around where a shot lands
+const guidePts = [];
+
+const G = {
+  score: 0, shown: 0, level: 1, fields: 0, misses: 0, shots: 0, popped: 0, dropped: 0, bestDrop: 0, tidies: 0,
+  phase: 'aim', phaseT: 0, parity: 0, nColors: 5, fieldRows: 6, gridVer: 0,
+  aim: 0, aimHold: 0, aimDir: 0, touch: null, reload: 0,
+  cur: 0, next: 1, loadT: 0, swapT: 0, curGlow: 0, nextGlow: 0,
+  shot: { x: 0, y: 0, dx: 0, dy: 0, bounces: 0, bx: 0, by: 0, dist: 0, steps: 0, col: 0, predicted: -1, active: false },
+  guide: null, guideAim: NaN, guideVer: -1,
+  lastLand: null, guideMisses: 0,
+  slideK: -1, slideX: 0, slideY: 0, slideT: 0, impX: 0, impY: 0,
+  banner: '', bannerSub: '', bannerColor: '#fff', bannerT: 0, bannerMax: 1,
+  word: '', wordT: 0,
+};
+
+function dealColor() {
+  const cs = colorsOnBoard(grid);
+  return cs.length ? pick(cs) : (Math.random() * G.nColors) | 0;
+}
+// Only colours still on the board are dealt: a loaded bubble whose colour is gone changes, with a shimmer.
+function refreshLoaded() {
+  const cs = colorsOnBoard(grid);
+  if (!cs.length) return;
+  if (!cs.includes(G.cur)) { G.cur = pick(cs); G.curGlow = 1; }
+  if (!cs.includes(G.next)) { G.next = pick(cs); G.nextGlow = 1; }
+}
+
+function newField() {
+  G.fieldRows = mode === 'relax' ? CFG.relax.rows : CFG.classicRows(G.level);
+  G.nColors = mode === 'relax' ? CFG.relax.colors : CFG.classicColors(G.level);
+  G.parity = 0;
+  grid = genField(G.fieldRows, G.nColors, 0);
+  bump.fill(0);
+  G.gridVer++;
+  G.misses = 0;
+  G.phase = 'intro'; G.phaseT = 0;
+  refreshLoaded();
+}
+
+function startGame(m) {
+  saveProgress();
+  mode = m;
+  Sfx.init();
+  clearFx();
+  Object.assign(G, {
+    score: 0, shown: 0, level: 1, fields: 0, misses: 0, shots: 0, popped: 0, dropped: 0, bestDrop: 0, tidies: 0,
+    aim: 0, aimHold: 0, aimDir: 0, touch: null, reload: 0, loadT: 0, swapT: 0, curGlow: 0, nextGlow: 0,
+    guide: null, guideAim: NaN, guideVer: -1, lastLand: null, guideMisses: 0,
+    slideK: -1, slideT: 0, bannerT: 0, wordT: 0,
+  });
+  G.shot.active = false;
+  newField();
+  G.cur = dealColor(); G.next = dealColor();
+  setState('play');
+}
+
+function banner(title, sub, color, t = 2.4) {
+  G.banner = title; G.bannerSub = sub; G.bannerColor = color; G.bannerT = G.bannerMax = t;
+}
+
+function addScore(pts) {
+  G.score += pts;
+  if (mode === 'relax' && G.score > relaxBest) relaxBest = G.score;
+}
+
+function canFire() { return state === 'play' && G.phase === 'aim' && G.reload <= 0; }
+
+function updateGuide() {
+  if (G.guideAim === G.aim && G.guideVer === G.gridVer && G.guide) return;
+  G.guide = traceShot(LAUNCH_X, LAUNCH_Y, G.aim, grid, G.parity, guidePts);
+  G.guideAim = G.aim; G.guideVer = G.gridVer;
+}
+
+function fire() {
+  if (!canFire()) return false;
+  updateGuide();
+  const sh = G.shot;
+  sh.x = LAUNCH_X; sh.y = LAUNCH_Y; sh.dx = Math.sin(G.aim); sh.dy = -Math.cos(G.aim);
+  sh.bounces = 0; sh.dist = 0; sh.steps = 0; sh.col = G.cur; sh.predicted = G.guide.k; sh.active = true;
+  G.cur = G.next; G.next = dealColor(); G.loadT = 1; G.curGlow = 0;
+  G.phase = 'fly'; G.phaseT = 0;
+  Sfx.shoot();
+  return true;
+}
+
+function swapBubbles() {
+  if (state !== 'play' || G.phase === 'ending') return;
+  const t = G.cur; G.cur = G.next; G.next = t;
+  G.swapT = 1;
+  Sfx.swap();
+}
+
+function bumpAround(k) {
+  G.impX = cellX(k, G.parity); G.impY = cellY(k);
+  for (const n of NB[G.parity][k]) {
+    bump[n] = 1;
+    for (const n2 of NB[G.parity][n]) if (n2 !== k && bump[n2] < 0.6) bump[n2] = 0.6;
+  }
+}
+
+// The shot has stopped: it joins the field, then pops, drops, row pushes and field changes follow.
+function land(k, hit) {
+  const sh = G.shot, col = sh.col, P = G.parity;
+  sh.active = false;
+  grid[k] = col; G.gridVer++;
+  G.shots++;
+  G.lastLand = { k, predicted: sh.predicted, hit, bounces: sh.bounces };
+  if (k !== sh.predicted) G.guideMisses++;
+  G.slideK = k; G.slideX = sh.x; G.slideY = sh.y; G.slideT = 1;
+  bumpAround(k);
+  const depth = [];
+  const cluster = findCluster(grid, P, k, depth);
+  let popped = 0;
+  if (cluster.length >= 3) {
+    let sx = 0, sy = 0, maxDelay = 0;
+    cluster.forEach((j, i) => {
+      const x = cellX(j, P), y = cellY(j), d = depth[i] * CFG.anim.popWave;
+      spawnFx(FX_POP, grid[j], x, y, d, depth[i]);
+      sx += x; sy += y; maxDelay = Math.max(maxDelay, d);
+      grid[j] = -1;
+    });
+    popped = cluster.length;
+    const pts = popped * CFG.points.pop, px = sx / popped, py = sy / popped;
+    addScore(pts);
+    floater('+' + fmt(pts), px, py, BUBBLES[col].color, 22);
+    const floating = findFloating(grid, P);
+    if (floating.length) {
+      for (const j of floating) {
+        spawnFx(FX_DROP, grid[j], cellX(j, P), cellY(j), maxDelay + 0.1 + Math.random() * 0.08, 0);
+        grid[j] = -1;
+      }
+      const n = floating.length, dpts = n * CFG.points.drop;
+      addScore(dpts);
+      floater(`+${fmt(dpts)} drop bonus`, px, py + 30, CFG.color.warn, 22);   // just under the pop score
+      G.dropped += n;
+      if (n > G.bestDrop) G.bestDrop = n;
+      if (n >= 4) { G.word = DROP_WORDS[Math.min(DROP_WORDS.length - 1, ((n - 4) / 4) | 0)]; G.wordT = 1.8; }
+      totalPopped += n;
+    }
+    G.gridVer++;
+    G.popped += popped; totalPopped += popped;
+  } else {
+    Sfx.land();
+  }
+  G.phase = 'aim'; G.phaseT = 0; G.reload = CFG.anim.reload;
+  if (isEmpty(grid)) fieldCleared();
+  else if (lowestRow(grid) >= DANGER_ROW) {
+    if (mode === 'classic') startEnding(); else tidyField();
+  } else if (!popped && mode === 'classic' && ++G.misses >= CFG.missesPerRow) {
+    G.misses = 0;
+    pushNewRow();
+  }
+  refreshLoaded();
+  saveProgress();
+}
+
+// Classic: a new row slides in at the top
+function pushNewRow() {
+  const row = [];
+  for (let c = 0; c < COLS; c++) {
+    let t = (Math.random() * G.nColors) | 0;
+    if (c > 0 && Math.random() < CFG.cluster) t = row[c - 1];
+    row.push(t);
+  }
+  G.parity = shiftDown(grid, G.parity, row);
+  bump.fill(0); G.slideT = 0;
+  G.gridVer++;
+  G.phase = 'push'; G.phaseT = 0;
+  Sfx.push();
+}
+
+function afterPush() {
+  if (lowestRow(grid) >= DANGER_ROW) startEnding();
+  else { G.phase = 'aim'; G.phaseT = 0; }
+}
+
+function fieldCleared() {
+  G.fields++;
+  const bonus = mode === 'relax' ? CFG.points.clear : CFG.points.clear * G.level;
+  addScore(bonus);
+  if (mode === 'classic') {
+    G.level++;
+    if (G.level > classicLevel) { classicLevel = G.level; save('neonBurst.classicLevel', classicLevel); }
+    banner(`Level ${G.level}`, `Field cleared  ·  +${fmt(bonus)}`, CFG.color.title, 2.2);
+  } else {
+    banner('Field cleared!', `+${fmt(bonus)}  ·  a fresh field drifts in`, CFG.color.title, 2.2);
+  }
+  for (let i = 0; i < 3; i++) ring(W / 2, H * 0.35, 10, 200 + i * 60, 1 + i * 0.2, BUBBLES[(G.fields + i) % KINDS].color, 2.5);
+  G.phase = 'clear'; G.phaseT = 0;
+  Sfx.clear();
+}
+
+// Relax never ends: if bubbles reach the line, the lowest rows drift softly away.
+function tidyField() {
+  const P = G.parity;
+  for (let k = (DANGER_ROW - 3) * COLS; k < NCELL; k++) {
+    if (grid[k] >= 0) { spawnFx(FX_FADE, grid[k], cellX(k, P), cellY(k), Math.random() * 0.25, 0); grid[k] = -1; }
+  }
+  for (const j of findFloating(grid, P)) { spawnFx(FX_FADE, grid[j], cellX(j, P), cellY(j), Math.random() * 0.25, 0); grid[j] = -1; }
+  G.gridVer++; G.tidies++;
+  banner('Making a little room', 'The lowest rows drift away', CFG.color.ui, 2.2);
+  Sfx.room();
+  if (isEmpty(grid)) fieldCleared();
+}
+
+function startEnding() {
+  G.phase = 'ending'; G.phaseT = 0;
+  banner('Round complete', 'The bubbles reached the line', CFG.color.warn, CFG.anim.ending);
+  Sfx.ending();
+}
+
+function finishClassic() {
+  const isBest = G.score > classicBest;
+  if (isBest) { classicBest = G.score; save('neonBurst.classicBest', classicBest); }
+  if (G.level > classicLevel) { classicLevel = G.level; save('neonBurst.classicLevel', classicLevel); }
+  resultInfo = { score: G.score, best: classicBest, isBest, level: G.level, popped: G.popped, dropped: G.dropped, bestDrop: G.bestDrop };
+  saveProgress();
+  setState('result');
+  Sfx.finish();
+}
+
+function saveProgress() {
+  save('neonBurst.relaxBest', relaxBest);
+  save('neonBurst.popped', totalPopped);
+}
+
+function fieldOffY() {
+  if (G.phase === 'intro') return -(G.fieldRows * ROW_H + 60) * (1 - easeOut(Math.min(1, G.phaseT / CFG.anim.intro)));
+  if (G.phase === 'push') return -ROW_H * (1 - easeOut(Math.min(1, G.phaseT / CFG.anim.push)));
+  return 0;
+}
+
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const NEXT_POS = { x: LAUNCH_X - 86, y: LAUNCH_Y + 6 }, SWAP_POS = { x: LAUNCH_X + 86, y: LAUNCH_Y + 6 };
+const NEXT_BTN = { x: NEXT_POS.x - 34, y: NEXT_POS.y - 32, w: 68, h: 68 };
+const SWAP_BTN = { x: SWAP_POS.x - 34, y: SWAP_POS.y - 32, w: 68, h: 68 };
+const LAUNCH_BTN = { x: LAUNCH_X - 36, y: LAUNCH_Y - 36, w: 72, h: 72 };
+const onButton = p => inRect(p, PAUSE_BTN) || inRect(p, SOUND_BTN) || inRect(p, NEXT_BTN) || inRect(p, SWAP_BTN);
+
+function aimFromPoint(x, y) {
+  const dx = x - LAUNCH_X, dy = Math.max(8, LAUNCH_Y - y);
+  return clamp(Math.atan2(dx, dy), -AIM_MAX, AIM_MAX);
+}
+
+// Aiming and shooting by controller, keyboard, mouse and touch
+function playInput(dt) {
+  const I = Input, m = I.mouse;
+  if (m.clicked && inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+  if (m.clicked && inRect(m, SOUND_BTN)) { toggleSound(); return; }
+  if (m.clicked && (inRect(m, SWAP_BTN) || inRect(m, NEXT_BTN))) { swapBubbles(); G.touch = null; return; }
+
+  // Keys, D-pad and sticks turn the launcher
+  const A = CFG.aim;
+  if (I.aimCoarse) {
+    const dir = Math.sign(I.aimCoarse);
+    if (dir !== G.aimDir) { G.aimDir = dir; G.aimHold = 0; }
+    G.aimHold += dt;
+    const rate = I.digitalAim ? dir * lerp(A.slow, A.fast, Math.min(1, G.aimHold / A.ramp)) : I.aimCoarse * A.fast;
+    G.aim = clamp(G.aim + rate * dt, -AIM_MAX, AIM_MAX);
+  } else { G.aimDir = 0; G.aimHold = 0; }
+  if (I.aimFine) G.aim = clamp(G.aim + I.aimFine * A.fine * dt, -AIM_MAX, AIM_MAX);
+  if (I.swap) swapBubbles();
+  if (I.shoot) fire();
+
+  // Mouse: point to aim, click to shoot
+  if (m.type === 'mouse') {
+    if (I.device === 'mouse' && (m.moved || m.clicked) && !onButton(m)) G.aim = aimFromPoint(m.x, m.y);
+    if (m.clicked) fire();
+    return;
+  }
+  // Touch: drag in the field to aim and lift to shoot; swipe the bottom strip to fine-tune; tap the launcher to shoot
+  if (m.clicked) {
+    if (inRect(m, LAUNCH_BTN)) G.touch = { mode: 'launch', x0: m.x, aim0: G.aim, moved: false };
+    else if (m.y > STRIP_Y) G.touch = { mode: 'fine', x0: m.x, aim0: G.aim, moved: false };
+    else { G.touch = { mode: 'drag', cancel: false }; G.aim = aimFromPoint(m.x, m.y); }
+  }
+  const t = G.touch;
+  if (!t) return;
+  if (m.down || m.released) {
+    if (t.mode === 'drag') {
+      t.cancel = m.y > STRIP_Y;
+      if (!t.cancel) G.aim = aimFromPoint(m.x, m.y);
+    } else {
+      const dx = m.x - t.x0;
+      if (Math.abs(dx) > 8) t.moved = true;
+      if (t.moved) G.aim = clamp(t.aim0 + dx * A.touch, -AIM_MAX, AIM_MAX);
+    }
+  }
+  if (m.released) {
+    G.touch = null;
+    if ((t.mode === 'drag' && !t.cancel) || (t.mode === 'launch' && !t.moved)) fire();
+  }
+}
+
+function stepPlay(dt) {
+  const A = CFG.anim;
+  G.phaseT += dt;
+  if (G.reload > 0) G.reload = Math.max(0, G.reload - dt);
+  if (G.loadT > 0) G.loadT = Math.max(0, G.loadT - dt / A.load);
+  if (G.swapT > 0) G.swapT = Math.max(0, G.swapT - dt / 0.18);
+  if (G.slideT > 0) G.slideT = Math.max(0, G.slideT - dt / A.slide);
+  if (G.curGlow > 0) G.curGlow = Math.max(0, G.curGlow - dt * 1.5);
+  if (G.nextGlow > 0) G.nextGlow = Math.max(0, G.nextGlow - dt * 1.5);
+  for (let k = 0; k < NCELL; k++) if (bump[k] > 0) bump[k] = Math.max(0, bump[k] - dt * 4);
+  stepFxBubbles(dt);
+  switch (G.phase) {
+    case 'intro':
+      if (G.phaseT >= A.intro) { G.phase = 'aim'; G.phaseT = 0; }
+      break;
+    case 'fly': {
+      const sh = G.shot;
+      sh.dist += CFG.shotSpeed * dt;
+      while (sh.dist >= STEP) {
+        sh.dist -= STEP;
+        const b = sh.bounces;
+        let res = stepShot(sh, grid, G.parity);
+        if (sh.bounces !== b) Sfx.bounce();
+        if (++sh.steps >= MAX_STEPS && res === -2) res = -1;
+        if (res !== -2) { land(snapCell(grid, G.parity, sh.x, sh.y, res), res); break; }
+      }
+      break;
+    }
+    case 'push':
+      if (G.phaseT >= A.push) afterPush();
+      break;
+    case 'clear':
+      if (G.phaseT >= A.clear) newField();
+      break;
+    case 'ending':
+      if (G.phaseT >= A.ending) finishClassic();
+      break;
+  }
+}
+
+function updatePlay(dt) {
+  playInput(dt);
+  if (state !== 'play') return; // paused from the on-screen button
+  stepPlay(dt);
+  if (state !== 'play') return;
+  if (G.phase === 'aim') updateGuide();
+  G.shown += (G.score - G.shown) * Math.min(1, dt * 8);
+  if (Math.abs(G.score - G.shown) < 1) G.shown = G.score;
+  if (G.bannerT > 0) G.bannerT = Math.max(0, G.bannerT - dt);
+  if (G.wordT > 0) G.wordT = Math.max(0, G.wordT - dt);
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const FX_POP = 0, FX_DROP = 1, FX_FADE = 2;
+const fxb = new Pool(260, () => ({ kind: 0, col: 0, x: 0, y: 0, vx: 0, vy: 0, t: 0, note: 0, bounced: false, bt: 0, fired: false }));
+const parts = new Pool(LOW_RES ? 160 : 360, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(48, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const floaters = new Pool(24, () => ({ x: 0, y: 0, text: '', color: '#fff', life: 0, max: 1, size: 20 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 26); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: i % KINDS });
+}
+
+function spawnFx(kind, col, x, y, delay, note) {
+  const o = fxb.get();
+  if (!o) return;
+  o.kind = kind; o.col = col; o.x = x; o.y = y; o.t = -delay; o.note = note; o.bounced = false; o.bt = 0; o.fired = false;
+  if (kind === FX_DROP) { o.vx = rand(-70, 70); o.vy = rand(-120, -30); } else { o.vx = rand(-12, 12); o.vy = -rand(20, 40); }
+}
+
+function stepFxBubbles(dt) {
+  for (const o of fxb.items) {
+    if (!o.active) continue;
+    o.t += dt;
+    if (o.t < 0) continue;
+    if (o.kind === FX_POP) {
+      if (!o.fired) {
+        o.fired = true;
+        burst(o.x, o.y, o.col, LOW_RES ? 4 : 8, 140, 0.6, 7);
+        ring(o.x, o.y, R * 0.6, R * 1.8, 0.35, BUBBLES[o.col].color, 1.5);
+        Sfx.pop(o.note);
+      }
+      if (o.t >= CFG.anim.pop) o.active = false;
+    } else if (o.kind === FX_DROP) {
+      o.vy += 1500 * dt; o.x += o.vx * dt; o.y += o.vy * dt;
+      if (o.x < WALL_L) { o.x = WALL_L; o.vx = Math.abs(o.vx) * 0.6; } else if (o.x > WALL_R) { o.x = WALL_R; o.vx = -Math.abs(o.vx) * 0.6; }
+      if (!o.bounced && o.y > FLOOR_Y) {
+        o.y = FLOOR_Y; o.vy = -Math.abs(o.vy) * 0.42; o.vx *= 0.7; o.bounced = true; o.bt = o.t;
+        Sfx.plink();
+        burst(o.x, o.y, o.col, LOW_RES ? 2 : 4, 80, 0.4, 6);
+      }
+      if ((o.bounced && o.t - o.bt > 0.55) || o.y > H + 40) o.active = false;
+    } else {
+      o.x += o.vx * dt; o.y += o.vy * dt;
+      if (o.t > 0.9) o.active = false;
+    }
+  }
+}
+
+function burst(x, y, ci, n, speed, life = 0.7, size = 7) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+function floater(text, x, y, color, size = 20) {
+  const o = floaters.get();
+  if (!o) return;
+  o.text = text; o.x = clamp(x, FX + 90, FX + FW - 90); o.y = y; o.color = color; o.size = size; o.life = o.max = 1.2;
+}
+function clearFx() { parts.clear(); rings.clear(); floaters.clear(); fxb.clear(); }
+
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 40 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const pool of [rings, floaters]) {
+    for (const o of pool.items) {
+      if (!o.active) continue;
+      o.life -= dt;
+      if (o.life <= 0) o.active = false;
+    }
+  }
+  for (const f of floaters.items) if (f.active) f.y -= 28 * dt;
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function titleItems() {
+  return [
+    { id: 'relax', label: 'Relax', hint: totalPopped > 0 ? `Endless and unhurried. ${fmt(totalPopped)} bubbles popped so far.` : 'Endless and unhurried: nothing pushes down, nothing to lose.' },
+    { id: 'classic', label: 'Classic', hint: `Every ${CFG.missesPerRow} misses a row pushes down. Clear fields to level up.` },
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Controls, bubbles and tips.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() { return [{ id: 'resume', label: 'Resume' }, { id: 'restart', label: 'Restart' }, { id: 'quit', label: 'Quit to menu' }]; }
+function resultItems() { return [{ id: 'again', label: 'Play again' }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'relax' || id === 'classic') startGame(id);
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 3; Sfx.blip(); }
+      break;
+    case 'play':
+      if (Input.pause) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') startGame(mode);
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'result':
+      if (stateT > 0.8) {
+        const id = menuInput(resultItems());
+        if (id === 'again') startGame(mode);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.13 + 0.1 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawBubble(t, x, y, s = 1, a = 1) {
+  if (a <= 0.01 || s <= 0.02) return;
+  const z = SPR * s;
+  ctx.globalAlpha = a;
+  ctx.drawImage(bubbleSprites[t], x - z / 2, y - z / 2, z, z);
+  ctx.globalAlpha = 1;
+}
+
+function drawFieldFrame() {
+  ctx.drawImage(panelCanvas, FX - 20, FY - 20, FW + 40, H - FY + 40);
+  ctx.beginPath();
+  ctx.moveTo(FX, H - 8); ctx.lineTo(FX, FY); ctx.lineTo(FX + FW, FY); ctx.lineTo(FX + FW, H - 8);
+  ctx.lineJoin = 'round';
+  ctx.globalAlpha = 0.5; glowStroke(CFG.color.ui, 1.5); ctx.globalAlpha = 1;
+  // The danger line: calm in Relax, a soft warm glow in Classic when the field gets close
+  const low = lowestRow(grid), near = mode === 'classic' && low >= DANGER_ROW - 2;
+  ctx.setLineDash([10, 8]);
+  ctx.beginPath(); ctx.moveTo(FX + 4, DANGER_Y); ctx.lineTo(FX + FW - 4, DANGER_Y);
+  ctx.globalAlpha = near ? 0.6 + 0.3 * Math.sin(time * 4) : mode === 'classic' ? 0.4 : 0.22;
+  glowStroke(near || G.phase === 'ending' ? CFG.color.warn : CFG.color.ui, 1.4);
+  ctx.globalAlpha = 1;
+  ctx.setLineDash([]);
+}
+
+function drawGrid() {
+  const off = fieldOffY(), P = G.parity;
+  const dim = G.phase === 'ending' ? 1 - 0.55 * Math.min(1, G.phaseT / CFG.anim.ending) : 1;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(FX, FY - 1, FW, H); ctx.clip();
+  for (let k = 0; k < NCELL; k++) {
+    const t = grid[k];
+    if (t < 0) continue;
+    let x = cellX(k, P), y = cellY(k) + off;
+    const b = bump[k];
+    if (b > 0) {
+      const dx = x - G.impX, dy = y - G.impY, d = Math.hypot(dx, dy) || 1, o = 3 * Math.sin(b * Math.PI);
+      x += (dx / d) * o; y += (dy / d) * o;
+    }
+    if (k === G.slideK && G.slideT > 0) { x = lerp(x, G.slideX, G.slideT); y = lerp(y, G.slideY, G.slideT); }
+    drawBubble(t, x, y, 1, dim);
+  }
+  ctx.restore();
+}
+
+function drawFxBubbles() {
+  for (const o of fxb.items) {
+    if (!o.active) continue;
+    if (o.t < 0) { drawBubble(o.col, o.x, o.y); continue; }
+    if (o.kind === FX_POP) {
+      const p = clamp(o.t / CFG.anim.pop, 0, 1);
+      drawBubble(o.col, o.x, o.y, 1 + 0.35 * p, 1 - p * p);
+      if (p < 0.6) {
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = (1 - p / 0.6) * 0.6;
+        const d = D * (1.1 + p);
+        ctx.drawImage(dotSprites[KINDS], o.x - d / 2, o.y - d / 2, d, d);
+        ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+      }
+    } else if (o.kind === FX_DROP) {
+      drawBubble(o.col, o.x, o.y, 1, o.bounced ? clamp(1 - (o.t - o.bt) / 0.55, 0, 1) : 1);
+    } else {
+      drawBubble(o.col, o.x, o.y, 1 - o.t * 0.2, clamp(1 - o.t / 0.9, 0, 1));
+    }
+  }
+}
+
+function guideVisible() { return state === 'play' && G.phase === 'aim' && !!G.guide; }
+
+function drawGuide() {
+  const gd = G.guide, pts = guidePts, col = G.cur;
+  const cancel = G.touch && G.touch.mode === 'drag' && G.touch.cancel;
+  const base = cancel ? 0.25 : 1;
+  // Flowing dots along the path, through the first wall bounce
+  const segs = Math.min(pts.length / 2 - 1, 2), gap = 14;
+  let d = 34 + ((time * 40) % gap), cum = 0;
+  ctx.globalCompositeOperation = 'lighter';
+  for (let s = 0; s < segs; s++) {
+    const x0 = pts[2 * s], y0 = pts[2 * s + 1], x1 = pts[2 * s + 2], y1 = pts[2 * s + 3];
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    if (len < 0.001) continue;
+    while (d <= len) {
+      const f = d / len, a = (0.9 - 0.55 * Math.min(1, (cum + d) / 650)) * base;
+      ctx.globalAlpha = a;
+      ctx.drawImage(dotSprites[col], x0 + (x1 - x0) * f - 6, y0 + (y1 - y0) * f - 6, 12, 12);
+      d += gap;
+    }
+    d -= len; cum += len;
+  }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  // Ghost bubble where it will land
+  if (gd.k >= 0) {
+    const x = cellX(gd.k, G.parity), y = cellY(gd.k), danger = mode === 'classic' && rowOf(gd.k) >= DANGER_ROW;
+    drawBubble(col, x, y, 1, 0.32 * base);
+    ctx.beginPath(); ctx.arc(x, y, R + 1 + Math.sin(time * 5) * 1.5, 0, TAU);
+    ctx.globalAlpha = (0.55 + 0.25 * Math.sin(time * 5)) * base;
+    glowStroke(danger ? CFG.color.warn : '#ffffff', 1.5);
+    ctx.globalAlpha = 1;
+  }
+  if (cancel) {
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    text('Lift here to cancel', LAUNCH_X, STRIP_Y - 26, `600 15px ${SANS}`, CFG.color.warn);
+  }
+}
+
+function drawShot() {
+  const sh = G.shot;
+  if (!sh.active) return;
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 1; i <= 3; i++) {
+    ctx.globalAlpha = 0.35 - i * 0.09;
+    ctx.drawImage(dotSprites[sh.col], sh.x - sh.dx * i * 11 - 9, sh.y - sh.dy * i * 11 - 9, 18, 18);
+  }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  drawBubble(sh.col, sh.x, sh.y);
+}
+
+function drawSwapIcon(cx, cy, color) {
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2.6; ctx.lineCap = 'round';
+  for (const [a0, a1] of [[Math.PI * 1.08, Math.PI * 1.82], [Math.PI * 0.08, Math.PI * 0.82]]) {
+    ctx.beginPath(); ctx.arc(cx, cy, 11, a0, a1); ctx.stroke();
+    const px = cx + Math.cos(a1) * 11, py = cy + Math.sin(a1) * 11;
+    const tx = -Math.sin(a1), ty = Math.cos(a1), nx = Math.cos(a1), ny = Math.sin(a1);
+    ctx.beginPath();
+    ctx.moveTo(px + tx * 6, py + ty * 6);
+    ctx.lineTo(px + nx * 5 - tx * 1, py + ny * 5 - ty * 1);
+    ctx.lineTo(px - nx * 5 - tx * 1, py - ny * 5 - ty * 1);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.lineCap = 'butt';
+}
+
+function drawLauncher() {
+  const x = LAUNCH_X, y = LAUNCH_Y, C = CFG.color, playing = state === 'play';
+  // Aim needle
+  if (G.phase !== 'ending') {
+    const sx = Math.sin(G.aim), sy = -Math.cos(G.aim);
+    ctx.beginPath(); ctx.moveTo(x + sx * 30, y + sy * 30); ctx.lineTo(x + sx * 54, y + sy * 54);
+    ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.9; glowStroke(BUBBLES[G.cur].color, 3); ctx.globalAlpha = 1;
+    ctx.lineCap = 'butt';
+    ctx.beginPath();
+    ctx.moveTo(x + sx * 64, y + sy * 64);
+    ctx.lineTo(x + sx * 52 - sy * 7, y + sy * 52 + sx * 7);
+    ctx.lineTo(x + sx * 52 + sy * 7, y + sy * 52 - sx * 7);
+    ctx.closePath(); ctx.fillStyle = BUBBLES[G.cur].color; ctx.fill();
+  }
+  // Base ring
+  ctx.beginPath(); ctx.arc(x, y, 27, 0, TAU);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  ctx.globalAlpha = 0.75; glowStroke(C.ui, 1.6); ctx.globalAlpha = 1;
+  // Current bubble (slides in from NEXT after each shot)
+  const l = easeOut(1 - G.loadT);
+  const cx = lerp(NEXT_POS.x, x, l), cy = lerp(NEXT_POS.y, y, l);
+  const sw = G.swapT > 0 ? 1 - 0.25 * Math.sin(G.swapT * Math.PI) : 1;
+  drawBubble(G.cur, cx, cy, lerp(0.8, 1.05, l) * sw);
+  if (G.curGlow > 0) { ctx.beginPath(); ctx.arc(x, y, R + 6, 0, TAU); ctx.globalAlpha = G.curGlow; glowStroke('#ffffff', 2); ctx.globalAlpha = 1; }
+  // Next bubble and swap button
+  const hoverN = Input.device === 'mouse' && inRect(Input.mouse, NEXT_BTN), hoverS = Input.device === 'mouse' && inRect(Input.mouse, SWAP_BTN);
+  ctx.beginPath(); ctx.arc(NEXT_POS.x, NEXT_POS.y, 22, 0, TAU);
+  ctx.fillStyle = hoverN ? 'rgba(143,216,255,0.16)' : 'rgba(10,14,32,0.85)'; ctx.fill();
+  ctx.globalAlpha = hoverN ? 0.9 : 0.4; glowStroke(C.ui, 1.2); ctx.globalAlpha = 1;
+  if (G.loadT <= 0.5) drawBubble(G.next, NEXT_POS.x, NEXT_POS.y, 0.8 * (G.loadT > 0 ? 1 - G.loadT * 2 : 1) * sw);
+  if (G.nextGlow > 0) { ctx.beginPath(); ctx.arc(NEXT_POS.x, NEXT_POS.y, R + 4, 0, TAU); ctx.globalAlpha = G.nextGlow; glowStroke('#ffffff', 2); ctx.globalAlpha = 1; }
+  ctx.beginPath(); ctx.arc(SWAP_POS.x, SWAP_POS.y, 22, 0, TAU);
+  ctx.fillStyle = hoverS ? 'rgba(143,216,255,0.16)' : 'rgba(10,14,32,0.85)'; ctx.fill();
+  ctx.globalAlpha = hoverS ? 1 : 0.6; glowStroke(C.ui, 1.2); ctx.globalAlpha = 1;
+  drawSwapIcon(SWAP_POS.x, SWAP_POS.y, C.text);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text('NEXT', NEXT_POS.x, NEXT_POS.y + 37, `800 12px ${SANS}`, C.dim);
+  text('SWAP', SWAP_POS.x, SWAP_POS.y + 37, `800 12px ${SANS}`, C.dim);
+  if (playing && Input.device === 'touch') {
+    text('‹ swipe ›', FX + 56, LAUNCH_Y + 18, `600 13px ${SANS}`, C.faint);
+    text('‹ swipe ›', FX + FW - 56, LAUNCH_Y + 18, `600 13px ${SANS}`, C.faint);
+  }
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawFloaters() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const f of floaters.items) {
+    if (!f.active) continue;
+    const a = Math.min(1, (f.life / f.max) * 2.5);
+    ctx.font = `800 ${f.size}px ${SANS}`; ctx.lineJoin = 'round';
+    ctx.globalAlpha = a * 0.8; ctx.strokeStyle = '#05070f'; ctx.lineWidth = 6; ctx.strokeText(f.text, f.x, f.y); // dark edge so it reads over bright bubbles
+    ctx.globalAlpha = a;
+    glowText(f.text, f.x, f.y, `800 ${f.size}px ${SANS}`, f.color);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? 'rgba(143,216,255,0.16)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.ui, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return ['Left stick / D-pad: aim', 'Right stick: fine aim', `${NN.a}: shoot  ·  ${NN.x} / ${NN.y}: swap`, `${NN.start}: pause`];
+    case 'mouse': return ['Point to aim', 'Click to shoot', 'Click NEXT or ⇄ to swap', 'Esc or ‖ button: pause'];
+    case 'touch': return ['Drag to aim, lift to shoot', 'Swipe the bottom strip', 'to fine-tune the aim', 'Tap NEXT or ⇄ to swap'];
+    default: return ['← →: aim  ·  Shift: fine', 'Space: shoot', 'S or Tab: swap', 'Esc: pause  ·  M: sound'];
+  }
+}
+
+function drawHUD() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const LX = FX / 2, RX = W - FX / 2, C = CFG.color;
+  // Left: mode, score, level or fields, best
+  glowText(mode === 'relax' ? 'RELAX' : 'CLASSIC', LX, 60, `800 30px ${SANS}`, C.title);
+  text(mode === 'relax' ? 'endless  ·  no pressure' : 'clear fields  ·  mind the line', LX, 92, `500 14px ${SANS}`, C.dim);
+  text('SCORE', LX, 138, `800 13px ${SANS}`, C.faint);
+  text(fmt(G.shown), LX, 170, `800 36px ${MONO}`, C.text);
+  if (mode === 'classic') {
+    text('LEVEL', LX, 226, `800 13px ${SANS}`, C.faint);
+    text(String(G.level), LX, 258, `800 32px ${SANS}`, C.title);
+    text('NEW ROW IN', LX, 310, `800 13px ${SANS}`, C.faint);
+    const left = CFG.missesPerRow - G.misses;
+    for (let i = 0; i < CFG.missesPerRow; i++) {
+      ctx.beginPath(); ctx.arc(LX - 50 + i * 20, 338, 6, 0, TAU);
+      ctx.fillStyle = i < left ? (left <= 2 ? C.warn : C.ui) : 'rgba(131,144,189,0.2)'; ctx.fill();
+    }
+    text(`${left} more miss${left === 1 ? '' : 'es'}`, LX, 366, `500 14px ${SANS}`, left <= 2 ? C.warn : C.dim);
+  } else {
+    text('FIELDS CLEARED', LX, 226, `800 13px ${SANS}`, C.faint);
+    text(String(G.fields), LX, 258, `800 32px ${SANS}`, C.title);
+    text('Nothing pushes down.', LX, 312, `500 14px ${SANS}`, C.dim);
+    text('Take all the time', LX, 336, `500 14px ${SANS}`, C.dim);
+    text('you like.', LX, 360, `500 14px ${SANS}`, C.dim);
+  }
+  text('BEST', LX, 420, `800 13px ${SANS}`, C.faint);
+  text(fmt(mode === 'relax' ? relaxBest : Math.max(classicBest, G.score)), LX, 448, `700 22px ${MONO}`, C.dim);
+  // Right: buttons, stats, drop words, controls
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  text('POPPED', RX, 112, `800 13px ${SANS}`, C.faint);
+  text(fmt(G.popped), RX, 142, `800 28px ${MONO}`, C.text);
+  text('DROPPED', RX, 188, `800 13px ${SANS}`, C.faint);
+  text(fmt(G.dropped), RX, 218, `800 28px ${MONO}`, C.text);
+  text(`biggest drop ${G.bestDrop}`, RX, 246, `500 14px ${SANS}`, C.dim);
+  if (G.wordT > 0) {
+    ctx.globalAlpha = Math.min(1, G.wordT * 2);
+    glowText(G.word, RX, 306 - (1.8 - G.wordT) * 6, `800 28px ${SANS}`, C.warn);
+    ctx.globalAlpha = 1;
+  }
+  controlLines().forEach((s, i) => text(s, RX, 404 + i * 24, `500 14px ${SANS}`, C.dim));
+}
+
+function drawBanner() {
+  if (G.bannerT <= 0) return;
+  const a = Math.min(1, G.bannerT * 2, (G.bannerMax - G.bannerT) * 5);
+  ctx.globalAlpha = a;
+  rrPath(W / 2 - 200, H / 2 - 86, 400, 96, 20);
+  ctx.fillStyle = 'rgba(6,9,22,0.88)'; ctx.fill();
+  glowStroke(G.bannerColor, 1.5);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(G.banner, W / 2, H / 2 - 52, `800 30px ${SANS}`, G.bannerColor);
+  text(G.bannerSub, W / 2, H / 2 - 16, `500 15px ${SANS}`, CFG.color.dim);
+  ctx.globalAlpha = 1;
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  drawFieldFrame();
+  drawGrid();
+  if (guideVisible()) drawGuide();
+  drawFxBubbles();
+  drawLauncher();
+  drawShot();
+  drawFx();
+  drawHUD();
+  drawFloaters();
+  drawBanner();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 340, h = 42;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(143,216,255,0.10)'; ctx.fill();
+      glowStroke(CFG.color.ui, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 21px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 16px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 21px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  // Big bubbles drifting slowly behind the menu
+  for (let i = 0; i < 12; i++) {
+    const x = ((i * 131 + time * (9 + (i % 3) * 5)) % (W + 160)) - 80;
+    const y = 50 + ((i * 197) % 440) + Math.sin(time * 0.6 + i) * 16;
+    drawBubble(i % KINDS, x, y, 1.3 + (i % 3) * 0.35, 0.18 + (i % 3) * 0.05);
+  }
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 380);
+  shade.addColorStop(0, 'rgba(5,7,15,0.84)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON BURST', W / 2, 78, `800 64px ${SANS}`, CFG.color.title);
+  text('a calm bubble-popping game', W / 2, 124, `500 16px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), y0 = 184, gap = 46;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap + 4, `500 15px ${SANS}`, CFG.color.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, y0 + items.length * gap + 30, `500 13px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 24, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 13px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 13px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`Relax ${fmt(relaxBest)}  ·  Classic ${fmt(classicBest)}`, W - 24, yb, `600 13px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, CFG.color.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 38, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Aim', 'Left stick / D-pad', '← →  or  A D', 'Point, or drag in the field'],
+    ['Fine aim', 'Right stick', 'Shift + ← →', 'Swipe along the bottom strip'],
+    ['Shoot', NN.a, 'Space, Enter or ↑', 'Click, or lift your finger'],
+    ['Swap', `${NN.x} or ${NN.y}`, 'S, Tab or ↓', 'Tap NEXT or the ⇄ button'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [200, 220, 410, 590];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 78, `800 13px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 78, `800 13px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 78, `800 13px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 104 + i * 25;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 250, W - 120, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 276, `800 13px ${SANS}`, C.faint);
+    lines.forEach((s, i) => text(s, x, 304 + i * 24, `500 15px ${SANS}`, C.text));
+  };
+  col('POPPING', 60, [
+    'Shoot a bubble next to its',
+    'colour: 3 or more that touch',
+    'will pop. Bubbles cut loose',
+    'from the top fall away for',
+    'bonus points. Shots bounce',
+    'off the side walls.',
+  ]);
+  text('BUBBLES', 376, 276, `800 13px ${SANS}`, C.faint);
+  for (let i = 0; i < KINDS; i++) drawBubble(i, 398 + (i % 3) * 58, 318 + ((i / 3) | 0) * 56, 1.3);
+  text('Each colour has its', 376, 428, `500 15px ${SANS}`, C.text);
+  text('own symbol inside.', 376, 452, `500 15px ${SANS}`, C.text);
+  col('MODES', 650, [
+    'Relax: endless. Nothing',
+    'pushes down, and a clear',
+    'field brings a fresh one.',
+    `Classic: every ${CFG.missesPerRow} misses a`,
+    'row pushes down. Keep the',
+    'bubbles above the line.',
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 26, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the field
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.95)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.ui, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  card(W / 2 - 240, 90, 480, 360);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 152, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time.', W / 2, 196, `500 16px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 258, true, 54);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 418, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawResult() {
+  overlay(Math.min(0.6, stateT * 1.5));
+  const r = resultInfo, C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 250, 52, 500, 436);
+  glowText(r.isBest ? 'New best!' : 'Well played', W / 2, 104, `800 50px ${SANS}`, r.isBest ? C.warn : C.title);
+  text('The bubbles reached the line.', W / 2, 148, `500 16px ${SANS}`, C.dim);
+  text('SCORE', W / 2, 186, `800 13px ${SANS}`, C.faint);
+  text(fmt(r.score), W / 2, 222, `800 46px ${MONO}`, C.text);
+  text(`Best ${fmt(r.best)}`, W / 2, 264, `600 17px ${SANS}`, C.dim);
+  text(`Level ${r.level}   ·   Popped ${fmt(r.popped)}   ·   Dropped ${fmt(r.dropped)}   ·   Biggest drop ${r.bestDrop}`, W / 2, 298, `500 15px ${SANS}`, C.dim);
+  drawMenu(resultItems(), 366, stateT > 0.8, 54);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 15px ${SANS}`;
+  const y = state === 'play' ? H / 2 + 40 : H - 54, w = ctx.measureText(toast.text).width + 32;
+  rrPath(W / 2 - w / 2, y - 14, w, 28, 14);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  text(toast.text, W / 2, y, `600 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'result') drawResult();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

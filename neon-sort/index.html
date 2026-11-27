@@ -1,0 +1,1764 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Sort</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  cap: 4,                 // balls per tube
+  empties: 2,             // empty tubes dealt with every level
+  // Colours per level: from level L on, levels use C colours (up to 12)
+  steps: [[1, 3], [3, 4], [6, 5], [10, 6], [15, 7], [21, 8], [28, 9], [36, 10], [45, 11], [55, 12]],
+  genTries: 40,           // random deals tried per level before the always-solvable fallback deal
+  // Solver limits (positions searched). Hints search for at most `ms` milliseconds per frame, so they never stall the game.
+  budget: { gen: 12000, hint: 80000, chunk: 120, ms: 5 },
+  // Ball flight: lift speed (px/s), glide time (+ per px), drop time (+ per px), delay between balls of one move
+  anim: { liftPx: 1000, glide: 0.16, glidePx: 1500, drop: 0.08, dropPx: 1300, stagger: 0.07, layout: 0.35, winCard: 1.4 },
+  // Tube area between the side panels, and when to switch to two rows
+  layout: { left: 128, right: 832, top: 52, bottom: 512, maxSlot: 124, oneRow: 7 },
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', title: '#ff9fb0', good: '#7dffc0', warn: '#ffd88a',
+    glass: '#8fb6ff', accent: '#8fd8ff',
+  },
+};
+// Twelve ball colours. Each also has its own symbol (on by default) so colours never have to be told apart by hue alone.
+const BALLS = [
+  { color: '#4fe3ff', sym: 'ring' },
+  { color: '#ff6fcf', sym: 'heart' },
+  { color: '#ffe066', sym: 'star' },
+  { color: '#6dff9e', sym: 'triangle' },
+  { color: '#a68bff', sym: 'diamond' },
+  { color: '#ff9a5c', sym: 'square' },
+  { color: '#ff5a6e', sym: 'plus' },
+  { color: '#eef3ff', sym: 'moon' },
+  { color: '#5b8cff', sym: 'cross' },
+  { color: '#c6ff4d', sym: 'bars' },
+  { color: '#e05cff', sym: 'dots' },
+  { color: '#2ee6b8', sym: 'drop' },
+];
+const CAP = CFG.cap;
+const NOTES = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98]; // C major pentatonic
+const WIN_WORDS = ['Beautifully sorted', 'Nice and tidy', 'Calm and clear', 'Everything in its place', 'Lovely work', 'Neat as can be'];
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);  // smooth in and out
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+function mix(a, b, t) {
+  const A = parseInt(a.slice(1), 16), B = parseInt(b.slice(1), 16);
+  const ch = s => Math.round(((A >> s) & 255) * (1 - t) + ((B >> s) & 255) * t);
+  return `rgb(${ch(16)},${ch(8)},${ch(0)})`;
+}
+const nowMs = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+function mulberry32(seed) { // small seeded random, so level N is always the same deal
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas + art (balls and background are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null;
+let ballSprites = [], symSprites = [], dotSprites = [];  // dotSprites[0..11] ball colours, [12] white
+const BR = 26, BS = 84;   // sprite ball radius and sprite size (room for the glow)
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+// The small dark symbol printed on each ball (filled path, size s)
+function symbolPath(g, kind, s) {
+  g.beginPath();
+  switch (kind) {
+    case 'ring': g.arc(0, 0, s * 0.78, 0, TAU); g.moveTo(s * 0.4, 0); g.arc(0, 0, s * 0.4, 0, TAU, true); break;
+    case 'heart':
+      g.moveTo(0, s * 0.85);
+      g.bezierCurveTo(-s * 1.15, s * 0.05, -s * 0.7, -s * 1.0, 0, -s * 0.38);
+      g.bezierCurveTo(s * 0.7, -s * 1.0, s * 1.15, s * 0.05, 0, s * 0.85);
+      g.closePath();
+      break;
+    case 'star':
+      for (let i = 0; i < 10; i++) {
+        const a = -Math.PI / 2 + i * Math.PI / 5, d = i % 2 ? s * 0.42 : s * 0.98;
+        if (i) g.lineTo(Math.cos(a) * d, Math.sin(a) * d); else g.moveTo(Math.cos(a) * d, Math.sin(a) * d);
+      }
+      g.closePath();
+      break;
+    case 'triangle': g.moveTo(0, -s * 0.92); g.lineTo(s * 0.9, s * 0.68); g.lineTo(-s * 0.9, s * 0.68); g.closePath(); break;
+    case 'diamond': g.moveTo(0, -s); g.lineTo(s * 0.72, 0); g.lineTo(0, s); g.lineTo(-s * 0.72, 0); g.closePath(); break;
+    case 'square': g.rect(-s * 0.66, -s * 0.66, s * 1.32, s * 1.32); break;
+    case 'plus': { const a = s * 0.88, b = s * 0.27; g.rect(-a, -b, 2 * a, 2 * b); g.rect(-b, -a, 2 * b, a - b); g.rect(-b, b, 2 * b, a - b); break; }
+    case 'cross': {
+      const a = s * 0.92, b = s * 0.25;
+      g.save(); g.rotate(Math.PI / 4);
+      g.rect(-a, -b, 2 * a, 2 * b); g.rect(-b, -a, 2 * b, a - b); g.rect(-b, b, 2 * b, a - b);
+      g.restore();
+      break;
+    }
+    case 'moon': { // a crescent: one circle minus an offset circle
+      const r = s * 0.85, d = s * 0.6, h = Math.sqrt(r * r - d * d / 4), al = Math.atan2(h, d / 2), ox = s * 0.18;
+      g.arc(ox, 0, r, -al, al, true);
+      g.arc(ox + d, 0, r, Math.PI - al, Math.PI + al, false);
+      g.closePath();
+      break;
+    }
+    case 'bars': for (const y of [-0.62, -0.13, 0.36]) g.rect(-s * 0.78, y * s, s * 1.56, s * 0.27); break;
+    case 'dots':
+      for (const [x, y] of [[0, -0.48], [-0.52, 0.42], [0.52, 0.42]]) { g.moveTo(x * s + s * 0.31, y * s); g.arc(x * s, y * s, s * 0.31, 0, TAU); }
+      break;
+    case 'drop': g.moveTo(0, -s * 0.95); g.arc(0, s * 0.2, s * 0.58, -Math.PI / 6, Math.PI * 7 / 6, false); g.closePath(); break;
+  }
+}
+
+function drawBallSprite(ci, withSym) {
+  const { c, g } = layer(BS, BS), col = BALLS[ci].color;
+  g.translate(BS / 2, BS / 2);
+  const halo = g.createRadialGradient(0, 0, BR * 0.7, 0, 0, BS / 2);
+  halo.addColorStop(0, hexA(col, 0.3)); halo.addColorStop(1, hexA(col, 0));
+  g.fillStyle = halo; g.fillRect(-BS / 2, -BS / 2, BS, BS);
+  const body = g.createRadialGradient(-BR * 0.35, -BR * 0.4, BR * 0.08, 0, 0, BR * 1.05);
+  body.addColorStop(0, mix(col, '#ffffff', 0.6)); body.addColorStop(0.5, col); body.addColorStop(1, mix(col, '#05070f', 0.45));
+  g.beginPath(); g.arc(0, 0, BR, 0, TAU); g.fillStyle = body; g.fill();
+  // Neon edge: a wide faint stroke under a thin bright one
+  g.strokeStyle = col; g.globalAlpha = 0.35; g.lineWidth = 5; g.stroke();
+  g.globalAlpha = 0.95; g.lineWidth = 1.8; g.strokeStyle = mix(col, '#ffffff', 0.4); g.stroke();
+  g.globalAlpha = 1;
+  if (withSym) {
+    g.save(); g.translate(0, BR * 0.06);
+    symbolPath(g, BALLS[ci].sym, BR * 0.5);
+    g.fillStyle = 'rgba(6,8,22,0.76)'; g.fill();
+    g.restore();
+  }
+  g.globalAlpha = 0.5; g.fillStyle = '#ffffff';
+  g.beginPath(); g.ellipse(-BR * 0.4, -BR * 0.52, BR * 0.24, BR * 0.12, -0.6, 0, TAU); g.fill();
+  g.globalAlpha = 1;
+  return c;
+}
+
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  const L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[150, 120, 300, '#3a5cff', 0.09], [820, 440, 320, '#ff6f9a', 0.06], [880, 70, 220, '#20c0d0', 0.06], [90, 480, 240, '#a64dff', 0.06]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  ballSprites = BALLS.map((_, i) => drawBallSprite(i, false));
+  symSprites = BALLS.map((_, i) => drawBallSprite(i, true));
+  dotSprites = [...BALLS.map(b => b.color), '#ffffff'].map(drawDot);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine bells only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  lift()   { if (this.ok('lift', 0.04)) this.tone(520, 660, 0.12, 'sine', 0.045); },
+  drop()   { if (this.ok('lift', 0.04)) this.tone(600, 500, 0.1, 'sine', 0.035); },
+  glide()  { if (this.ok('glide', 0.05)) this.tone(440, 560, 0.18, 'sine', 0.025); },
+  land()   { if (this.ok('land', 0.035)) { this.tone(392, 330, 0.12, 'triangle', 0.05); this.tone(784, 784, 0.06, 'sine', 0.012); } },
+  nope()   { if (this.ok('nope', 0.1)) { this.tone(392, 392, 0.14, 'sine', 0.04, 0.02); this.tone(330, 330, 0.2, 'sine', 0.035, 0.14); } },
+  complete(n) { // a full tube: three rising bells, a little higher for each tube already sorted
+    if (!this.ok('complete', 0.08)) return;
+    const b = clamp(n, 0, NOTES.length - 3);
+    [0, 1, 2].forEach(i => this.bell(NOTES[b + i], 0.05, i * 0.07, 0.8));
+  },
+  finish() { if (this.ok('finish', 0.5)) [261.63, 329.63, 392, 523.25, 659.25, 783.99].forEach((f, i) => this.bell(f, 0.055, i * 0.11, 1.6)); },
+  undo()   { if (this.ok('undo', 0.05)) this.tone(600, 440, 0.15, 'sine', 0.045); },
+  hint()   { if (this.ok('hint', 0.2)) { this.bell(783.99, 0.04, 0, 0.5); this.bell(1046.5, 0.035, 0.1, 0.6); } },
+  extra()  { if (this.ok('extra', 0.2)) { this.tone(330, 660, 0.3, 'triangle', 0.035); this.bell(987.77, 0.04, 0.2, 0.6); } },
+  restart() { if (this.ok('restart', 0.2)) { this.tone(660, 330, 0.3, 'sine', 0.04); this.tone(392, 523.25, 0.3, 'sine', 0.03, 0.25); } },
+  tick()   { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select() { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()   { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, pause: false, mute: false, select: false, back: false,
+  hint: false, undo: false, extra: false, restart: false, pick: -1,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let act = P.has('Space') || P.has('Enter') || P.has('NumpadEnter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space') || P.has('NumpadEnter');
+    let back = P.has('Escape') || P.has('Backspace');
+    let hint = P.has('KeyH'), undo = P.has('KeyU') || P.has('KeyZ'), extra = P.has('KeyX') || P.has('KeyE'), restart = P.has('KeyR');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+    // Number keys pick a tube: 1-9 and 0 for tubes 1-10, with Shift for tubes 11-20
+    let pick = -1;
+    const shift = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
+    for (let d = 0; d <= 9; d++) {
+      if (P.has('Digit' + d) || P.has('Numpad' + d)) pick = (d === 0 ? 9 : d - 1) + (shift ? 10 : 0);
+    }
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) act = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      if (tap(3)) hint = true;     // Y / triangle
+      if (tap(4)) undo = true;     // LB / L1
+      if (tap(2)) extra = true;    // X / square
+      // D-pad or left stick as a cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.hint = hint; this.undo = undo; this.extra = extra; this.restart = restart; this.pick = pick;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function keyish() { return Input.device === 'kb' || Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', x: '□', y: '△', lb: 'L1', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', x: 'X', y: 'Y', lb: 'LB', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let level = Math.max(1, parseInt(load('neonSort.level', '1'), 10) || 1);          // the level Continue starts
+let bestLevel = Math.max(level, parseInt(load('neonSort.best', '1'), 10) || 1);   // highest level reached
+let solvedCount = Math.max(0, parseInt(load('neonSort.solved', '0'), 10) || 0);  // levels solved, all time
+let symbolsOn = load('neonSort.symbols', '1') !== '0';
+Sfx.muted = load('neonSort.muted', '0') === '1';
+let confirmRestart = false;
+const toast = { text: '', t: 0 };
+
+function showToast(text) { toast.text = text; toast.t = 2.2; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); G.drag = null; Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { clearFx(); G.job = null; setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonSort.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function toggleSymbols() {
+  symbolsOn = !symbolsOn;
+  save('neonSort.symbols', symbolsOn ? 1 : 0);
+}
+
+// ============================================================
+// 2. Puzzle logic: tubes[i] is an array of colour numbers, bottom first
+// ============================================================
+function topRun(t) { // how many balls of the top colour sit together at the top
+  const n = t.length;
+  if (!n) return 0;
+  const c = t[n - 1];
+  let k = 1;
+  while (k < n && t[n - 1 - k] === c) k++;
+  return k;
+}
+function isUniform(t) { for (let i = 1; i < t.length; i++) if (t[i] !== t[0]) return false; return true; }
+function isComplete(t) { return t.length === CAP && isUniform(t); }
+function isSolved(ts) { for (const t of ts) if (t.length && !isComplete(t)) return false; return true; }
+// A move takes the top ball from tube a to tube b. Tube b must have room and be empty or have the same colour on top.
+// A finished tube is sealed (moving out of it can never help).
+function canMove(ts, a, b) {
+  if (a === b || a < 0 || b < 0 || a >= ts.length || b >= ts.length) return false;
+  const A = ts[a], B = ts[b];
+  if (!A.length || isComplete(A) || B.length >= CAP) return false;
+  return !B.length || B[B.length - 1] === A[A.length - 1];
+}
+// Same-colour balls on top travel together, as many as fit
+function moveCount(ts, a, b) { return canMove(ts, a, b) ? Math.min(topRun(ts[a]), CAP - ts[b].length) : 0; }
+function applyMove(ts, a, b) {
+  const k = moveCount(ts, a, b);
+  for (let i = 0; i < k; i++) ts[b].push(ts[a].pop());
+  return k;
+}
+function cloneTubes(ts) { return ts.map(t => t.slice()); }
+function tubeStr(t) { let s = ''; for (let i = 0; i < t.length; i++) s += String.fromCharCode(97 + t[i]); return s; }
+// Tubes are interchangeable, so a position is the sorted list of its tubes
+function tubesKey(ts) { const s = ts.map(tubeStr); s.sort(); return s.join(','); }
+function legalMoves(ts) {
+  const out = [];
+  for (let a = 0; a < ts.length; a++) for (let b = 0; b < ts.length; b++) if (canMove(ts, a, b)) out.push([a, b]);
+  return out;
+}
+function countComplete(ts) { let n = 0; for (const t of ts) if (isComplete(t)) n++; return n; }
+
+// Moves worth searching, best first. Skips only moves that can never help:
+// a one-colour tube poured into an empty one, and all but the first empty tube.
+function solverMoves(ts) {
+  const out = [];
+  let firstEmpty = -1;
+  for (let b = 0; b < ts.length; b++) if (!ts[b].length) { firstEmpty = b; break; }
+  for (let a = 0; a < ts.length; a++) {
+    const A = ts[a];
+    if (!A.length || isComplete(A)) continue;
+    const run = topRun(A), c = A[A.length - 1], aUni = run === A.length;
+    for (let b = 0; b < ts.length; b++) {
+      if (a === b) continue;
+      const B = ts[b];
+      if (!B.length) {
+        if (b === firstEmpty && !aUni) out.push([a, b, 1]);
+        continue;
+      }
+      if (B.length >= CAP || B[B.length - 1] !== c) continue;
+      const k = Math.min(run, CAP - B.length), bUni = isUniform(B);
+      let s = 10;
+      if (bUni) s += 20;
+      if (bUni && B.length + k === CAP) s += 50;   // finishes a tube
+      if (k === run) s += 5; else s -= 8;           // keeps a run together
+      if (k === A.length) s += 8;                   // empties the source
+      out.push([a, b, s]);
+    }
+  }
+  out.sort((x, y) => y[2] - x[2]);
+  return out;
+}
+
+// Depth-first search with a visited set and a node budget. It can run in slices (step) so it never stalls a frame.
+class Solver {
+  constructor(start, budget) {
+    this.budget = budget; this.nodes = 0; this.done = false; this.result = null;
+    const ts = cloneTubes(start);
+    if (isSolved(ts)) { this.done = true; this.result = { path: [] }; return; }
+    this.seen = new Set([tubesKey(ts)]);
+    this.stack = [{ ts, ms: solverMoves(ts), i: 0, mv: null }];
+  }
+  finish(r) { this.done = true; this.result = r; this.stack = null; this.seen = null; }
+  // Explores up to `limit` new positions. Returns true when finished.
+  step(limit) {
+    if (this.done) return true;
+    const st = this.stack;
+    let n = 0;
+    while (st.length) {
+      if (n >= limit) return false;
+      const f = st[st.length - 1];
+      if (f.i >= f.ms.length) { st.pop(); continue; }
+      const mv = f.ms[f.i++];
+      const nt = cloneTubes(f.ts);
+      applyMove(nt, mv[0], mv[1]);
+      const k = tubesKey(nt);
+      if (this.seen.has(k)) continue;
+      this.seen.add(k);
+      this.nodes++; n++;
+      if (isSolved(nt)) {
+        const path = [];
+        for (let j = 1; j < st.length; j++) path.push([st[j].mv[0], st[j].mv[1]]);
+        path.push([mv[0], mv[1]]);
+        this.finish({ path, nodes: this.nodes });
+        return true;
+      }
+      if (this.nodes >= this.budget) { this.finish({ fail: 'budget', nodes: this.nodes }); return true; }
+      st.push({ ts: nt, ms: solverMoves(nt), i: 0, mv });
+    }
+    this.finish({ fail: 'exhausted', nodes: this.nodes });
+    return true;
+  }
+}
+function solve(ts, budget) { const s = new Solver(ts, budget); s.step(Infinity); return s.result; }
+
+// ---------- Levels ----------
+function coloursFor(lv) { let c = CFG.steps[0][1]; for (const [from, n] of CFG.steps) if (lv >= from) c = n; return Math.min(c, BALLS.length); }
+function shuffle(a, rnd) { for (let i = a.length - 1; i > 0; i--) { const j = (rnd() * (i + 1)) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+function dealRandom(n, rnd) {
+  const balls = [];
+  for (let c = 0; c < n; c++) for (let i = 0; i < CAP; i++) balls.push(c);
+  shuffle(balls, rnd);
+  const ts = [];
+  for (let t = 0; t < n; t++) ts.push(balls.slice(t * CAP, t * CAP + CAP));
+  for (let e = 0; e < CFG.empties; e++) ts.push([]);
+  return ts;
+}
+// Always solvable: tube i holds two of colour i under two of colour i+1 (a ring), with two empty tubes.
+function dealCyclic(n, rnd) {
+  const p = shuffle([...Array(n).keys()], rnd), half = CAP / 2, ts = [];
+  for (let i = 0; i < n; i++) {
+    const t = [];
+    for (let j = 0; j < CAP; j++) t.push(j < half ? p[i] : p[(i + 1) % n]);
+    ts.push(t);
+  }
+  shuffle(ts, rnd);
+  for (let e = 0; e < CFG.empties; e++) ts.push([]);
+  return ts;
+}
+// Builds a level: random deals, each checked by the solver, until one is solvable (and not already sorted).
+// Level n always uses seed n, so it is always the same deal. It can run in slices (step) like the solver.
+class LevelJob {
+  constructor(lv, opt = {}) {
+    this.lv = lv; this.n = opt.colours || coloursFor(lv); this.seed = opt.seed !== undefined ? opt.seed : lv;
+    this.attempt = 0; this.solver = null; this.ts = null; this.done = false; this.level = null;
+    this.rejected = { solved: 0, finished: 0, stuck: 0, budget: 0 };
+  }
+  step(limit) {
+    while (!this.done) {
+      if (!this.solver) {
+        if (this.attempt >= CFG.genTries) { // practically never: a ring deal that is always solvable
+          const ts = dealCyclic(this.n, mulberry32(this.seed * 7919 + 1)), r = solve(ts, CFG.budget.hint);
+          this.level = { colours: this.n, tubes: ts, path: r.path || null, attempt: -1 };
+          this.done = true;
+          break;
+        }
+        const rnd = mulberry32((Math.imul(this.seed, 2654435761) ^ Math.imul(this.attempt + 1, 40503)) >>> 0);
+        const ts = dealRandom(this.n, rnd);
+        this.attempt++;
+        if (isSolved(ts)) { this.rejected.solved++; continue; }
+        if (ts.some(isComplete)) { this.rejected.finished++; continue; }
+        this.ts = ts; this.solver = new Solver(ts, CFG.budget.gen);
+      }
+      if (!this.solver.step(limit)) return false;
+      const r = this.solver.result;
+      this.solver = null;
+      if (r.path) { this.level = { colours: this.n, tubes: this.ts, path: r.path, attempt: this.attempt - 1 }; this.done = true; }
+      else this.rejected[r.fail === 'budget' ? 'budget' : 'stuck']++;
+    }
+    return true;
+  }
+}
+function makeLevel(lv, opt) { const j = new LevelJob(lv, opt); j.step(Infinity); return j.level; }
+let nextJob = null;   // the next level, prepared in slices on the title screen and while the level-complete card is up
+function stepTimed(job) {
+  const t0 = nowMs();
+  let done = false;
+  do { done = job.step(CFG.budget.chunk); } while (!done && nowMs() - t0 < CFG.budget.ms);
+  return done;
+}
+
+// ============================================================
+// 3. Layout: tubes sit between the side panels, in one row or two
+// ============================================================
+function computeLayout(count) {
+  const L = CFG.layout, rows = count <= L.oneRow ? 1 : 2;
+  const perRow = Math.ceil(count / rows);
+  const R = rows === 1 ? 24 : 19, pitch = 2 * R + 3;
+  const tubeW = 2 * R + 12, tubeH = CAP * pitch + 10, lift = 2 * R + 10;
+  const slot = Math.min(L.maxSlot, (L.right - L.left) / perRow);
+  const gap = 10, blockH = lift + tubeH, totalH = rows * blockH + (rows - 1) * gap;
+  const below = rows === 2 ? gap : 14;   // tap room under a tube (the upper row stops where the lower row's space starts)
+  const y0 = L.top + (L.bottom - L.top - totalH) / 2;
+  const tubes = [];
+  for (let i = 0; i < count; i++) {
+    const row = i < perRow ? 0 : 1;
+    const inRow = row === 0 ? Math.min(perRow, count) : count - perRow, col = row === 0 ? i : i - perRow;
+    tubes.push({ x: (L.left + L.right) / 2 + (col - (inRow - 1) / 2) * slot, top: y0 + row * (blockH + gap) + lift, row, a: 1, below: row === 0 ? below : 14 });
+  }
+  return { rows, perRow, R, pitch, tubeW, tubeH, lift, slot, tubes };
+}
+let LAY = null, V = null, layFrom = null, layT = 1;   // LAY: target layout (hit tests); V: what is drawn (eases toward LAY)
+function relayout(animate) {
+  const next = computeLayout(G.tubes.length);
+  LAY = next;
+  if (animate && V) { layFrom = V; layT = 0; stepLayout(0); } else { layFrom = null; layT = 1; V = next; }
+}
+function stepLayout(dt) {
+  if (layT >= 1) { V = LAY; return; }
+  layT = Math.min(1, layT + dt / CFG.anim.layout);
+  const e = ease(layT), a = layFrom, b = LAY;
+  V = {
+    rows: b.rows, perRow: b.perRow, slot: lerp(a.slot, b.slot, e),
+    R: lerp(a.R, b.R, e), pitch: lerp(a.pitch, b.pitch, e), tubeW: lerp(a.tubeW, b.tubeW, e),
+    tubeH: lerp(a.tubeH, b.tubeH, e), lift: lerp(a.lift, b.lift, e),
+    tubes: b.tubes.map((t, i) => { const f = a.tubes[i]; return f ? { x: lerp(f.x, t.x, e), top: lerp(f.top, t.top, e), row: t.row, a: 1 } : { x: t.x, top: t.top, row: t.row, a: e }; }),
+  };
+}
+const slotY = (i, j) => V.tubes[i].top + V.tubeH - 6 - V.R - j * V.pitch;
+const hoverY = i => V.tubes[i].top - V.R - 8;
+// Which tube is at (x, y)? Each tube owns its whole column: the glass plus the space above it.
+function tubeAt(x, y) {
+  if (!LAY) return -1;
+  for (let i = 0; i < LAY.tubes.length; i++) {
+    const t = LAY.tubes[i];
+    if (Math.abs(x - t.x) <= LAY.slot / 2 && y >= t.top - LAY.lift && y <= t.top + LAY.tubeH + t.below) return i;
+  }
+  return -1;
+}
+// Up / down: the tube in the other row closest in x
+function otherRow(i, dir) {
+  if (!LAY || LAY.rows < 2) return i;
+  const row = LAY.tubes[i].row + dir;
+  if (row < 0 || row > 1) return i;
+  let best = i, d = 1e9;
+  LAY.tubes.forEach((t, k) => { if (t.row === row && Math.abs(t.x - LAY.tubes[i].x) < d) { d = Math.abs(t.x - LAY.tubes[i].x); best = k; } });
+  return best;
+}
+
+// ============================================================
+// 4. Play
+// ============================================================
+const UNDO_BTN = { x: 14, y: 196, w: 102, h: 64 };
+const RESTART_BTN = { x: 14, y: 274, w: 102, h: 64 };
+const HINT_BTN = { x: W - 116, y: 196, w: 102, h: 64 };
+const EXTRA_BTN = { x: W - 116, y: 274, w: 102, h: 64 };
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+
+const G = {
+  level: 1, colours: 3, tubes: [], start: [], extra: false, history: [], moves: 0, hints: 0, undos: 0,
+  sel: -1, cursor: 0, holdX: 0, holdY: 0, drag: null, tapAgain: false,
+  flights: [], pending: [], shake: [], glow: [], squash: [],
+  hint: null, hintExtra: false, job: null, plan: null, planKey: '',
+  won: false, winT: 0, solvedPending: false, winInfo: null, introT: 0,
+  banner: '', bannerSub: '', bannerColor: '#fff', bannerT: 0, bannerMax: 1,
+};
+
+function resetTubeFx() {
+  const n = G.tubes.length;
+  for (const k of ['pending', 'shake', 'glow', 'squash']) { G[k] = []; for (let i = 0; i < n; i++) G[k].push(0); }
+}
+
+function startLevel(n) {
+  Sfx.init();
+  clearFx();
+  let L;
+  if (nextJob && nextJob.lv === n) { nextJob.step(Infinity); L = nextJob.level; }   // usually ready already
+  else L = makeLevel(n);
+  nextJob = null;
+  Object.assign(G, {
+    level: n, colours: L.colours, start: cloneTubes(L.tubes), tubes: cloneTubes(L.tubes), extra: false,
+    history: [], moves: 0, hints: 0, undos: 0,
+    sel: -1, cursor: 0, drag: null, tapAgain: false, flights: [],
+    hint: null, hintExtra: false, job: null, plan: L.path ? L.path.map(m => m.slice()) : null, planKey: '',
+    won: false, winT: 0, solvedPending: false, winInfo: null, introT: 0, bannerT: 0,
+  });
+  G.planKey = tubesKey(G.tubes);
+  relayout(false);
+  resetTubeFx();
+  setState('play');
+}
+
+function banner(title, sub, color, t = 2.6) {
+  G.banner = title; G.bannerSub = sub; G.bannerColor = color; G.bannerT = G.bannerMax = t;
+}
+
+function canLift(i) { const t = G.tubes[i]; return !!t && t.length > 0 && !isComplete(t); }
+function flightTouches(i) { for (const f of G.flights) if (f.src === i || f.dst === i) return true; return false; }
+
+// A ball's trip: up out of its tube (if it is still inside), a soft arc across, then down into place
+function addFlight(col, src, dst, x0, y0, slot, delay) {
+  const A = CFG.anim, x1 = V.tubes[dst].x, y1 = slotY(dst, slot), S = V.tubes[src];
+  const inside = Math.abs(x0 - S.x) < V.tubeW && y0 > S.top - V.R;
+  const hyA = inside ? Math.min(y0, hoverY(src)) : y0, hyB = hoverY(dst), dx = Math.abs(x1 - x0);
+  const f = {
+    col, src, dst, x0, y0, x1, y1, hyA, hyB,
+    ta: Math.min(0.14, (y0 - hyA) / A.liftPx),
+    tb: dx < 2 ? Math.min(0.14, Math.abs(hyB - hyA) / 700) : A.glide + dx / A.glidePx,
+    tc: A.drop + Math.max(0, y1 - hyB) / A.dropPx, arc: Math.min(46, 8 + dx * 0.1), t: -delay, after: null,
+  };
+  G.flights.push(f);
+  G.pending[dst]++;
+  return f;
+}
+function flightPos(f, out) {
+  let t = Math.max(0, f.t);
+  if (t < f.ta) { out.x = f.x0; out.y = lerp(f.y0, f.hyA, easeOut(t / f.ta)); return out; }
+  t -= f.ta;
+  if (t < f.tb) {
+    const u = t / f.tb, e = ease(u);
+    out.x = lerp(f.x0, f.x1, e); out.y = lerp(f.hyA, f.hyB, e) - f.arc * Math.sin(Math.PI * u);
+    return out;
+  }
+  t -= f.tb;
+  const u = f.tc > 0 ? Math.min(1, t / f.tc) : 1;
+  out.x = f.x1; out.y = lerp(f.hyB, f.y1, u * u);
+  return out;
+}
+function landFlight(f, quiet) {
+  G.pending[f.dst] = Math.max(0, G.pending[f.dst] - 1);
+  if (!quiet) { G.squash[f.dst] = 1; Sfx.land(); }
+  if (f.after === 'complete') completeFx(f.dst);
+}
+function stepFlights(dt) {
+  if (!G.flights.length) return;
+  let keep = 0;
+  for (const f of G.flights) {
+    f.t += dt;
+    if (f.t >= f.ta + f.tb + f.tc) landFlight(f, false);
+    else G.flights[keep++] = f;
+  }
+  G.flights.length = keep;
+}
+function finishFlights() { // snaps every ball still in the air into place
+  for (const f of G.flights) landFlight(f, true);
+  G.flights.length = 0;
+  for (let i = 0; i < G.pending.length; i++) G.pending[i] = 0;
+}
+
+function select(i) {
+  if (flightTouches(i)) finishFlights();
+  const t = G.tubes[i];
+  G.sel = i;
+  G.holdX = V.tubes[i].x; G.holdY = slotY(i, t.length - 1);
+  Sfx.lift();
+}
+function putBack() {
+  if (G.sel < 0) return;
+  const i = G.sel, t = G.tubes[i];
+  G.sel = -1; G.drag = null; G.tapAgain = false;
+  addFlight(t[t.length - 1], i, i, G.holdX, G.holdY, t.length - 1, 0);
+  Sfx.drop();
+}
+function dropHeld() { G.sel = -1; G.drag = null; G.tapAgain = false; } // forget a held ball without animating it
+
+function pushHistory() { G.history.push({ tubes: cloneTubes(G.tubes), moves: G.moves }); }
+
+// Moves from tube a to tube b. (fx, fy) is where the lifted ball is now.
+function doMove(a, b, fx, fy) {
+  if (!canMove(G.tubes, a, b)) return 0;
+  if (flightTouches(a) || flightTouches(b)) finishFlights();
+  const T = G.tubes, la = T[a].length, lb = T[b].length, col = T[a][la - 1];
+  if (fx === undefined) { fx = V.tubes[a].x; fy = slotY(a, la - 1); }
+  const keyBefore = tubesKey(T);
+  pushHistory();
+  const sortedBefore = countComplete(T);
+  const k = applyMove(T, a, b);
+  let last = null;
+  for (let i = 0; i < k; i++) {
+    last = addFlight(col, a, b, i === 0 ? fx : V.tubes[a].x, i === 0 ? fy : slotY(a, la - 1 - i), lb + i, i * CFG.anim.stagger);
+  }
+  if (isComplete(T[b]) && last) { last.after = 'complete'; last.sortedBefore = sortedBefore; }
+  G.moves++;
+  dropHeld();
+  G.hint = null; G.hintExtra = false;
+  // Keep the hint plan if the player followed it
+  if (G.plan && G.plan.length && G.planKey === keyBefore && G.plan[0][0] === a && G.plan[0][1] === b) {
+    G.plan.shift(); G.planKey = tubesKey(T);
+  } else G.plan = null;
+  Sfx.glide();
+  if (isSolved(T)) G.solvedPending = true;
+  else if (!legalMoves(T).length) {
+    banner('No moves left', G.extra ? 'Undo a few moves, or restart the level' : 'Add the extra tube, or Undo a few moves', CFG.color.warn, 3.2);
+  }
+  return k;
+}
+
+function undo() {
+  if (G.won) return false;
+  if (!G.history.length) { showToast('Nothing to undo'); Sfx.tick(); return false; }
+  finishFlights(); dropHeld();
+  const s = G.history.pop(), ts = cloneTubes(s.tubes);
+  while (ts.length < G.tubes.length) ts.push([]);   // the extra tube stays (empty) once added
+  G.tubes = ts; G.moves = s.moves; G.undos++;
+  G.hint = null; G.hintExtra = false; G.plan = null; G.job = null; G.bannerT = 0;
+  Sfx.undo();
+  return true;
+}
+
+function restartLevel() {
+  if (G.won) return false;
+  finishFlights(); dropHeld();
+  if (!G.history.length) { showToast('Already at the start'); Sfx.tick(); return false; }
+  pushHistory();   // so Undo can bring the moves back
+  const ts = cloneTubes(G.start);
+  if (G.extra) ts.push([]);
+  G.tubes = ts; G.moves = 0;
+  G.hint = null; G.hintExtra = false; G.plan = null; G.job = null; G.bannerT = 0;
+  for (let i = 0; i < G.glow.length; i++) G.glow[i] = 0.6;
+  showToast('Level restarted · Undo brings your moves back');
+  Sfx.restart();
+  return true;
+}
+
+function addExtraTube() {
+  if (G.won) return false;
+  if (G.extra) { showToast('One extra tube per level'); Sfx.nope(); return false; }
+  finishFlights();
+  G.tubes.push([]);
+  G.extra = true;
+  for (const k of ['pending', 'shake', 'squash']) G[k].push(0);
+  G.glow.push(1);
+  relayout(true);
+  G.hint = null; G.hintExtra = false; G.plan = null; G.job = null; G.bannerT = 0;
+  showToast('Extra tube added');
+  Sfx.extra();
+  return true;
+}
+
+// ---------- Hints: the solver suggests a good next move ----------
+function requestHint() {
+  if (G.won || isSolved(G.tubes)) return;
+  if (G.job) return;   // still thinking
+  const key = tubesKey(G.tubes);
+  if (G.plan && G.plan.length && G.planKey === key) { showHint(G.plan[0]); return; }
+  G.job = { solver: new Solver(G.tubes, CFG.budget.hint), key, extra: false };
+  runHintJob();
+}
+function runHintJob() {
+  const J = G.job;
+  if (!J) return;
+  if (J.key !== tubesKey(G.tubes)) { G.job = null; return; }   // the board changed: drop the search
+  const t0 = nowMs();
+  let done = false;
+  do { done = J.solver.step(CFG.budget.chunk); } while (!done && nowMs() - t0 < CFG.budget.ms);
+  if (!done) return;
+  const r = J.solver.result;
+  G.job = null;
+  if (r.path && r.path.length) {
+    if (!J.extra) { G.plan = r.path; G.planKey = J.key; showHint(r.path[0]); }
+    else { G.hintExtra = true; G.hints++; Sfx.hint(); banner('Try the extra tube', 'With one more tube there is a way through', CFG.color.accent); }
+  } else if (!J.extra && !G.extra) {
+    const ts = cloneTubes(G.tubes); ts.push([]);
+    G.job = { solver: new Solver(ts, CFG.budget.hint), key: J.key, extra: true };
+  } else {
+    Sfx.nope();
+    banner('A little tangled', 'Undo a few moves, or restart the level', CFG.color.warn, 3.2);
+  }
+}
+function showHint(mv) {
+  G.hint = [mv[0], mv[1]];
+  G.hints++;
+  if (keyish() && G.sel < 0) G.cursor = mv[0];
+  Sfx.hint();
+}
+
+function startWin() {
+  G.won = true; G.winT = 0; dropHeld(); G.hint = null; G.job = null;
+  level = G.level + 1;
+  bestLevel = Math.max(bestLevel, level);
+  solvedCount++;
+  save('neonSort.level', level); save('neonSort.best', bestLevel); save('neonSort.solved', solvedCount);
+  G.winInfo = { level: G.level, moves: G.moves, hints: G.hints, word: WIN_WORDS[(G.level - 1) % WIN_WORDS.length] };
+  nextJob = new LevelJob(level);
+  for (let i = 0; i < G.tubes.length; i++) if (G.tubes[i].length) { G.glow[i] = 1; sparkle(i, LOW_RES ? 6 : 14); }
+  Sfx.finish();
+}
+
+// Act on tube i with the keyboard or controller (also number keys): lift, drop, or put back
+function actOn(i) {
+  if (G.sel < 0) {
+    if (canLift(i)) select(i);
+    else { Sfx.nope(); G.shake[i] = 1; }
+    return;
+  }
+  if (i === G.sel) { putBack(); return; }
+  if (canMove(G.tubes, G.sel, i)) doMove(G.sel, i, G.holdX, G.holdY);
+  else { Sfx.nope(); G.shake[i] = 1; }
+}
+
+function playInput() {
+  const I = Input, m = I.mouse;
+  if (m.clicked && inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+  if (m.clicked && inRect(m, SOUND_BTN)) { toggleSound(); return; }
+  if (G.won) return;
+  if (I.undo || (m.clicked && inRect(m, UNDO_BTN))) { undo(); return; }
+  if (I.restart || (m.clicked && inRect(m, RESTART_BTN))) { restartLevel(); return; }
+  if (I.hint || (m.clicked && inRect(m, HINT_BTN))) { requestHint(); return; }
+  if (I.extra || (m.clicked && inRect(m, EXTRA_BTN))) { addExtraTube(); return; }
+  const n = G.tubes.length;
+
+  // Cursor: left / right go through the tubes in order, up / down switch rows
+  if (I.navLeft || I.navRight) {
+    const c = clamp(G.cursor + (I.navRight ? 1 : -1), 0, n - 1);
+    if (c !== G.cursor) { G.cursor = c; Sfx.tick(); }
+  }
+  if (I.navUp || I.navDown) {
+    const c = otherRow(G.cursor, I.navUp ? -1 : 1);
+    if (c !== G.cursor) { G.cursor = c; Sfx.tick(); }
+  }
+  if (I.pick >= 0) {
+    if (I.pick < n) { G.cursor = I.pick; actOn(I.pick); } else Sfx.tick();
+  }
+  if (I.act) actOn(G.cursor);
+  if (I.back && G.sel >= 0) putBack();
+
+  // Mouse / touch: tap a tube then another, or drag the lifted ball
+  if (m.clicked) {
+    const t = tubeAt(m.x, m.y);
+    if (t < 0) { if (G.sel >= 0) putBack(); }
+    else {
+      G.cursor = t;
+      if (G.sel < 0) {
+        if (canLift(t)) { select(t); G.drag = { x: m.x, y: m.y, active: false }; }
+        else { Sfx.nope(); G.shake[t] = 1; }
+      } else if (t === G.sel) {
+        G.tapAgain = true; G.drag = { x: m.x, y: m.y, active: false };
+      } else if (canMove(G.tubes, G.sel, t)) {
+        doMove(G.sel, t, G.holdX, G.holdY);
+      } else if (canLift(t)) { // not a fit: pick up from this tube instead
+        Sfx.nope(); putBack(); select(t); G.drag = { x: m.x, y: m.y, active: false };
+      } else { Sfx.nope(); G.shake[t] = 1; }
+    }
+  }
+  if (G.drag && m.down && G.sel >= 0 && !G.drag.active && Math.hypot(m.x - G.drag.x, m.y - G.drag.y) > 12) {
+    G.drag.active = true; G.tapAgain = false;
+  }
+  if (m.released) {
+    if (G.drag && G.drag.active && G.sel >= 0) {
+      const t = tubeAt(m.x, m.y);
+      G.holdX = m.x; G.holdY = m.y;
+      if (t >= 0 && t !== G.sel && canMove(G.tubes, G.sel, t)) doMove(G.sel, t, G.holdX, G.holdY);
+      else { if (t >= 0 && t !== G.sel) { Sfx.nope(); G.shake[t] = 1; } putBack(); }
+    } else if (G.drag && G.tapAgain && G.sel >= 0) putBack();
+    G.drag = null; G.tapAgain = false;
+  }
+}
+
+function updatePlay(dt) {
+  playInput();
+  if (state !== 'play') return; // paused from the on-screen button
+  stepLayout(dt);
+  G.introT += dt;
+  // The lifted ball hovers over its tube (or the cursor's tube, or follows a drag)
+  if (G.sel >= 0) {
+    const m = Input.mouse;
+    if (G.drag && G.drag.active && m.down) { G.holdX = m.x; G.holdY = m.y; }
+    else {
+      const i = keyish() ? G.cursor : G.sel;
+      const tx = V.tubes[i].x, ty = hoverY(i) + Math.sin(time * 3) * 2;
+      const k = 1 - Math.exp(-dt * 16);
+      G.holdX += (tx - G.holdX) * k; G.holdY += (ty - G.holdY) * k;
+    }
+  }
+  stepFlights(dt);
+  runHintJob();
+  for (let i = 0; i < G.tubes.length; i++) {
+    if (G.shake[i] > 0) G.shake[i] = Math.max(0, G.shake[i] - dt * 3);
+    if (G.glow[i] > 0) G.glow[i] = Math.max(0, G.glow[i] - dt * 0.8);
+    if (G.squash[i] > 0) G.squash[i] = Math.max(0, G.squash[i] - dt / 0.16);
+  }
+  if (G.bannerT > 0) G.bannerT = Math.max(0, G.bannerT - dt);
+  if (G.solvedPending && !G.flights.length && !G.won) { G.solvedPending = false; startWin(); }
+  if (G.won) {
+    G.winT += dt;
+    if (nextJob && !nextJob.done) stepTimed(nextJob);
+    if (G.winT > CFG.anim.winCard) setState('win');
+  }
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 160 : 360, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(40, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 24); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: i % BALLS.length });
+}
+function burst(x, y, ci, n, speed, life = 0.8, size = 8) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x + rand(-6, 6); p.y = y + rand(-20, 20); p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s - speed * 0.3;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+function sparkle(i, n) {
+  const t = G.tubes[i];
+  if (!t || !t.length || !V || !V.tubes[i]) return;
+  const x = V.tubes[i].x, y = V.tubes[i].top + V.tubeH / 2;
+  burst(x, y, t[0], n, 120, 0.9, 9);
+  burst(x, y, BALLS.length, Math.ceil(n / 3), 90, 0.7, 7);
+}
+function completeFx(i) {
+  const t = G.tubes[i];
+  if (!t || !isComplete(t)) return;
+  G.glow[i] = 1;
+  sparkle(i, LOW_RES ? 8 : 18);
+  ring(V.tubes[i].x, V.tubes[i].top + 4, 6, V.tubeW * 1.2, 0.6, BALLS[t[0]].color, 2);
+  Sfx.complete(countComplete(G.tubes) - 1);
+}
+function clearFx() { parts.clear(); rings.clear(); }
+
+function updateFx(dt) {
+  const drag = Math.pow(0.1, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 30 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    o.life -= dt;
+    if (o.life <= 0) o.active = false;
+  }
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function symbolsItem() {
+  return { id: 'symbols', label: 'Symbols', value: symbolsOn ? 'On' : 'Off', cycle: () => toggleSymbols(), hint: 'A small shape on every ball, so colours are easy to tell apart.' };
+}
+function titleItems() {
+  return [
+    { id: 'continue', label: level > 1 ? `Continue (level ${level})` : 'Play (level 1)', hint: level > 1 ? 'Pick up where you left off.' : 'Sort the colours, one ball at a time.' },
+    { id: 'restart1', label: confirmRestart ? 'Press again to confirm' : 'Restart from level 1', hint: confirmRestart ? `Start over from level 1. Your record (level ${bestLevel}) is kept.` : 'Begin again with the gentlest levels.' },
+    symbolsItem(),
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Controls, rules and helpers.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() {
+  return [{ id: 'resume', label: 'Resume' }, { id: 'restart', label: 'Restart level' }, symbolsItem(), soundItem(), { id: 'quit', label: 'Quit to menu' }];
+}
+function winItems() { return [{ id: 'next', label: `Next: level ${G.level + 1}` }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      // Prepare the Continue level in small slices, so pressing it never stalls
+      if (!nextJob || nextJob.lv !== level) nextJob = new LevelJob(level);
+      if (!nextJob.done) stepTimed(nextJob);
+      if (menuSel !== 1) confirmRestart = false;
+      const id = menuInput(titleItems());
+      if (menuSel !== 1) confirmRestart = false;
+      if (id === 'continue') startLevel(level);
+      else if (id === 'restart1') {
+        if (level <= 1 || confirmRestart) {
+          confirmRestart = false; level = 1; save('neonSort.level', 1); startLevel(1);
+        } else confirmRestart = true;
+      } else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 4; Sfx.blip(); }
+      break;
+    case 'play':
+      // Esc puts down a held ball first; a second Esc pauses
+      if (Input.pause && !(Input.back && G.sel >= 0)) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') { state = pausedFrom; restartLevel(); }
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'win':
+      if (nextJob && !nextJob.done) stepTimed(nextJob);
+      if (stateT > 0.6) {
+        const id = menuInput(winItems());
+        if (id === 'next') startLevel(level);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.12 + 0.09 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawBall(c, x, y, R, sx = 1, sy = 1) {
+  const s = BS * (R / BR), w = s * sx, h = s * sy;
+  ctx.drawImage((symbolsOn ? symSprites : ballSprites)[c], x - w / 2, y - h / 2 + (s - h) * 0.25, w, h);
+}
+
+// A glass tube: open top with a small lip, rounded bottom
+function tubeShape(x, top, w, h, lip) {
+  const r = w / 2;
+  ctx.beginPath();
+  ctx.moveTo(x - r - lip, top);
+  ctx.lineTo(x - r, top);
+  ctx.lineTo(x - r, top + h - r);
+  ctx.arc(x, top + h - r, r, Math.PI, 0, true);
+  ctx.lineTo(x + r, top);
+  ctx.lineTo(x + r + lip, top);
+}
+
+function renderTubes() {
+  const n = G.tubes.length, C = CFG.color, holding = G.sel >= 0 && state === 'play';
+  const hover = Input.device === 'mouse' && G.sel < 0 && !Input.mouse.down && state === 'play' ? tubeAt(Input.mouse.x, Input.mouse.y) : -1;
+  const hintOn = G.hint && state === 'play';
+  for (let i = 0; i < n; i++) {
+    const vt = V.tubes[i], T = G.tubes[i];
+    const intro = clamp((G.introT - i * 0.035) / 0.45, 0, 1), dy = (1 - ease(intro)) * 26;
+    const x = vt.x + (G.shake[i] > 0 ? Math.sin(time * 42) * 5 * G.shake[i] : 0), top = vt.top + dy;
+    ctx.globalAlpha = vt.a * (0.25 + 0.75 * intro);
+    // glass
+    tubeShape(x, top, V.tubeW, V.tubeH, 0); ctx.closePath();
+    const done = isComplete(T);
+    ctx.fillStyle = done ? hexA(BALLS[T[0]].color, 0.12 + 0.12 * G.glow[i]) : 'rgba(120,160,255,0.055)';
+    ctx.fill();
+    // balls (the lifted one and any still in the air are drawn elsewhere)
+    const shown = T.length - G.pending[i] - (G.sel === i ? 1 : 0);
+    for (let j = 0; j < shown; j++) {
+      const sq = j === shown - 1 && G.squash[i] > 0 ? Math.sin(G.squash[i] * Math.PI) * 0.1 : 0;
+      drawBall(T[j], x, slotY(i, j) + dy, V.R, 1 + sq, 1 - sq);
+    }
+    // rim
+    let col = C.glass, a = 0.5, w = 2;
+    if (done) { col = BALLS[T[0]].color; a = 0.7 + 0.15 * Math.sin(time * 2 + i) + 0.3 * G.glow[i]; w = 2.2; }
+    if (holding && canMove(G.tubes, G.sel, i)) { col = C.good; a = 0.7 + 0.2 * Math.sin(time * 5); w = 2.4; }
+    if (hintOn && (G.hint[0] === i || G.hint[1] === i)) { col = C.warn; a = 0.75 + 0.25 * Math.sin(time * 4); w = 2.6; }
+    if (i === hover) { a = Math.max(a, 0.9); w = Math.max(w, 2.4); }
+    ctx.globalAlpha *= clamp(a, 0, 1);
+    tubeShape(x, top, V.tubeW, V.tubeH, 5);
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    glowStroke(col, w);
+    ctx.globalAlpha = vt.a * intro * 0.08;
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(x - V.tubeW / 2 + 5, top + 10, 3, Math.max(0, V.tubeH - V.tubeW / 2 - 16));
+    if (done) { // a soft cap shows the tube is finished
+      ctx.globalAlpha = vt.a * (0.6 + 0.3 * G.glow[i]);
+      ctx.beginPath(); ctx.moveTo(x - V.tubeW / 2 + 4, top + 4); ctx.lineTo(x + V.tubeW / 2 - 4, top + 4);
+      glowStroke(BALLS[T[0]].color, 3);
+    }
+    ctx.globalAlpha = 1; ctx.lineCap = 'butt';
+  }
+  // Keyboard players see each tube's number key
+  if (Input.device === 'kb' && state === 'play') {
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    for (let i = 0; i < n; i++) {
+      const lab = i < 9 ? String(i + 1) : i === 9 ? '0' : i < 20 ? '⇧' + ((i - 9) % 10) : '';
+      text(lab, V.tubes[i].x, V.tubes[i].top + V.tubeH + 11, `700 13px ${SANS}`, i === G.cursor ? C.text : C.faint);
+    }
+  }
+}
+
+function drawCursor() {
+  if (!keyish() || state !== 'play' || G.won) return;
+  const i = G.cursor, t = V.tubes[i];
+  if (!t) return;
+  const w = Math.min(V.slot - 8, V.tubeW + 26), top = t.top - (G.sel < 0 ? 12 : V.lift), h = V.tubeH + (top < t.top ? t.top - top : 0) + 14;
+  rrPath(t.x - w / 2, top, w, h, 16);
+  ctx.globalAlpha = 0.55 + 0.3 * Math.sin(time * 4);
+  glowStroke('#ffffff', 1.8);
+  ctx.globalAlpha = 1;
+  if (G.sel < 0) { // a small arrow above the chosen tube
+    const y = hoverY(i) + Math.sin(time * 4) * 3;
+    ctx.fillStyle = '#ffffff'; ctx.globalAlpha = 0.85;
+    ctx.beginPath(); ctx.moveTo(t.x - 9, y - 6); ctx.lineTo(t.x + 9, y - 6); ctx.lineTo(t.x, y + 5); ctx.closePath(); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawHintArrow() {
+  if (!G.hint || state !== 'play') return;
+  const [a, b] = G.hint, A = V.tubes[a], B = V.tubes[b];
+  if (!A || !B) return;
+  const x0 = A.x, y0 = hoverY(a) - 6, x1 = B.x, y1 = hoverY(b) - 2;
+  const cx = (x0 + x1) / 2, cy = Math.min(y0, y1) - 28 - Math.abs(x1 - x0) * 0.06;
+  ctx.beginPath(); ctx.moveTo(x0, y0); ctx.quadraticCurveTo(cx, cy, x1, y1);
+  ctx.setLineDash([10, 8]); ctx.lineDashOffset = -time * 30;
+  ctx.globalAlpha = 0.85; glowStroke(CFG.color.warn, 2.5);
+  ctx.setLineDash([]); ctx.lineDashOffset = 0;
+  const ang = Math.atan2(y1 - cy, x1 - cx);
+  ctx.fillStyle = CFG.color.warn;
+  ctx.beginPath();
+  ctx.moveTo(x1 + Math.cos(ang) * 6, y1 + Math.sin(ang) * 6);
+  ctx.lineTo(x1 + Math.cos(ang + 2.5) * 13, y1 + Math.sin(ang + 2.5) * 13);
+  ctx.lineTo(x1 + Math.cos(ang - 2.5) * 13, y1 + Math.sin(ang - 2.5) * 13);
+  ctx.closePath(); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+const tmpPos = { x: 0, y: 0 };
+function drawMovingBalls() {
+  for (const f of G.flights) { flightPos(f, tmpPos); drawBall(f.col, tmpPos.x, tmpPos.y, V.R); }
+  if (G.sel >= 0 && state !== 'win') {
+    const t = G.tubes[G.sel];
+    if (t && t.length) drawBall(t[t.length - 1], G.holdX, G.holdY, V.R * 1.06);
+  }
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? 'rgba(143,216,255,0.16)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.accent, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+function drawIcon(kind, cx, cy, col) {
+  ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 2.6; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  switch (kind) {
+    case 'undo':
+      ctx.arc(cx + 2, cy + 3, 9, Math.PI, Math.PI * 2.3); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx - 13, cy - 1); ctx.lineTo(cx - 1, cy - 1); ctx.lineTo(cx - 7, cy + 8); ctx.closePath(); ctx.fill();
+      break;
+    case 'restart':
+      ctx.arc(cx, cy, 9, -Math.PI * 0.3, Math.PI * 1.45); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx + 3, cy - 14); ctx.lineTo(cx + 12, cy - 8); ctx.lineTo(cx + 3, cy - 3); ctx.closePath(); ctx.fill();
+      break;
+    case 'hint':
+      for (let i = 0; i < 8; i++) {
+        const a = -Math.PI / 2 + i * Math.PI / 4, d = i % 2 ? 3.6 : 11;
+        if (i) ctx.lineTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d); else ctx.moveTo(cx + Math.cos(a) * d, cy + Math.sin(a) * d);
+      }
+      ctx.closePath(); ctx.fill();
+      break;
+    case 'tube': // a small glass tube with one ball in it
+      ctx.lineWidth = 2.2;
+      ctx.moveTo(cx - 11, cy - 12); ctx.lineTo(cx - 7, cy - 12); ctx.lineTo(cx - 7, cy + 5); ctx.arc(cx, cy + 5, 7, Math.PI, 0, true);
+      ctx.lineTo(cx + 7, cy - 12); ctx.lineTo(cx + 11, cy - 12); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy + 5, 4, 0, TAU); ctx.fill();
+      break;
+  }
+  ctx.lineCap = 'butt';
+}
+
+// A big helper button for the side panels: icon, label, and the key / button that also does it
+function drawPanelButton(r, icon, label, badge, opt = {}) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r) && !opt.dim;
+  const C = CFG.color;
+  rrPath(r.x, r.y, r.w, r.h, 14);
+  ctx.fillStyle = hover ? 'rgba(143,216,255,0.14)' : 'rgba(20,26,52,0.62)'; ctx.fill();
+  const pulse = opt.pulse ? 0.5 + 0.5 * Math.sin(time * 5) : 0;
+  ctx.globalAlpha = opt.dim ? 0.25 : opt.pulse ? 0.6 + 0.4 * pulse : hover ? 1 : 0.6;
+  glowStroke(opt.pulse ? C.warn : C.accent, opt.pulse ? 2 : 1.3);
+  ctx.globalAlpha = opt.dim ? 0.4 : 1;
+  const cx = r.x + r.w / 2;
+  drawIcon(icon, cx, r.y + 22, opt.pulse ? C.warn : C.text);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text(label, cx, r.y + 48, `700 15px ${SANS}`, opt.dim ? C.dim : C.text);
+  if (badge) {
+    ctx.font = `800 11px ${SANS}`;
+    const bw = Math.max(20, ctx.measureText(badge).width + 10), bx = r.x + r.w - bw - 5, by = r.y + 5;
+    rrPath(bx, by, bw, 18, 9); ctx.fillStyle = 'rgba(143,216,255,0.16)'; ctx.fill();
+    text(badge, bx + bw / 2, by + 9.5, `800 11px ${SANS}`, C.accent);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function topLine() {
+  const dev = Input.device, NN = padNames(), holding = G.sel >= 0;
+  if (dev === 'pad') return holding ? `Choose a tube and press ${NN.a} to drop  ·  ${NN.b} puts it back` : `D-pad: choose a tube  ·  ${NN.a}: lift the top ball`;
+  if (dev === 'touch') return holding ? 'Tap a tube with the same colour on top, or an empty one' : 'Tap a tube to lift its top ball, or drag it';
+  if (dev === 'mouse') return holding ? 'Click where it should go, or click it again to put it back' : 'Click a tube to lift its top ball, or drag it';
+  return holding ? 'Arrows choose  ·  Space drops it  ·  Esc puts it back' : 'Arrows or 1–9 choose a tube  ·  Space lifts the top ball';
+}
+
+function drawHUD() {
+  const C = CFG.color, LX = 65, RX = W - 65, NN = padNames(), dev = Input.device;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // Left: level, then Undo and Restart
+  text('LEVEL', LX, 40, `800 12px ${SANS}`, C.faint);
+  glowText(String(G.level), LX, 78, `800 40px ${SANS}`, C.title);
+  text(`${G.colours} colours`, LX, 114, `600 14px ${SANS}`, C.dim);
+  text('MOVES', LX, 146, `800 12px ${SANS}`, C.faint);
+  text(String(G.moves), LX, 170, `700 20px ${MONO}`, C.text);
+  const badge = (pad, kb) => (dev === 'pad' ? pad : dev === 'kb' ? kb : '');
+  drawPanelButton(UNDO_BTN, 'undo', 'Undo', badge(NN.lb, 'U'), { dim: !G.history.length });
+  drawPanelButton(RESTART_BTN, 'restart', 'Restart', badge('', 'R'), { dim: !G.history.length });
+  // Right: sound and pause, then Hint and Extra tube
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  text('SORTED', RX, 146, `800 12px ${SANS}`, C.faint);
+  text(`${countComplete(G.tubes)} / ${G.colours}`, RX, 170, `700 20px ${MONO}`, C.text);
+  drawPanelButton(HINT_BTN, 'hint', G.job ? 'Thinking…' : 'Hint', badge(NN.y, 'H'), { pulse: !!G.job });
+  drawPanelButton(EXTRA_BTN, 'tube', G.extra ? 'Used' : '+ Tube', badge(NN.x, 'X'), { dim: G.extra, pulse: G.hintExtra && !G.extra });
+  text(G.extra ? 'extra tube used' : '1 extra tube', RX, EXTRA_BTN.y + EXTRA_BTN.h + 16, `500 13px ${SANS}`, C.faint);
+  // Top centre: what to do next
+  if (!G.won) { // (it fades out while a toast is shown in the same spot)
+    ctx.globalAlpha = toast.t > 0 ? 1 - Math.min(1, toast.t * 3) : 1;
+    text(topLine(), W / 2, 24, `500 15px ${SANS}`, C.dim);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawBanner() {
+  if (G.bannerT <= 0) return;
+  const a = Math.min(1, G.bannerT * 2, (G.bannerMax - G.bannerT) * 5);
+  ctx.globalAlpha = a;
+  rrPath(W / 2 - 220, H / 2 - 48, 440, 96, 20);
+  ctx.fillStyle = 'rgba(6,9,22,0.9)'; ctx.fill();
+  glowStroke(G.bannerColor, 1.5);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(G.banner, W / 2, H / 2 - 14, `800 28px ${SANS}`, G.bannerColor);
+  text(G.bannerSub, W / 2, H / 2 + 22, `500 16px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  renderTubes();
+  drawCursor();
+  drawHintArrow();
+  drawMovingBalls();
+  drawFx();
+  drawHUD();
+  drawBanner();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 330, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(255,159,176,0.10)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 16px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  // Big balls drifting slowly behind the menu
+  for (let i = 0; i < 12; i++) {
+    const x = ((i * 137 + time * (8 + (i % 3) * 5)) % (W + 160)) - 80;
+    const y = 60 + ((i * 191) % 420) + Math.sin(time * 0.6 + i) * 16;
+    const R = 22 + (i % 3) * 7;
+    ctx.globalAlpha = 0.18 + (i % 3) * 0.05;
+    drawBall(i, x, y, R);
+  }
+  ctx.globalAlpha = 1;
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 380);
+  shade.addColorStop(0, 'rgba(5,7,15,0.84)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON SORT', W / 2, 78, `800 64px ${SANS}`, CFG.color.title);
+  text('a calm colour-sorting puzzle', W / 2, 122, `500 16px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), y0 = 176, gap = 44;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap + 4, `500 15px ${SANS}`, CFG.color.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, y0 + items.length * gap + 28, `500 13px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 26, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`Highest level ${bestLevel}  ·  ${solvedCount} solved`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, CFG.color.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.5);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 36, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Choose a tube', 'D-pad / left stick', 'Arrows, or 1–9 and 0', 'Tap or click it'],
+    ['Lift / drop a ball', NN.a, 'Space or Enter', 'Tap a tube, then another'],
+    ['Put it back', NN.b, 'Esc', 'Tap it again (or drag it)'],
+    ['Undo', NN.lb, 'U or Z', 'Undo button'],
+    ['Hint', NN.y, 'H', 'Hint button'],
+    ['Extra tube', NN.x, 'X or E', '+ Tube button'],
+    ['Restart level', 'Pause menu', 'R', 'Restart button'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [222, 244, 436, 626];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 72, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 72, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 72, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 96 + i * 22;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 300, W - 120, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 322, `800 12px ${SANS}`, C.faint);
+    lines.forEach((s, i) => text(s, x, 348 + i * 22, `500 15px ${SANS}`, C.text));
+  };
+  col('SORTING', 60, [
+    'Move the top ball onto a tube',
+    'with the same colour on top,',
+    'or into an empty tube.',
+    'Same-colour balls move together.',
+    'Fill each tube with one colour.',
+    'No timer and no move limit.',
+  ]);
+  col('HELPERS', 380, [
+    'Undo as often as you like.',
+    'Hint shows a good next move.',
+    '+ Tube: one extra empty tube',
+    'per level.',
+    'Restart goes back to the start',
+    '(Undo brings your moves back).',
+  ]);
+  text('SYMBOLS', 690, 322, `800 12px ${SANS}`, C.faint);
+  for (let i = 0; i < 6; i++) drawBall(i, 704 + i * 36, 356, 15);
+  for (let i = 6; i < 12; i++) drawBall(i, 704 + (i - 6) * 36, 394, 15);
+  ['Each colour has its own', 'symbol. Turn them off with', 'Symbols on the menu.']
+    .forEach((s, i) => text(s, 690, 434 + i * 22, `500 15px ${SANS}`, C.text));
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 22, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the board
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.94)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  card(W / 2 - 240, 60, 480, 420);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 116, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time.', W / 2, 158, `500 15px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 212, true, 48);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 446, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawWin() {
+  overlay(Math.min(0.55, stateT * 1.5));
+  const r = G.winInfo, C = CFG.color;
+  if (!r) return;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 240, 96, 480, 340);
+  glowText(`Level ${r.level} complete`, W / 2, 150, `800 40px ${SANS}`, C.title);
+  text(r.word, W / 2, 196, `600 18px ${SANS}`, C.text);
+  const hints = r.hints === 1 ? '1 hint' : `${r.hints} hints`;
+  text(`Sorted in ${r.moves} moves  ·  ${hints}`, W / 2, 228, `500 15px ${SANS}`, C.dim);
+  drawMenu(winItems(), 296, stateT > 0.6);
+  const NN = padNames();
+  text(usingPad() ? `${NN.a}: choose` : Input.device === 'touch' ? 'Tap an option' : 'Enter or click: choose', W / 2, 404, `500 13px ${SANS}`, C.faint);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 15px ${SANS}`;
+  const y = state === 'play' ? 24 : H - 52, w = ctx.measureText(toast.text).width + 32;  // in play it covers the top hint line
+  rrPath(W / 2 - w / 2, y - 15, w, 30, 15);
+  ctx.fillStyle = 'rgba(10,14,32,0.96)'; ctx.fill();
+  ctx.globalAlpha *= 0.5; glowStroke(CFG.color.accent, 1); ctx.globalAlpha = Math.min(1, toast.t * 3);
+  text(toast.text, W / 2, y, `600 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'win') drawWin();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

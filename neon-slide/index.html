@@ -1,0 +1,1507 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Slide</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const BS = 440;                                // the board is always a BS x BS square
+const BX = (W - BS) / 2, BY = 54;              // board top-left corner
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const SIZES = [3, 4, 5];
+const SIZE_LABEL = { 3: '3×3', 4: '4×4', 5: '5×5' };
+const SIZE_HINT = {
+  3: 'Small and short: reach the 256 tile.',
+  4: 'The classic size: reach the 2048 tile.',
+  5: 'Roomy and relaxed: reach the 4096 tile.',
+};
+const SLOT_GAP = { 3: 14, 4: 12, 5: 10 };     // space between cells, per board size
+const MODES = ['relax', 'classic'];
+const MODE_LABEL = { relax: 'Relax', classic: 'Classic' };
+const MODE_HINT = { relax: 'Unlimited undo. Nothing to lose.', classic: '3 undos per game. A gentle challenge.' };
+
+const CFG = {
+  goal: { 3: 256, 4: 2048, 5: 4096 },   // the tile that earns a celebration, per board size
+  fourChance: 0.1,                      // chance a new tile is a 4 instead of a 2
+  classicUndos: 3,                      // undos per game in Classic (Relax has no limit)
+  // Animation times in seconds
+  anim: { slide: 0.12, pop: 0.2, born: 0.18, bump: 0.18, winDelay: 0.5, overDelay: 0.7 },
+  swipe: { fire: 26, flick: 14 },       // drag distance (in 960x540 units) that counts as a swipe
+  stick: { on: 0.6, off: 0.35 },        // stick push that makes a move, and the release that re-arms it
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#636e9a', title: '#c4f27a', good: '#7dffc0', warn: '#ffd88a',
+  },
+};
+// One glowing colour per tile value: index = power of two (1 = 2, 2 = 4, ... 11 = 2048). Index 0 is white.
+const TILE_COLORS = ['#ffffff',
+  '#5ad1ff', '#5affc8', '#8dff6a', '#e4ff5a', '#ffc65a', '#ff8f6a',
+  '#ff6fae', '#e07bff', '#a48bff', '#7aa2ff', '#fff1b0', '#f4f8ff'];
+// Soft pentatonic notes: a merge rings higher the bigger the tile it makes
+const NOTES = [261.63, 293.66, 329.63, 392, 440, 523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51];
+const KEY = 'neonSlide.';
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+const isNum = v => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+const log2 = v => (v > 0 ? Math.round(Math.log2(v)) : 0);
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const fmt = n => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+const backOut = t => { const s = 1.6, u = t - 1; return 1 + (s + 1) * u * u * u + s * u * u; };
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+const tileColor = e => (e < TILE_COLORS.length ? TILE_COLORS[e] : TILE_COLORS[1 + ((e - 1) % 10)]);
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas + art (background, board and every tile are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, boardCanvas = null, boardArtN = 0;
+let dotSprites = [];                 // soft glowing dots, one per tile colour
+const tileCache = new Map();         // (size, power) -> { c: canvas, S: sprite size }
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function sparkle(g, x, y, r) { // a small four-point star
+  g.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 4, d = i % 2 ? r * 0.28 : r;
+    if (i) g.lineTo(x + Math.cos(a) * d, y + Math.sin(a) * d); else g.moveTo(x + Math.cos(a) * d, y + Math.sin(a) * d);
+  }
+  g.closePath(); g.fill();
+}
+
+// One tile: tinted dark glass, a neon edge, its number, and more detail as the value grows
+function makeTile(e, s) {
+  const p = Math.round(s * 0.24), S = s + p * 2;
+  const { c, g } = layer(S, S);
+  const col = tileColor(e), rad = s * 0.18;
+  g.translate(p, p);
+  // Halo: brighter for bigger values
+  const ha = Math.min(0.42, 0.1 + e * 0.028);
+  const hg = g.createRadialGradient(s / 2, s / 2, s * 0.25, s / 2, s / 2, s / 2 + p);
+  hg.addColorStop(0, hexA(col, ha)); hg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = hg; g.fillRect(-p, -p, S, S);
+  // Body
+  rr(g, 0, 0, s, s, rad); g.fillStyle = '#080b1c'; g.fill();
+  const body = g.createLinearGradient(0, 0, 0, s);
+  body.addColorStop(0, hexA(col, 0.5)); body.addColorStop(1, hexA(col, 0.15));
+  g.fillStyle = body; g.fill();
+  // Soft inner patterns from 128 up
+  g.save();
+  rr(g, 0, 0, s, s, rad); g.clip();
+  g.strokeStyle = '#ffffff'; g.fillStyle = '#ffffff';
+  if (e >= 7) {
+    const kind = (e - 7) % 4;
+    if (kind === 0 || e >= 11) { // rings
+      g.globalAlpha = 0.09; g.lineWidth = Math.max(1, s * 0.02);
+      for (let i = 1; i <= 4; i++) { g.beginPath(); g.arc(s / 2, s / 2, s * 0.14 * i, 0, TAU); g.stroke(); }
+    }
+    if (kind === 1) { // dots
+      g.globalAlpha = 0.15;
+      const st = s / 6;
+      for (let y = st / 2; y < s; y += st) for (let x = st / 2; x < s; x += st) { g.beginPath(); g.arc(x, y, s * 0.02, 0, TAU); g.fill(); }
+    }
+    if (kind === 2) { // soft diagonal bands
+      g.globalAlpha = 0.07; g.lineWidth = s * 0.07;
+      for (let i = -s; i < s * 2; i += s * 0.22) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i + s, s); g.stroke(); }
+    }
+    if (kind === 3 || e >= 11) { // rays
+      g.globalAlpha = 0.1; g.lineWidth = Math.max(1, s * 0.025);
+      for (let i = 0; i < 12; i++) {
+        const a = i * TAU / 12;
+        g.beginPath();
+        g.moveTo(s / 2 + Math.cos(a) * s * 0.14, s / 2 + Math.sin(a) * s * 0.14);
+        g.lineTo(s / 2 + Math.cos(a) * s * 0.75, s / 2 + Math.sin(a) * s * 0.75);
+        g.stroke();
+      }
+    }
+  }
+  g.globalAlpha = 0.1; // gloss along the top
+  g.beginPath(); g.ellipse(s * 0.5, -s * 0.04, s * 0.62, s * 0.24, 0, 0, TAU); g.fill();
+  g.restore();
+  // Neon edge: wide faint strokes under a thin bright one (a prism edge from 4096 up)
+  rr(g, 1, 1, s - 2, s - 2, rad);
+  g.lineJoin = 'round';
+  let edge = col;
+  if (e >= 12) {
+    edge = g.createLinearGradient(0, 0, s, s);
+    [1, 3, 5, 7, 9].forEach((ci, i) => edge.addColorStop(i / 4, TILE_COLORS[ci]));
+  }
+  g.strokeStyle = edge;
+  g.globalAlpha = 0.16; g.lineWidth = 9; g.stroke();
+  g.globalAlpha = 0.32; g.lineWidth = 4.5; g.stroke();
+  g.globalAlpha = 1; g.lineWidth = Math.max(1.6, s * 0.022); g.stroke();
+  if (e >= 4) { // inner outline from 16 up
+    rr(g, s * 0.09, s * 0.09, s * 0.82, s * 0.82, rad * 0.7);
+    g.globalAlpha = 0.3; g.lineWidth = 1.2; g.strokeStyle = col; g.stroke();
+  }
+  if (e >= 10) { // sparkles from 1024 up
+    g.globalAlpha = 0.9; g.fillStyle = '#ffffff';
+    sparkle(g, s * 0.17, s * 0.17, s * 0.08);
+    sparkle(g, s * 0.85, s * 0.84, s * 0.055);
+  }
+  // The number: white with a dark edge and a soft glow in the tile's colour
+  const txt = String(2 ** e);
+  let fs = s * [0.52, 0.52, 0.46, 0.38, 0.31, 0.26, 0.22, 0.19][Math.min(txt.length, 7)];
+  g.font = `800 ${fs}px ${SANS}`;
+  const tw = g.measureText(txt).width;
+  if (tw > s * 0.84) { fs *= (s * 0.84) / tw; g.font = `800 ${fs}px ${SANS}`; }
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  const ty = s / 2 + fs * 0.05;
+  g.globalAlpha = 0.35; g.strokeStyle = col; g.lineWidth = Math.max(3, fs * 0.3); g.strokeText(txt, s / 2, ty);
+  g.globalAlpha = 0.6; g.strokeStyle = '#05070f'; g.lineWidth = Math.max(2, fs * 0.14); g.strokeText(txt, s / 2, ty);
+  g.globalAlpha = 1; g.fillStyle = '#ffffff'; g.fillText(txt, s / 2, ty);
+  return { c, S };
+}
+
+function tileSprite(e, size) {
+  const key = Math.round(size) * 64 + e;
+  let t = tileCache.get(key);
+  if (!t) { t = makeTile(e, Math.round(size)); tileCache.set(key, t); }
+  return t;
+}
+
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+// The board panel with its empty slots, for one board size
+function buildBoardArt(n) {
+  const L = layer(BS + 48, BS + 48), g = L.g, gap = SLOT_GAP[n], cs = (BS - gap * (n + 1)) / n;
+  g.translate(24, 24);
+  rr(g, -10, -10, BS + 20, BS + 20, 20); g.fillStyle = 'rgba(8,11,26,0.9)'; g.fill();
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      rr(g, gap + c * (cs + gap), gap + r * (cs + gap), cs, cs, cs * 0.18);
+      g.fillStyle = 'rgba(120,150,255,0.055)'; g.fill();
+      g.strokeStyle = 'rgba(140,165,255,0.09)'; g.lineWidth = 1; g.stroke();
+    }
+  }
+  boardCanvas = L.c; boardArtN = n;
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  const L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[120, 90, 300, '#3a8cff', 0.09], [860, 460, 320, '#8a5cff', 0.08], [900, 60, 220, '#5affc8', 0.05], [70, 500, 260, '#c4f27a', 0.045]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  dotSprites = TILE_COLORS.map(drawDot);
+  tileCache.clear();
+  buildBoardArt(boardArtN || 4);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine bells only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) { // a soft airy swell
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  slide()   { if (this.ok('slide', 0.05)) this.noise(0.16, 0.012, 900); },
+  merge(e) { // e = power of two of the biggest tile made by this move
+    if (!this.ok('merge', 0.04)) return;
+    const f = NOTES[clamp(e - 2, 0, NOTES.length - 1)];
+    this.bell(f, 0.085, 0, 0.55);
+    this.tone(f / 2, f / 2, 0.3, 'triangle', 0.03);
+  },
+  bump()    { if (this.ok('bump', 0.12)) this.tone(196, 174.61, 0.16, 'sine', 0.035); },
+  undo()    { if (this.ok('undo', 0.06)) { this.tone(587.33, 587.33, 0.12, 'sine', 0.045); this.tone(440, 440, 0.2, 'sine', 0.04, 0.08); } },
+  win()     { if (this.ok('win', 0.5)) [523.25, 659.25, 783.99, 1046.5, 1318.51].forEach((f, i) => this.bell(f, 0.06, i * 0.14, 1.4)); },
+  full()    { if (this.ok('full', 0.5)) [523.25, 440, 392, 329.63].forEach((f, i) => this.bell(f, 0.05, i * 0.18, 1.0)); },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select()  { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()    { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates; sx/sy is where it went down
+  mouse: { x: W / 2, y: H / 2, sx: W / 2, sy: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0, stickArmed: true,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, pause: false, mute: false, select: false, back: false, undo: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+  move: 0,          // a tile move this frame: 1 up, 2 down, 3 left, 4 right (never repeats while held)
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.sx = m.x; m.sy = m.y;
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let act = P.has('Space') || P.has('Enter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let undo = P.has('KeyU') || P.has('KeyZ');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+    // Tile moves use fresh key presses only (`pressed` never holds key repeats)
+    let move = P.has('ArrowUp') || P.has('KeyW') ? 1 : P.has('ArrowDown') || P.has('KeyS') ? 2
+      : P.has('ArrowLeft') || P.has('KeyA') ? 3 : P.has('ArrowRight') || P.has('KeyD') ? 4 : 0;
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) act = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      if (tap(4)) undo = true;
+      // D-pad or left stick as a menu cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+      // Tile moves: one per D-pad press, or one per stick push (it must come back near the centre to re-arm)
+      if (!move) move = tap(12) ? 1 : tap(13) ? 2 : tap(14) ? 3 : tap(15) ? 4 : 0;
+      const sm = Math.hypot(ax, ay);
+      if (fresh) this.stickArmed = sm < CFG.stick.on;
+      else if (this.stickArmed) {
+        if (sm > CFG.stick.on) {
+          this.stickArmed = false;
+          if (!move) move = Math.abs(ay) >= Math.abs(ax) ? (ay < 0 ? 1 : 2) : (ax < 0 ? 3 : 4);
+        }
+      } else if (sm < CFG.stick.off) this.stickArmed = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.pause = pause; this.mute = mute; this.select = select; this.back = back; this.undo = undo;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+    this.move = move;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', start: 'Options', select: 'Create', lb: 'L1' }
+    : { a: 'A', b: 'B', start: 'Start', select: 'Back', lb: 'LB' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let boardN = SIZES.includes(+load(KEY + 'size', 4)) ? +load(KEY + 'size', 4) : 4;   // Board chip
+let modePick = MODES.includes(load(KEY + 'mode', 'relax')) ? load(KEY + 'mode', 'relax') : 'relax';  // Mode chip
+let bests = loadBests();                 // best score and biggest tile, per board size
+Sfx.muted = load(KEY + 'muted', '0') === '1';
+const toast = { text: '', t: 0 };
+
+function showToast(text) { toast.text = text; toast.t = 2; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); G.drag = null; saveGame(); Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { if (G.live) saveGame(); clearFx(); setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save(KEY + 'muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function cycleSize(d) {
+  boardN = SIZES[(SIZES.indexOf(boardN) + d + SIZES.length) % SIZES.length];
+  save(KEY + 'size', boardN);
+}
+function cycleMode(d) {
+  modePick = MODES[(MODES.indexOf(modePick) + d + MODES.length) % MODES.length];
+  save(KEY + 'mode', modePick);
+}
+
+function loadBests() {
+  let b = null;
+  try { b = JSON.parse(load(KEY + 'bests', '{}')); } catch (e) { b = null; }
+  const out = {};
+  for (const n of SIZES) {
+    const x = (b && typeof b === 'object' && b[n]) || {};
+    out[n] = { score: isNum(x.score) ? x.score : 0, tile: isNum(x.tile) ? x.tile : 0 };
+  }
+  return out;
+}
+
+// ============================================================
+// 2. Board logic. cells is a flat array (row by row) of tile values; 0 = empty.
+//    Directions: 1 up, 2 down, 3 left, 4 right.
+// ============================================================
+const LINES = {};
+// The board cut into lines for one direction; each line starts at the wall the tiles slide toward
+function lines(n, dir) {
+  const key = n * 10 + dir;
+  if (LINES[key]) return LINES[key];
+  const out = [];
+  for (let a = 0; a < n; a++) {
+    const line = [];
+    for (let b = 0; b < n; b++) {
+      let r, c;
+      if (dir === 1) { c = a; r = b; } else if (dir === 2) { c = a; r = n - 1 - b; }
+      else if (dir === 3) { r = a; c = b; } else { r = a; c = n - 1 - b; }
+      line.push(r * n + c);
+    }
+    out.push(line);
+  }
+  return (LINES[key] = out);
+}
+
+// Slides one line toward its start. Equal neighbours merge once each: [2,2,2,2] -> [4,4,0,0].
+function slideLine(vals) {
+  const n = vals.length, out = new Array(n).fill(0), src = [], merged = [];
+  let score = 0, w = 0, open = false;   // open: the last placed tile can still take a merge
+  for (let i = 0; i < n; i++) {
+    const v = vals[i];
+    if (!v) continue;
+    if (open && out[w - 1] === v) {
+      out[w - 1] = v * 2; score += v * 2; merged.push(w - 1); src.push([i, w - 1]); open = false;
+    } else {
+      out[w] = v; src.push([i, w]); w++; open = true;
+    }
+  }
+  return { out, score, merged, src };
+}
+
+// A whole move. Pure: returns the new cells plus what moved and merged (for the animation).
+function slideBoard(cells, n, dir) {
+  const next = cells.slice(), moves = [], merges = [];
+  let score = 0, moved = false;
+  for (const line of lines(n, dir)) {
+    const vals = line.map(k => cells[k]);
+    const r = slideLine(vals);
+    for (let i = 0; i < line.length; i++) { next[line[i]] = r.out[i]; if (r.out[i] !== vals[i]) moved = true; }
+    for (const [i, j] of r.src) moves.push({ from: line[i], to: line[j], v: vals[i] });
+    for (const j of r.merged) merges.push({ k: line[j], v: r.out[j] });
+    score += r.score;
+  }
+  return { cells: next, score, moved, moves, merges };
+}
+
+// Puts a 2 (or sometimes a 4) in a random empty cell. Returns the cell, or -1 if the board is full.
+function spawnTile(cells, rnd = Math.random) {
+  let empty = 0;
+  for (const v of cells) if (!v) empty++;
+  if (!empty) return -1;
+  let pick = Math.min(empty - 1, Math.floor(rnd() * empty));
+  for (let k = 0; k < cells.length; k++) {
+    if (!cells[k] && pick-- === 0) { cells[k] = rnd() < CFG.fourChance ? 4 : 2; return k; }
+  }
+  return -1;
+}
+
+// Is any move possible? (an empty cell, or two equal neighbours)
+function canMove(cells, n) {
+  for (let k = 0; k < n * n; k++) {
+    const v = cells[k];
+    if (!v) return true;
+    if (k % n < n - 1 && cells[k + 1] === v) return true;
+    if (k + n < n * n && cells[k + n] === v) return true;
+  }
+  return false;
+}
+
+function maxTile(cells) { let m = 0; for (const v of cells) if (v > m) m = v; return m; }
+// Saved boards: one base-36 character per cell, holding the power of two (0 = empty)
+function encode(cells) { return cells.map(v => log2(v).toString(36)).join(''); }
+function decode(s) { return [...s].map(ch => { const e = parseInt(ch, 36); return e ? 2 ** e : 0; }); }
+const validCode = (s, n) => typeof s === 'string' && s.length === n * n && /^[0-9a-z]+$/.test(s);
+
+// ============================================================
+// 3. Play
+// ============================================================
+let CS = 95, GAP = 12;                   // cell size and gap for the board being played
+const G = {
+  n: 4, mode: 'relax', cells: [], score: 0, shown: 0, moves: 0, undos: 0, hist: [], won: false, live: false,
+  startBest: 0, anim: null, bump: null, pending: null, pendingT: 0, drag: null, undoFlash: 0, scoreGlow: 0,
+};
+let savedGame = summarize(loadGame());   // what Continue would resume (or null)
+
+function setGeometry(n) {
+  GAP = SLOT_GAP[n]; CS = (BS - GAP * (n + 1)) / n;
+  if (boardArtN !== n) buildBoardArt(n);
+}
+const tileX = k => BX + GAP + (k % G.n) * (CS + GAP);           // left edge of cell k
+const tileY = k => BY + GAP + ((k / G.n) | 0) * (CS + GAP);     // top edge of cell k
+
+function resetPlay(n, mode) {
+  Sfx.init();
+  clearFx();
+  setGeometry(n);
+  Object.assign(G, {
+    n, mode, cells: new Array(n * n).fill(0), score: 0, shown: 0, moves: 0,
+    undos: mode === 'classic' ? CFG.classicUndos : 0, hist: [], won: false, live: true,
+    startBest: bests[n].score, anim: null, bump: null, pending: null, pendingT: 0, drag: null, undoFlash: 0, scoreGlow: 0,
+  });
+}
+
+function newGame(n, mode) {
+  resetPlay(n, mode);
+  const a = spawnTile(G.cells), b = spawnTile(G.cells);
+  G.anim = { t: CFG.anim.slide, moves: [], merges: [], mergeSet: new Set(), spawn: [a, b], fx: true };  // the first two tiles pop in
+  setState('play');
+  saveGame();
+}
+
+function continueGame() {
+  const d = loadGame();
+  if (!d) { savedGame = null; showToast('No saved game'); return; }
+  resetPlay(d.n, d.mode);
+  Object.assign(G, { cells: d.cells, score: d.score, shown: d.score, moves: d.moves, undos: d.undos, hist: d.hist, won: d.won, startBest: d.startBest });
+  const all = [];
+  G.cells.forEach((v, k) => { if (v) all.push(k); });
+  G.anim = { t: CFG.anim.slide, moves: [], merges: [], mergeSet: new Set(), spawn: all, fx: true };
+  setState('play');
+  if (!canMove(G.cells, G.n)) { G.pending = 'over'; G.pendingT = 0; }
+}
+
+// Ends the running animation at once (a quick player never has to wait for it)
+function finishAnim() {
+  if (G.anim && !G.anim.fx) mergeFx();
+  G.anim = null;
+}
+
+function doMove(dir) {
+  if (G.pending === 'win') return false;      // the celebration is on its way
+  if (G.anim) finishAnim();
+  const res = slideBoard(G.cells, G.n, dir);
+  if (!res.moved) { G.bump = { dir, t: 0 }; Sfx.bump(); return false; }  // nothing moves: a soft nudge, no new tile
+  G.hist.push({ c: encode(G.cells), s: G.score, m: G.moves });
+  G.cells = res.cells;
+  G.score += res.score;
+  G.moves++;
+  const k = spawnTile(G.cells);
+  G.anim = { t: 0, moves: res.moves, merges: res.merges, mergeSet: new Set(res.merges.map(m => m.k)), spawn: k >= 0 ? [k] : [], fx: false };
+  G.bump = null;
+  Sfx.slide();
+  if (res.merges.length) {
+    let top = 0;
+    for (const m of res.merges) if (m.v > top) top = m.v;
+    Sfx.merge(log2(top));
+    floaters.clear(); // one gain at a time, so quick moves never stack up
+    floater('+' + fmt(res.score), BX / 2 + 70, 146, tileColor(log2(top)), 18);
+    G.scoreGlow = 1;
+  }
+  updateBests();
+  G.pending = null;
+  if (!G.won && maxTile(G.cells) >= CFG.goal[G.n]) { G.won = true; G.pending = 'win'; G.pendingT = 0; }
+  else if (!canMove(G.cells, G.n)) { G.pending = 'over'; G.pendingT = 0; }
+  return true;
+}
+
+function canUndo() { return G.live && G.hist.length > 0 && (G.mode === 'relax' || G.undos > 0); }
+
+function undo() {
+  if (!G.hist.length) { showToast('Nothing to undo yet'); Sfx.bump(); return false; }
+  if (G.mode === 'classic' && G.undos <= 0) { showToast('No undos left in this game'); Sfx.bump(); return false; }
+  const h = G.hist.pop();
+  G.cells = decode(h.c); G.score = h.s; G.moves = h.m;
+  if (G.mode === 'classic') G.undos--;
+  if (G.pending === 'win') G.won = false;   // it was never celebrated
+  G.anim = null; G.bump = null; G.pending = null; G.undoFlash = 1;
+  Sfx.undo();
+  if (state !== 'play') setState('play');
+  return true;
+}
+
+function updateBests() {
+  const b = bests[G.n];
+  let changed = false;
+  if (G.score > b.score) { b.score = G.score; changed = true; }
+  const t = maxTile(G.cells);
+  if (t > b.tile) { b.tile = t; changed = true; }
+  if (changed) save(KEY + 'bests', JSON.stringify(bests));
+}
+
+function showWin() {
+  setState('win');
+  Sfx.win();
+  saveGame();
+  const goal = CFG.goal[G.n], k = G.cells.findIndex(v => v >= goal);
+  if (k >= 0) {
+    const x = tileX(k) + CS / 2, y = tileY(k) + CS / 2, col = tileColor(log2(goal));
+    ring(x, y, CS * 0.4, 300, 1.4, col, 3);
+    ring(x, y, CS * 0.3, 200, 1.0, '#ffffff', 2);
+    for (let e = 1; e <= 11; e++) burst(x, y, e, LOW_RES ? 2 : 4, 220, 1.4, 8);
+  }
+}
+
+function keepGoing() {
+  setState('play');
+  Sfx.blip();
+  if (!canMove(G.cells, G.n)) { G.pending = 'over'; G.pendingT = 0; }
+}
+
+function showOver() {
+  setState('over');
+  Sfx.full();
+  updateBests();
+  if (G.mode === 'classic' && G.undos <= 0) { clearGame(); G.live = false; } // nothing left to continue
+  else saveGame();
+}
+
+// ---- Saving the current game (on pause, quit, closing the page and when a game ends)
+function gameJSON(keep) {
+  const h = keep ? G.hist.slice(-keep) : G.hist;
+  return JSON.stringify({
+    v: 1, n: G.n, mode: G.mode, c: encode(G.cells), s: G.score, m: G.moves, u: G.undos, w: G.won ? 1 : 0, b: G.startBest,
+    h: h.map(e => `${e.c}:${e.s}:${e.m}`),
+  });
+}
+function saveGame() {
+  if (!G.live || !G.cells.length) return;
+  try { localStorage.setItem(KEY + 'game', gameJSON(0)); }
+  catch (e) { try { localStorage.setItem(KEY + 'game', gameJSON(500)); } catch (e2) { /* storage blocked: ignore */ } }
+  savedGame = { n: G.n, mode: G.mode, score: G.score, tile: maxTile(G.cells) };
+}
+function clearGame() {
+  try { localStorage.removeItem(KEY + 'game'); } catch (e) { /* ignore */ }
+  savedGame = null;
+}
+function loadGame() {
+  let d;
+  try { d = JSON.parse(load(KEY + 'game', '')); } catch (e) { return null; }
+  if (!d || typeof d !== 'object' || d.v !== 1 || !SIZES.includes(d.n) || !MODES.includes(d.mode)) return null;
+  if (!validCode(d.c, d.n) || !isNum(d.s) || !isNum(d.m)) return null;
+  const cells = decode(d.c);
+  if (!cells.some(v => v)) return null;
+  const hist = [];
+  if (Array.isArray(d.h)) {
+    for (const e of d.h) {
+      const p = String(e).split(':'), s = +p[1], m = +p[2];
+      if (p.length !== 3 || !validCode(p[0], d.n) || !isNum(s) || !isNum(m)) { hist.length = 0; break; }
+      hist.push({ c: p[0], s, m });
+    }
+  }
+  return {
+    n: d.n, mode: d.mode, cells, score: d.s, moves: d.m, hist, won: !!d.w,
+    undos: d.mode === 'classic' ? clamp(Math.floor(+d.u) || 0, 0, CFG.classicUndos) : 0,
+    startBest: isNum(d.b) ? d.b : 0,
+  };
+}
+function summarize(d) { return d ? { n: d.n, mode: d.mode, score: d.score, tile: maxTile(d.cells) } : null; }
+
+// Animation, and the gentle cards that follow a win or a full board
+function stepPlay(dt) {
+  const A = CFG.anim;
+  if (G.anim) {
+    G.anim.t += dt;
+    if (!G.anim.fx && G.anim.t >= A.slide) mergeFx();
+    if (G.anim.t >= A.slide + Math.max(A.pop, A.born)) G.anim = null;
+  }
+  if (G.bump) { G.bump.t += dt; if (G.bump.t >= A.bump) G.bump = null; }
+  if (G.undoFlash > 0) G.undoFlash = Math.max(0, G.undoFlash - dt * 2.5);
+  if (G.scoreGlow > 0) G.scoreGlow = Math.max(0, G.scoreGlow - dt * 2);
+  if (G.pending && !G.anim) {
+    G.pendingT += dt;
+    if (G.pendingT >= (G.pending === 'win' ? A.winDelay : A.overDelay)) {
+      const p = G.pending;
+      G.pending = null;
+      if (p === 'win') showWin(); else showOver();
+    }
+  }
+}
+
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const UNDO_BTN = { x: 30, y: 384, w: 200, h: 64 };
+
+// Keys, D-pad, stick, swipes, drags and the on-screen buttons
+function boardInput() {
+  const I = Input, m = I.mouse;
+  if (m.clicked && inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+  if (m.clicked && inRect(m, SOUND_BTN)) { toggleSound(); return; }
+  if (m.clicked && inRect(m, UNDO_BTN)) { undo(); return; }
+  if (I.undo) { undo(); return; }
+  let dir = I.move;
+  if (m.clicked) G.drag = { x: m.sx, y: m.sy };
+  if (G.drag) {
+    // One swipe (or mouse drag) = one move, in the direction it travels furthest
+    const dx = m.x - G.drag.x, dy = m.y - G.drag.y, d = Math.max(Math.abs(dx), Math.abs(dy));
+    if ((m.down && d > CFG.swipe.fire) || (m.released && d > CFG.swipe.flick)) {
+      if (!dir) dir = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 3 : 4) : (dy < 0 ? 1 : 2);
+      G.drag = null;
+    } else if (!m.down) G.drag = null;
+  }
+  if (dir) doMove(dir);
+}
+
+function updatePlay(dt) {
+  boardInput();
+  if (state !== 'play') return; // paused from the on-screen button
+  stepPlay(dt);
+  G.shown += (G.score - G.shown) * Math.min(1, dt * 10);
+  if (Math.abs(G.score - G.shown) < 1) G.shown = G.score;
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 120 : 260, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(40, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const floaters = new Pool(16, () => ({ x: 0, y: 0, text: '', color: '#fff', life: 0, max: 1, size: 20 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 24); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: 1 + (i % 10) });
+}
+
+function burst(x, y, ci, n, speed, life = 0.7, size = 7) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+function floater(text, x, y, color, size = 20) {
+  const o = floaters.get();
+  if (!o) return;
+  o.text = text; o.x = x; o.y = y; o.color = color; o.size = size; o.life = o.max = 1.1;
+}
+// Soft rings and sparks where tiles merged (as the slide lands)
+function mergeFx() {
+  const an = G.anim;
+  an.fx = true;
+  for (const m of an.merges) {
+    const e = log2(m.v), ci = Math.min(e, TILE_COLORS.length - 1);
+    const x = tileX(m.k) + CS / 2, y = tileY(m.k) + CS / 2;
+    ring(x, y, CS * 0.3, CS * (0.75 + Math.min(e, 12) * 0.03), 0.4, tileColor(e), 1.5);
+    burst(x, y, ci, (LOW_RES ? 3 : 5) + (e >= 7 ? 4 : 0), 120 + e * 6, 0.6, 6);
+  }
+}
+function clearFx() { parts.clear(); rings.clear(); floaters.clear(); }
+
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 30 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const pool of [rings, floaters]) {
+    for (const o of pool.items) {
+      if (!o.active) continue;
+      o.life -= dt;
+      if (o.life <= 0) o.active = false;
+    }
+  }
+  for (const f of floaters.items) if (f.active) f.y -= 16 * dt;
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function titleItems() {
+  const items = [];
+  const s = savedGame;
+  if (s) items.push({ id: 'continue', label: 'Continue', hint: `${SIZE_LABEL[s.n]} · ${MODE_LABEL[s.mode]} · score ${fmt(s.score)} · biggest tile ${s.tile}` });
+  items.push(
+    { id: 'new', label: 'New game', hint: s ? `A fresh ${SIZE_LABEL[boardN]} board (replaces your saved game).` : `A fresh ${SIZE_LABEL[boardN]} board in ${MODE_LABEL[modePick]} mode.` },
+    { id: 'size', label: 'Board', value: SIZE_LABEL[boardN], cycle: d => cycleSize(d), hint: SIZE_HINT[boardN] },
+    { id: 'mode', label: 'Mode', value: MODE_LABEL[modePick], cycle: d => cycleMode(d), hint: MODE_HINT[modePick] },
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Controls, merging and modes.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  );
+  return items;
+}
+function pauseItems() {
+  return [{ id: 'resume', label: 'Resume' }, { id: 'new', label: 'New game' }, soundItem(), { id: 'quit', label: 'Quit to menu' }];
+}
+function winItems() { return [{ id: 'keep', label: 'Keep going' }, { id: 'new', label: 'New game' }]; }
+function overItems() {
+  const undoIt = { id: 'undo', label: G.mode === 'relax' ? 'Undo last move' : `Undo (${G.undos} left)` };
+  if (G.mode === 'relax') return [undoIt, { id: 'new', label: 'New game' }, { id: 'menu', label: 'Main menu' }];
+  return [{ id: 'new', label: 'New game' }, ...(canUndo() ? [undoIt] : []), { id: 'menu', label: 'Main menu' }];
+}
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'continue') continueGame();
+      else if (id === 'new') newGame(boardN, modePick);
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) {
+        setState('title'); menuSel = titleItems().findIndex(it => it.id === 'howto'); Sfx.blip();
+      }
+      break;
+    case 'play':
+      if (Input.pause || Input.back) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'new') newGame(G.n, G.mode);
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'win':
+      if (stateT < 2.5 && Math.random() < (LOW_RES ? 0.15 : 0.35)) { // a few slow sparks drift over the board
+        burst(rand(BX + 20, BX + BS - 20), rand(BY + 20, BY + BS - 20), 1 + ((Math.random() * 11) | 0), 1, 40, 1.6, 8);
+      }
+      if (stateT > 0.8) {
+        const id = menuInput(winItems());
+        if (id === 'keep' || Input.back) keepGoing();
+        else if (id === 'new') newGame(G.n, G.mode);
+      }
+      break;
+    case 'over':
+      if (stateT > 0.8) {
+        const id = menuInput(overItems());
+        if (id === 'undo') undo();
+        else if (id === 'new') newGame(G.n, G.mode);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.13 + 0.1 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// A tile of value v centred on (cx, cy), `size` wide
+function drawTileAt(v, cx, cy, size, scale = 1, alpha = 1) {
+  const e = log2(v);
+  if (e < 1 || scale <= 0.02) return;
+  const spr = tileSprite(e, size), d = spr.S * scale, a0 = ctx.globalAlpha;
+  ctx.globalAlpha = a0 * alpha;
+  ctx.drawImage(spr.c, cx - d / 2, cy - d / 2, d, d);
+  ctx.globalAlpha = a0;
+}
+
+const boardTint = () => tileColor(Math.max(1, log2(maxTile(G.cells))));
+
+function renderBoard() {
+  const A = CFG.anim, an = G.anim, half = CS / 2;
+  let ox = 0, oy = 0;
+  if (G.bump) { // a soft nudge when a move changes nothing
+    const s = Math.sin(clamp(G.bump.t / A.bump, 0, 1) * Math.PI) * 5, d = G.bump.dir;
+    ox = d === 3 ? -s : d === 4 ? s : 0; oy = d === 1 ? -s : d === 2 ? s : 0;
+  }
+  ctx.drawImage(boardCanvas, BX - 24 + ox, BY - 24 + oy, BS + 48, BS + 48);
+  rrPath(BX - 10 + ox, BY - 10 + oy, BS + 20, BS + 20, 20);
+  ctx.globalAlpha = 0.42 + 0.12 * Math.sin(time * 0.8) + G.undoFlash * 0.4;
+  glowStroke(boardTint(), 1.5 + G.undoFlash);
+  ctx.globalAlpha = 1;
+
+  if (an && an.t < A.slide) { // tiles gliding to their new places
+    const p = easeOut(an.t / A.slide);
+    for (const mv of an.moves) {
+      drawTileAt(mv.v, lerp(tileX(mv.from), tileX(mv.to), p) + half, lerp(tileY(mv.from), tileY(mv.to), p) + half, CS);
+    }
+    return;
+  }
+  const pt = an ? an.t - A.slide : 1;
+  const big = [];
+  for (let k = 0; k < G.cells.length; k++) {
+    const v = G.cells[k];
+    if (!v) continue;
+    let s = 1;
+    if (an) {
+      if (an.spawn.includes(k)) s = backOut(clamp(pt / A.born, 0, 1));          // new tile grows in
+      else if (an.mergeSet.has(k)) s = 1 + 0.16 * Math.sin(clamp(pt / A.pop, 0, 1) * Math.PI); // merge pop
+    }
+    const cx = tileX(k) + half + ox, cy = tileY(k) + half + oy;
+    drawTileAt(v, cx, cy, CS, s);
+    if (v >= 1024) big.push(k);
+  }
+  if (big.length) { // big tiles breathe a soft extra glow
+    ctx.globalCompositeOperation = 'lighter';
+    for (const k of big) {
+      const e = Math.min(log2(G.cells[k]), TILE_COLORS.length - 1), d = CS * 1.7;
+      ctx.globalAlpha = 0.12 + 0.08 * Math.sin(time * 2 + k);
+      ctx.drawImage(dotSprites[e], tileX(k) + half + ox - d / 2, tileY(k) + half + oy - d / 2, d, d);
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawFloaters() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const f of floaters.items) {
+    if (!f.active) continue;
+    const a = Math.min(1, (f.life / f.max) * 2.5);
+    ctx.globalAlpha = a;
+    glowText(f.text, f.x, f.y, `800 ${f.size}px ${SANS}`, f.color);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? 'rgba(196,242,122,0.16)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+function drawUndoButton() {
+  const r = UNDO_BTN, C = CFG.color, ok = canUndo() && state === 'play';
+  const hover = ok && Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 18);
+  ctx.fillStyle = hover ? 'rgba(196,242,122,0.16)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = ok ? (hover ? 1 : 0.65) : 0.25; glowStroke(C.title, 1.3);
+  ctx.globalAlpha = ok ? 1 : 0.4;
+  // a curved arrow turning back
+  const ix = r.x + 38, iy = r.y + r.h / 2 + 2;
+  ctx.strokeStyle = C.text; ctx.fillStyle = C.text; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(ix, iy, 11, Math.PI, Math.PI * 0.5); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(ix - 17, iy - 3); ctx.lineTo(ix - 5, iy - 3); ctx.lineTo(ix - 11, iy + 6); ctx.closePath(); ctx.fill();
+  ctx.lineCap = 'butt';
+  const NN = padNames(), dev = Input.device;
+  const key = dev === 'pad' ? NN.lb : dev === 'touch' ? 'tap' : dev === 'mouse' ? 'click' : 'U or Z';
+  const count = G.mode === 'relax' ? 'unlimited' : `${G.undos} left`;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  text('Undo', r.x + 66, r.y + 22, `800 21px ${SANS}`, C.text);
+  text(`${key}  ·  ${count}`, r.x + 66, r.y + 45, `600 14px ${SANS}`, G.mode === 'classic' && G.undos === 0 ? C.faint : C.dim);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return ['D-pad or stick: slide', `${NN.lb}: undo  ·  ${NN.start}: pause`];
+    case 'mouse': return ['Drag on the board to slide', 'Esc or the ‖ button: pause'];
+    case 'touch': return ['Swipe on the board to slide', '‖ button (top right): pause'];
+    default: return ['Arrows or W A S D: slide', 'U or Z: undo  ·  Esc: pause'];
+  }
+}
+
+function drawHUD() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const LX = BX / 2, RX = W - BX / 2, C = CFG.color, goal = CFG.goal[G.n];
+  // Left: mode, score, best, biggest tile, undo
+  glowText(G.mode === 'relax' ? 'RELAX' : 'CLASSIC', LX, 64, `800 26px ${SANS}`, C.title);
+  text(G.won ? `${SIZE_LABEL[G.n]}  ·  goal ${goal} reached` : `${SIZE_LABEL[G.n]}  ·  goal ${goal}`, LX, 94, `600 15px ${SANS}`, G.won ? C.good : C.dim);
+  text('SCORE', LX, 138, `800 13px ${SANS}`, C.faint);
+  if (G.scoreGlow > 0) { ctx.globalAlpha = G.scoreGlow; glowText(fmt(G.shown), LX, 170, `800 34px ${MONO}`, C.title); ctx.globalAlpha = 1; }
+  text(fmt(G.shown), LX, 170, `800 34px ${MONO}`, C.text);
+  text('BEST', LX, 214, `800 13px ${SANS}`, C.faint);
+  text(fmt(Math.max(bests[G.n].score, G.score)), LX, 238, `700 20px ${MONO}`, C.dim);
+  text('BIGGEST TILE', LX, 282, `800 13px ${SANS}`, C.faint);
+  const mt = maxTile(G.cells);
+  if (mt) drawTileAt(mt, LX, 330, 54);
+  drawUndoButton();
+  // Right: buttons, your tiles so far, controls
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  text('YOUR TILES', RX, 96, `800 13px ${SANS}`, C.faint);
+  const ge = log2(goal), me = log2(mt);
+  for (let e = 1; e <= ge; e++) {
+    const i = e - 1, x = RX + ((i % 3) - 1) * 60, y = 136 + Math.floor(i / 3) * 56;
+    if (e <= me) drawTileAt(2 ** e, x, y, 44);
+    else {
+      rrPath(x - 22, y - 22, 44, 44, 8);
+      ctx.globalAlpha = e === ge ? 0.5 + 0.25 * Math.sin(time * 2) : 0.35;
+      ctx.strokeStyle = tileColor(e); ctx.lineWidth = 1.2; ctx.stroke();
+      ctx.globalAlpha = 1;
+      text(String(2 ** e), x, y + 1, `700 ${e >= 10 ? 13 : 15}px ${SANS}`, C.faint);
+    }
+  }
+  const rows = Math.ceil(ge / 3), ly = 136 + rows * 56 - 8;
+  if (mt > goal) text(`Beyond the goal: ${mt}`, RX, ly, `700 15px ${SANS}`, C.good);
+  else text(G.won ? 'Goal reached. Lovely!' : `Goal: the ${goal} tile`, RX, ly, `600 14px ${SANS}`, G.won ? C.good : C.dim);
+  controlLines().forEach((s, i) => text(s, RX, 444 + i * 24, `500 14px ${SANS}`, i === 0 ? C.dim : C.faint));
+  text(`Moves ${fmt(G.moves)}`, RX, 400, `600 14px ${SANS}`, C.faint);
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  renderBoard();
+  drawFx();
+  drawHUD();
+  drawFloaters();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 330, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(196,242,122,0.10)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 16px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  // Tiles drifting slowly behind the menu
+  for (let i = 0; i < 11; i++) {
+    const x = ((i * 131 + time * (8 + (i % 3) * 5)) % (W + 160)) - 80;
+    const y = 60 + ((i * 197) % 420) + Math.sin(time * 0.6 + i) * 16;
+    drawTileAt(2 ** (1 + ((i * 4) % 11)), x, y, 58 + (i % 3) * 12, 1, 0.16 + (i % 3) * 0.05);
+  }
+  const shade = ctx.createRadialGradient(W / 2, H / 2 + 20, 80, W / 2, H / 2 + 20, 420);
+  shade.addColorStop(0, 'rgba(5,7,15,0.9)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON SLIDE', W / 2, 70, `800 64px ${SANS}`, CFG.color.title);
+  text('slide, merge, breathe: a calm number-tile puzzle', W / 2, 112, `500 16px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), gap = 42, y0 = items.length > 6 ? 158 : 172;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  const yh = y0 + items.length * gap;
+  text(it.hint, W / 2, yh, `500 15px ${SANS}`, CFG.color.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, yh + 24, `500 13px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 24, pad = Input.pad, b = bests[boardN];
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`Best ${SIZE_LABEL[boardN]}  ${fmt(b.score)}  ·  tile ${b.tile || '–'}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, CFG.color.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 40, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Slide the tiles', 'D-pad / left stick', 'Arrows / W A S D', 'Swipe or drag the board'],
+    ['Undo a move', NN.lb, 'U or Z', 'Undo button'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [226, 246, 432, 598];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 80, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 80, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 80, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 106 + i * 26;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(70, 216, W - 140, 1);
+  const col = (title, x, lines, y0 = 272) => {
+    text(title, x, 242, `800 12px ${SANS}`, C.faint);
+    lines.forEach(([s, c], i) => text(s, x, y0 + i * 24, `500 15px ${SANS}`, c || C.text));
+  };
+  col('SLIDING', 70, [
+    ['Every tile slides as far as it'],
+    ['can, all the same way.'],
+    ['After each move that changes'],
+    ['the board, a new 2 appears'],
+    ['(now and then a 4).'],
+    ['No timer: take your time.', C.dim],
+  ]);
+  text('MERGING', 370, 242, `800 12px ${SANS}`, C.faint);
+  drawTileAt(2, 392, 290, 44); drawTileAt(2, 464, 290, 44); drawTileAt(4, 568, 290, 44);
+  ctx.textAlign = 'center';
+  text('+', 428, 290, `800 22px ${SANS}`, C.dim); text('→', 516, 290, `800 22px ${SANS}`, C.dim);
+  ctx.textAlign = 'left';
+  [['Two equal tiles merge into', C.text], ['their sum. Each tile merges', C.text], ['once per move.', C.text], ['Bigger tiles glow brighter.', C.dim]]
+    .forEach(([s, c], i) => text(s, 370, 344 + i * 24, `500 15px ${SANS}`, c));
+  col('MODES AND BOARDS', 670, [
+    ['Relax: unlimited undo.'],
+    ['Classic: 3 undos per game.'],
+    ['3×3: reach 256 (short).'],
+    ['4×4: reach 2048.'],
+    ['5×5: reach 4096 (relaxed).'],
+    ['Then keep going if you like.', C.dim],
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 26, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the board
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.94)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  card(W / 2 - 240, 70, 480, 400);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 132, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time. Your game is saved.', W / 2, 174, `500 15px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 236, true, 50);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 438, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawWin() {
+  overlay(Math.min(0.55, stateT * 1.5));
+  const C = CFG.color, goal = CFG.goal[G.n], col = tileColor(log2(goal));
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 250, 34, 500, 476);   // covers the whole board, so nothing peeks out behind it
+  drawTileAt(goal, W / 2, 116, 84, 1 + 0.04 * Math.sin(time * 2.4));
+  glowText(`You made ${goal}!`, W / 2, 206, `800 42px ${SANS}`, col);
+  text('A lovely, steady climb. Take a breath.', W / 2, 246, `500 16px ${SANS}`, C.dim);
+  text(`Score ${fmt(G.score)}   ·   Moves ${fmt(G.moves)}`, W / 2, 282, `600 17px ${SANS}`, C.text);
+  drawMenu(winItems(), 352, stateT > 0.8, 54);
+  text('Keep going to see how high the tiles climb.', W / 2, 466, `500 14px ${SANS}`, C.faint);
+  ctx.globalAlpha = 1;
+}
+
+function drawOver() {
+  overlay(Math.min(0.55, stateT * 1.2));
+  const C = CFG.color, isBest = G.score > G.startBest && G.score > 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 2.5);
+  card(W / 2 - 250, 34, 500, 476);   // covers the whole board, so nothing peeks out behind it
+  glowText('Board full', W / 2, 96, `800 46px ${SANS}`, C.title);
+  text(G.mode === 'classic' && !canUndo() ? 'No moves or undos left. Nicely played.' : 'No moves left. Nicely played.', W / 2, 140, `500 16px ${SANS}`, C.dim);
+  text(isBest ? 'NEW BEST SCORE' : 'SCORE', W / 2, 184, `800 13px ${SANS}`, isBest ? C.warn : C.faint);
+  text(fmt(G.score), W / 2, 220, `800 40px ${MONO}`, C.text);
+  text(`Biggest tile ${maxTile(G.cells)}   ·   Best ${fmt(bests[G.n].score)}`, W / 2, 264, `600 16px ${SANS}`, C.dim);
+  drawMenu(overItems(), 340, stateT > 0.8, 54);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 15px ${SANS}`;
+  const y = state === 'play' ? H - 18 : H - 52, w = ctx.measureText(toast.text).width + 32;
+  rrPath(W / 2 - w / 2, y - 14, w, 28, 14);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  text(toast.text, W / 2, y, `600 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'win') drawWin();
+    if (state === 'over') drawOver();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return;
+  if (state === 'play') pauseGame(); else if (G.live) saveGame();
+});
+addEventListener('pagehide', () => { if (G.live) saveGame(); });
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

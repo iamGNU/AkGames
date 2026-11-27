@@ -1,0 +1,1777 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Pipes</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  // Board size by level: [first level, tiles per side]. From level `lateFrom` the size cycles through `late`.
+  sizes: [[1, 4], [3, 5], [6, 6], [10, 7], [15, 8]],
+  late: [8, 9, 7, 9], lateFrom: 21,
+  boardMax: 450,            // the board is never wider or taller than this (px)
+  cellMax: 88,              // and a tile is never bigger than this (small boards)
+  windy: 0.35,              // 0..1: higher makes longer, winding pipe runs
+  minWrong: 0.4,            // at least this share of tiles start turned the wrong way
+  longPress: 0.45,          // seconds to hold a tile to lock it
+  solverBudget: 6000,       // hint search steps before it falls back to a known solution
+  // Animation times in seconds (litUp / litDown are speeds per second)
+  anim: { turn: 0.15, litUp: 7, litDown: 5, wave: 0.06, celebrate: 2.4, intro: 0.3 },
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', title: '#c6f86b', good: '#7dffc0', warn: '#ffd88a',
+    pipe: '#3b4775', casing: '#161c36',
+  },
+};
+// Lit pipes take one calm colour per level, in this order
+const TINTS = ['#c6f86b', '#7fe8ff', '#ffcf7a', '#b9a4ff', '#7dffc8', '#ff9fc8'];
+const NOTES = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98]; // C major pentatonic
+const WIN_WORDS = ['All aglow', 'Light flows freely', 'Calm and complete', 'Every lamp is lit', 'Nicely connected', 'Smooth and steady'];
+const DR = [-1, 0, 1, 0], DC = [0, 1, 0, -1];   // directions: 0 up, 1 right, 2 down, 3 left; a pipe mask has bit (1 << d)
+const MAXN = 16;                                 // largest grid the helpers handle (the title art uses 12)
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+const backOut = t => { const s = 1.6, u = t - 1; return 1 + (s + 1) * u * u * u + s * u * u; };
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// 2. Puzzle logic (pure functions: masks in, answers out)
+// ============================================================
+const rotCW = m => ((m << 1) | (m >> 3)) & 15;    // up -> right -> down -> left -> up
+const rotCCW = m => ((m >> 1) | (m << 3)) & 15;
+const bits = m => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1);
+function tileType(m) {
+  const b = bits(m);
+  return b === 1 ? 'end' : b === 2 ? (m === 5 || m === 10 ? 'straight' : 'corner') : b === 3 ? 'tee' : b === 4 ? 'cross' : 'empty';
+}
+// The different ways a tile can face (a straight has 2, the others 4)
+function orients(m) {
+  const out = [];
+  let x = m;
+  for (let i = 0; i < 4; i++) { if (!out.includes(x)) out.push(x); x = rotCW(x); }
+  return out;
+}
+// Clockwise quarter turns from mask a to mask b (0..3, or 4 if b is not a turn of a)
+function cwSteps(a, b) { let s = 0; while (a !== b && s < 4) { a = rotCW(a); s++; } return s; }
+
+// The cell next to k in direction d, or -1 off the board (with wrap, edges join the far side)
+function nb(k, d, n, wrap) {
+  let r = ((k / n) | 0) + DR[d], c = (k % n) + DC[d];
+  if (r < 0 || r >= n || c < 0 || c >= n) {
+    if (!wrap) return -1;
+    r = (r + n) % n; c = (c + n) % n;
+  }
+  return r * n + c;
+}
+
+const QUEUE = new Int16Array(MAXN * MAXN);
+// Light from the source: fills depth[] (steps from the source, -1 = dark) and parent[]; returns how many tiles are lit
+function litMap(cur, n, wrap, src, depth, parent) {
+  const N2 = n * n;
+  depth.fill(-1, 0, N2);
+  depth[src] = 0;
+  if (parent) parent[src] = -1;
+  let qh = 0, qt = 0;
+  QUEUE[qt++] = src;
+  while (qh < qt) {
+    const k = QUEUE[qh++], m = cur[k];
+    for (let d = 0; d < 4; d++) {
+      if (!(m & (1 << d))) continue;
+      const j = nb(k, d, n, wrap);
+      if (j < 0 || depth[j] >= 0 || !(cur[j] & (1 << ((d + 2) & 3)))) continue;
+      depth[j] = depth[k] + 1;
+      if (parent) parent[j] = k;
+      QUEUE[qt++] = j;
+    }
+  }
+  return qt;
+}
+
+const SOLVE_DEPTH = new Int16Array(MAXN * MAXN);
+// Solved = no pipe end is open (every opening meets a matching one) and the light reaches every tile.
+// Any such layout counts, not only the one the generator made.
+function isSolved(cur, n, wrap, src) {
+  const N2 = n * n;
+  for (let k = 0; k < N2; k++) {
+    const m = cur[k];
+    if (!m) return false;
+    for (let d = 0; d < 4; d++) {
+      if (!(m & (1 << d))) continue;
+      const j = nb(k, d, n, wrap);
+      if (j < 0 || !(cur[j] & (1 << ((d + 2) & 3)))) return false;
+    }
+  }
+  return litMap(cur, n, wrap, src, SOLVE_DEPTH, null) === N2;
+}
+
+// A random spanning tree over every cell, grown from the source. Returns the solved pipe masks.
+// No cell gets 4 connections, so every tile is an end, a straight, a corner or a T.
+function genTree(n, wrap, src) {
+  const N2 = n * n;
+  for (let tries = 0; tries < 60; tries++) {
+    const mask = new Uint8Array(N2), deg = new Uint8Array(N2), inT = new Uint8Array(N2), front = [];
+    const addCell = k => {
+      inT[k] = 1;
+      for (let d = 0; d < 4; d++) { const j = nb(k, d, n, wrap); if (j >= 0 && !inT[j]) front.push(k * 4 + d); }
+    };
+    addCell(src);
+    let count = 1;
+    while (count < N2 && front.length) {
+      // Mostly a random edge; sometimes one of the newest, which makes longer winding runs
+      const i = Math.random() < CFG.windy
+        ? front.length - 1 - ((Math.random() * Math.min(3, front.length)) | 0)
+        : (Math.random() * front.length) | 0;
+      const e = front[i];
+      front[i] = front[front.length - 1]; front.pop();
+      const k = e >> 2, d = e & 3, j = nb(k, d, n, wrap);
+      if (inT[j] || deg[k] >= 3) continue;
+      mask[k] |= 1 << d; mask[j] |= 1 << ((d + 2) & 3);
+      deg[k]++; deg[j]++; count++;
+      addCell(j);
+    }
+    if (count === N2) return mask;
+  }
+  // Fallback (practically never used): one long snake through every row
+  const mask = new Uint8Array(N2);
+  for (let r = 0; r < n; r++) for (let c = 0; c < n - 1; c++) { mask[r * n + c] |= 2; mask[r * n + c + 1] |= 8; }
+  for (let r = 0; r < n - 1; r++) { const k = r * n + (r % 2 ? 0 : n - 1); mask[k] |= 4; mask[k + n] |= 1; }
+  return mask;
+}
+
+// Turns each tile a random amount. Never returns a solved board.
+function scramble(sol, n, wrap, src) {
+  const N2 = n * n, cur = new Uint8Array(N2), need = Math.max(2, Math.ceil(N2 * CFG.minWrong));
+  for (let t = 0; t < 300; t++) {
+    let wrong = 0;
+    for (let k = 0; k < N2; k++) {
+      let m = sol[k];
+      for (let i = (Math.random() * 4) | 0; i > 0; i--) m = rotCW(m);
+      cur[k] = m;
+      if (m !== sol[k]) wrong++;
+    }
+    if (wrong >= need && !isSolved(cur, n, wrap, src)) return cur;
+  }
+  for (let k = 0; k < N2; k++) cur[k] = rotCW(sol[k]);
+  if (isSolved(cur, n, wrap, src)) cur[src] = rotCW(cur[src]);
+  return cur;
+}
+
+function sizeFor(level) {
+  if (level >= CFG.lateFrom) return CFG.late[(level - CFG.lateFrom) % CFG.late.length];
+  let n = CFG.sizes[0][1];
+  for (const [l, s] of CFG.sizes) if (level >= l) n = s;
+  return n;
+}
+function pickSource(n) {
+  const h = (n - 1) / 2;
+  const r = Math.random() < 0.5 ? Math.floor(h) : Math.ceil(h), c = Math.random() < 0.5 ? Math.floor(h) : Math.ceil(h);
+  return r * n + c;
+}
+
+// ---- Hint solver: finds a full solution, keeping locked tiles and preferring how tiles face now ----
+const SV = {
+  par: new Int16Array(MAXN * MAXN), size: new Int16Array(MAXN * MAXN), loose: new Uint8Array(MAXN * MAXN),
+  must: new Uint8Array(MAXN * MAXN), may: new Uint8Array(MAXN * MAXN), inQ: new Uint8Array(MAXN * MAXN),
+};
+const solverStats = { runs: 0, solved: 0, gaveUp: 0, nodes: 0 };
+
+// cand[k] holds which of opts[k] are still possible. If a tile surely opens (or surely doesn't) toward a
+// neighbour, the neighbour must match. Returns false on a contradiction.
+function propagate(cand, opts, n, wrap, queue) {
+  const inQ = SV.inQ;
+  for (const k of queue) inQ[k] = 1;
+  let ok = true;
+  while (queue.length) {
+    const k = queue.pop();
+    inQ[k] = 0;
+    if (!ok) continue; // drain the queue
+    const c = cand[k], o = opts[k];
+    let must = 15, may = 0;
+    for (let i = 0; i < o.length; i++) if (c & (1 << i)) { must &= o[i]; may |= o[i]; }
+    for (let d = 0; d < 4 && ok; d++) {
+      const b = 1 << d;
+      if (!(must & b) && (may & b)) continue; // not decided yet
+      const j = nb(k, d, n, wrap);
+      if (j < 0) continue;
+      const want = (must & b) !== 0, ob = 1 << ((d + 2) & 3), oj = opts[j], cj = cand[j];
+      let nc = cj;
+      for (let i = 0; i < oj.length; i++) if ((cj & (1 << i)) && ((oj[i] & ob) !== 0) !== want) nc &= ~(1 << i);
+      if (nc !== cj) {
+        cand[j] = nc;
+        if (!nc) ok = false;
+        else if (!inQ[j]) { inQ[j] = 1; queue.push(j); }
+      }
+    }
+  }
+  return ok;
+}
+
+// Pipes that are surely joined must not close a loop, and a sealed group smaller than the board can't light up.
+function structureOK(cand, opts, n, wrap) {
+  const N2 = n * n, { par, size, loose, must, may } = SV;
+  for (let k = 0; k < N2; k++) {
+    const c = cand[k], o = opts[k];
+    let mu = 15, ma = 0;
+    for (let i = 0; i < o.length; i++) if (c & (1 << i)) { mu &= o[i]; ma |= o[i]; }
+    must[k] = mu; may[k] = ma; par[k] = k; size[k] = 1; loose[k] = 0;
+  }
+  const find = x => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+  for (let k = 0; k < N2; k++) {
+    for (let d = 1; d <= 2; d++) { // right and down: each joint once
+      if (!(must[k] & (1 << d))) continue;
+      const j = nb(k, d, n, wrap);
+      if (j < 0) continue;
+      const a = find(k), b = find(j);
+      if (a === b) return false;
+      par[a] = b; size[b] += size[a];
+    }
+  }
+  for (let k = 0; k < N2; k++) if (may[k] & ~must[k]) loose[find(k)] = 1;
+  for (let k = 0; k < N2; k++) if (par[k] === k && !loose[k] && size[k] < N2) return false;
+  return true;
+}
+
+// lock[k] >= fixLevel keeps tile k as it is. prefer: a known solution to try second. Returns masks or null.
+function solveNear(cur, lock, fixLevel, prefer, n, wrap, src, budget) {
+  const N2 = n * n, opts = new Array(N2), cand = new Uint8Array(N2);
+  solverStats.runs++;
+  for (let k = 0; k < N2; k++) {
+    const o = orients(cur[k]);
+    opts[k] = o;
+    let c = 0;
+    for (let i = 0; i < o.length; i++) {
+      const m = o[i];
+      if (lock && lock[k] >= fixLevel && m !== cur[k]) continue;
+      let ok = true;
+      for (let d = 0; d < 4 && ok; d++) {
+        if (!(m & (1 << d))) continue;
+        const j = nb(k, d, n, wrap);
+        if (j < 0) ok = false;                                     // no pipe may point off the board
+        else if (N2 > 2 && bits(m) === 1 && bits(cur[j]) === 1) ok = false; // two ends can't only join each other
+      }
+      if (ok) c |= 1 << i;
+    }
+    if (!c) return null;
+    cand[k] = c;
+  }
+  const all = [];
+  for (let k = 0; k < N2; k++) all.push(k);
+  if (!propagate(cand, opts, n, wrap, all) || !structureOK(cand, opts, n, wrap)) return null;
+  let nodes = 0, gaveUp = false;
+  const order = k => {
+    const o = opts[k], out = [], a = o.indexOf(cur[k]);
+    if (a >= 0) out.push(a);
+    if (prefer) { const b = o.indexOf(prefer[k]); if (b >= 0 && b !== a) out.push(b); }
+    for (let i = 0; i < o.length; i++) if (!out.includes(i)) out.push(i);
+    return out;
+  };
+  const search = c => {
+    if (++nodes > budget) { gaveUp = true; return null; }
+    let best = -1, bc = 9;
+    for (let k = 0; k < N2; k++) {
+      const v = c[k];
+      if (v & (v - 1)) { const cnt = bits(v); if (cnt < bc) { bc = cnt; best = k; if (cnt === 2) break; } }
+    }
+    if (best < 0) {
+      const out = new Uint8Array(N2);
+      for (let k = 0; k < N2; k++) out[k] = opts[k][31 - Math.clz32(c[k])];
+      return isSolved(out, n, wrap, src) ? out : null;
+    }
+    for (const i of order(best)) {
+      if (!(c[best] & (1 << i))) continue;
+      const next = c.slice();
+      next[best] = 1 << i;
+      if (!propagate(next, opts, n, wrap, [best]) || !structureOK(next, opts, n, wrap)) continue;
+      const r = search(next);
+      if (r || gaveUp) return r;
+    }
+    return null;
+  };
+  const res = search(cand);
+  solverStats.nodes += nodes;
+  if (res) solverStats.solved++; else if (gaveUp) solverStats.gaveUp++;
+  return res;
+}
+
+// ============================================================
+// Canvas + art (pipes, board and background are drawn once into caches)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, boardCanvas = null, dotSprites = [];
+let PIPES = null;            // { dim: [mask] -> canvas, lit: [mask] -> canvas, src } at the current tile size
+let DECOR_ART = null;        // the same at the title's tile size
+const DECOR = { n: 12, cell: 80, src: 3 * 12 + 6, mask: null, depth: new Int16Array(144) };
+let CELL = 88, BW = 352, BX = 304, BY = 94;   // tile size and board placement (set per level)
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+// One pipe tile in an S x S square. Dim: a slate tube. Lit: wide faint glow under a bright core.
+function drawPipe(g, m, S, lit, tint) {
+  const c = S / 2, w = S * 0.2;
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  g.beginPath();
+  for (let d = 0; d < 4; d++) if (m & (1 << d)) { g.moveTo(c, c); g.lineTo(c + DC[d] * c, c + DR[d] * c); }
+  if (!lit) {
+    g.strokeStyle = CFG.color.casing; g.lineWidth = w * 1.25; g.stroke();
+    g.strokeStyle = CFG.color.pipe; g.lineWidth = w * 0.5; g.stroke();
+  } else {
+    g.strokeStyle = tint;
+    g.globalAlpha = 0.13; g.lineWidth = w * 3; g.stroke();
+    g.globalAlpha = 0.32; g.lineWidth = w * 1.7; g.stroke();
+    g.globalAlpha = 1; g.lineWidth = w * 0.8; g.stroke();
+    g.strokeStyle = '#ffffff'; g.globalAlpha = 0.75; g.lineWidth = w * 0.28; g.stroke();
+    g.globalAlpha = 1;
+  }
+  if (bits(m) === 1) { // an end is a little lamp
+    const R = S * 0.17;
+    if (!lit) {
+      g.beginPath(); g.arc(c, c, R, 0, TAU); g.fillStyle = CFG.color.casing; g.fill();
+      g.lineWidth = Math.max(1.5, S * 0.035); g.strokeStyle = CFG.color.pipe; g.stroke();
+      g.beginPath(); g.arc(c, c, R * 0.4, 0, TAU); g.fillStyle = CFG.color.pipe; g.fill();
+    } else {
+      const halo = g.createRadialGradient(c, c, R * 0.3, c, c, R * 2.6);
+      halo.addColorStop(0, hexA(tint, 0.45)); halo.addColorStop(1, hexA(tint, 0));
+      g.fillStyle = halo; g.fillRect(0, 0, S, S);
+      g.beginPath(); g.arc(c, c, R, 0, TAU); g.fillStyle = tint; g.fill();
+      g.beginPath(); g.arc(c, c, R * 0.5, 0, TAU); g.fillStyle = '#ffffff'; g.fill();
+    }
+  }
+}
+
+// The glowing source: a ringed orb on top of its pipes
+function drawSource(g, S, tint) {
+  const c = S / 2, R = S * 0.24;
+  const halo = g.createRadialGradient(c, c, R * 0.4, c, c, S * 0.5);
+  halo.addColorStop(0, hexA(tint, 0.5)); halo.addColorStop(1, hexA(tint, 0));
+  g.fillStyle = halo; g.fillRect(0, 0, S, S);
+  g.beginPath(); g.arc(c, c, R, 0, TAU); g.fillStyle = '#0b1024'; g.fill();
+  g.strokeStyle = tint;
+  g.globalAlpha = 0.3; g.lineWidth = S * 0.09; g.stroke();
+  g.globalAlpha = 1; g.lineWidth = Math.max(2, S * 0.04); g.stroke();
+  const core = g.createRadialGradient(c, c, 0, c, c, R * 0.75);
+  core.addColorStop(0, '#ffffff'); core.addColorStop(0.5, hexA(tint, 0.9)); core.addColorStop(1, hexA(tint, 0));
+  g.fillStyle = core; g.beginPath(); g.arc(c, c, R * 0.75, 0, TAU); g.fill();
+}
+
+// Every mask, pre-turned, dim and lit: a still tile is one drawImage with no transform
+function makePipeSet(S, tint) {
+  const set = { dim: [null], lit: [null], src: null };
+  for (let m = 1; m < 16; m++) {
+    for (let l = 0; l < 2; l++) {
+      const L = layer(S, S);
+      drawPipe(L.g, m, S, l === 1, tint);
+      (l ? set.lit : set.dim)[m] = L.c;
+    }
+  }
+  const L = layer(S, S);
+  drawSource(L.g, S, tint);
+  set.src = L.c;
+  return set;
+}
+
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  const L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[140, 110, 300, '#3a5cff', 0.1], [830, 440, 320, '#a64dff', 0.07], [880, 70, 220, '#40c080', 0.06], [80, 480, 240, '#20c0d0', 0.05]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  dotSprites = [...TINTS, '#ffffff'].map(drawDot);
+  // Title art: one big solved network, with light rippling out from its source
+  if (!DECOR.mask) {
+    DECOR.mask = genTree(DECOR.n, false, DECOR.src);
+    litMap(DECOR.mask, DECOR.n, false, DECOR.src, DECOR.depth, null);
+  }
+  DECOR_ART = makePipeSet(DECOR.cell, CFG.color.title);
+  if (G.sol) buildBoardArt();
+}
+
+const levelTint = () => TINTS[(G.level - 1) % TINTS.length];
+const tintIndex = () => (G.level - 1) % TINTS.length;
+
+// Per level: pipe sprites at this tile size and colour, and the board panel
+function buildBoardArt() {
+  PIPES = makePipeSet(CELL, levelTint());
+  const n = G.n, L = layer(BW + 40, BW + 40), g = L.g;
+  g.translate(20, 20);
+  rr(g, -10, -10, BW + 20, BW + 20, 16); g.fillStyle = 'rgba(8,11,26,0.9)'; g.fill();
+  const rad = Math.min(10, CELL * 0.16);
+  for (let r = 0; r < n; r++) {
+    for (let c = 0; c < n; c++) {
+      rr(g, c * CELL + 2, r * CELL + 2, CELL - 4, CELL - 4, rad);
+      g.fillStyle = (r + c) % 2 ? 'rgba(120,150,255,0.04)' : 'rgba(120,150,255,0.075)'; g.fill();
+    }
+  }
+  boardCanvas = L.c;
+}
+
+function layoutBoard(n) {
+  CELL = Math.min(CFG.cellMax, Math.floor(CFG.boardMax / n));
+  BW = CELL * n;
+  BX = Math.round((W - BW) / 2);
+  BY = Math.round((H - BW) / 2);
+}
+const cellX = k => BX + ((k % G.n) + 0.5) * CELL, cellY = k => BY + (((k / G.n) | 0) + 0.5) * CELL;
+function cellAt(x, y) {
+  const n = G.n, c = Math.floor((x - BX) / CELL), r = Math.floor((y - BY) / CELL);
+  return r >= 0 && r < n && c >= 0 && c < n ? r * n + c : -1;
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine and triangle only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) { // a soft airy swell
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  turn()    { if (this.ok('turn', 0.03)) { this.tone(540, 460, 0.07, 'triangle', 0.045, 0, 0.005); this.tone(1080, 1080, 0.035, 'sine', 0.01, 0, 0.004); } },
+  connect(f) {
+    if (!this.ok('conn', 0.06)) return;
+    this.bell(NOTES[clamp(Math.round(f * (NOTES.length - 1)), 0, NOTES.length - 1)], 0.04, 0.02, 0.55);
+  },
+  lock()    { if (this.ok('lock', 0.05)) { this.tone(440, 440, 0.08, 'sine', 0.045); this.tone(659.25, 659.25, 0.12, 'sine', 0.04, 0.06); } },
+  unlock()  { if (this.ok('lock', 0.05)) { this.tone(659.25, 659.25, 0.08, 'sine', 0.04); this.tone(440, 440, 0.12, 'sine', 0.04, 0.06); } },
+  nope()    { if (this.ok('nope', 0.1)) { this.tone(392, 392, 0.12, 'sine', 0.035); this.tone(330, 330, 0.18, 'sine', 0.03, 0.1); } },
+  hint()    { if (this.ok('hint', 0.1)) [2, 4, 6].forEach((n, i) => this.bell(NOTES[n], 0.035, i * 0.06, 0.6)); },
+  undo()    { if (this.ok('undo', 0.04)) this.tone(620, 470, 0.12, 'sine', 0.04); },
+  restart() { if (this.ok('restart', 0.2)) { this.tone(523.25, 392, 0.3, 'sine', 0.04); this.tone(392, 261.63, 0.35, 'sine', 0.03, 0.12); } },
+  lamp()    { if (this.ok('lamp', 0.05)) { const f = NOTES[(Math.random() * NOTES.length) | 0] * 2; this.tone(f, f, 0.3, 'sine', 0.02); } },
+  win() {
+    if (!this.ok('win', 0.5)) return;
+    [261.63, 329.63, 392, 493.88, 523.25, 659.25].forEach((f, i) => this.bell(f, 0.055, i * 0.09, 1.6));
+    this.noise(1.4, 0.02, 700);
+  },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select()  { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()    { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates. rclick: a right-click this frame.
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, rclick: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, rotL: false, lock: false, hint: false, undo: false, restart: false,
+  pause: false, mute: false, select: false, back: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) {
+        this.pressed.add(e.code);
+        if (e.code === 'Space' && e.shiftKey) this.pressed.add('ShiftSpace');
+      }
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button === 2) { // right-click: lock
+        e.preventDefault();
+        this.toWorld(e); m.rclick = true; m.moved = true; m.type = 'mouse'; this.device = 'mouse';
+        Sfx.init();
+        return;
+      }
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+      if (!m.down && e.pointerType === 'mouse') this.device = 'mouse';
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let rotL = P.has('ShiftSpace');
+    let act = (P.has('Space') && !rotL) || P.has('Enter');
+    let lock = P.has('KeyL'), hint = P.has('KeyH'), undo = P.has('KeyU') || P.has('KeyZ'), restart = P.has('KeyR');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) act = true;
+      if (tap(1)) { rotL = true; back = true; }
+      if (tap(2)) hint = true;
+      if (tap(3)) lock = true;
+      if (tap(4)) undo = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      // D-pad or left stick as a cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.rotL = rotL; this.lock = lock; this.hint = hint; this.undo = undo; this.restart = restart;
+    this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    const m = this.mouse;
+    m.clicked = false; m.released = false; m.moved = false; m.rclick = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', x: '□', y: '△', lb: 'L1', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', x: 'X', y: 'Y', lb: 'LB', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// 3. Game state, progress and saving
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let wrapOn = load('neonPipes.wrap', '0') === '1';
+const LEVEL_KEYS = ['neonPipes.level', 'neonPipes.levelWrap'];
+const SAVE_KEYS = ['neonPipes.cur', 'neonPipes.curWrap'];
+const levels = LEVEL_KEYS.map(k => Math.max(1, Math.floor(Number(load(k, 1))) || 1));
+let solvedTotal = Math.max(0, Math.floor(Number(load('neonPipes.solved', 0))) || 0);
+Sfx.muted = load('neonPipes.muted', '0') === '1';
+const toast = { text: '', t: 0 };
+let resultInfo = null;
+let confirmT = 0;   // "Restart from level 1" waits for a second press while this runs
+
+const G = {
+  level: 1, n: 4, wrap: false, src: 0, N2: 16,
+  sol: null, start: null, cur: null, lock: null, target: null,   // lock: 0 free, 1 locked by you, 2 locked by a hint
+  moves: 0, hints: 0, undo: [],
+  depth: new Int16Array(MAXN * MAXN), parent: new Int16Array(MAXN * MAXN), litCount: 0, leaks: [],
+  lit: new Float32Array(81), spinFrom: new Float32Array(81), spinT: new Float32Array(81),
+  wig: new Float32Array(81), glow: new Float32Array(81), fired: new Uint8Array(81),
+  cursor: 0, press: null, phase: 'idle', winT: 0, winLen: 2.4, introT: 0, word: '',
+};
+
+function showToast(text) { toast.text = text; toast.t = 2.2; }
+const curLevel = () => levels[wrapOn ? 1 : 0];
+function setLevel(v) { levels[wrapOn ? 1 : 0] = v; save(LEVEL_KEYS[wrapOn ? 1 : 0], v); }
+
+const hex = a => Array.from(a, v => v.toString(16)).join('');
+// A saved puzzle from storage, checked carefully (anything odd is ignored)
+function parseSaved(str, wrap) {
+  try {
+    if (!str) return null;
+    const o = JSON.parse(str);
+    if (!o || o.v !== 1 || o.wrap !== wrap) return null;
+    const n = o.n;
+    if (!Number.isInteger(n) || n < 3 || n > 9 || !Number.isInteger(o.level) || o.level < 1) return null;
+    const N2 = n * n;
+    if (!Number.isInteger(o.src) || o.src < 0 || o.src >= N2) return null;
+    if (!Number.isInteger(o.moves) || o.moves < 0 || !Number.isInteger(o.hints) || o.hints < 0) return null;
+    const arr = key => (typeof o[key] === 'string' && o[key].length === N2 && /^[0-9a-f]+$/.test(o[key])
+      ? Uint8Array.from(o[key], ch => parseInt(ch, 16)) : null);
+    const sol = arr('sol'), start = arr('start'), cur = arr('cur'), lock = arr('lock'), target = arr('target');
+    if (!sol || !start || !cur || !lock || !target) return null;
+    if (!isSolved(sol, n, wrap, o.src) || !isSolved(target, n, wrap, o.src)) return null;
+    for (let k = 0; k < N2; k++) {
+      const ok = orients(sol[k]);
+      if (!ok.includes(cur[k]) || !ok.includes(start[k]) || !ok.includes(target[k]) || lock[k] > 2) return null;
+    }
+    return { level: o.level, n, wrap, src: o.src, sol, start, cur, lock, target, moves: o.moves, hints: o.hints };
+  } catch (e) { return null; }
+}
+const saved = [parseSaved(load(SAVE_KEYS[0], ''), false), parseSaved(load(SAVE_KEYS[1], ''), true)];
+function savedFor() { const s = saved[wrapOn ? 1 : 0]; return s && s.level === curLevel() ? s : null; }
+
+function saveCurrent() {
+  if (!G.sol) return;
+  const i = G.wrap ? 1 : 0;
+  saved[i] = {
+    level: G.level, n: G.n, wrap: G.wrap, src: G.src, sol: G.sol, start: G.start,
+    cur: G.cur.slice(), lock: G.lock.slice(), target: G.target, moves: G.moves, hints: G.hints,
+  };
+  save(SAVE_KEYS[i], JSON.stringify({
+    v: 1, level: G.level, n: G.n, wrap: G.wrap, src: G.src, sol: hex(G.sol), start: hex(G.start),
+    cur: hex(G.cur), lock: hex(G.lock), target: hex(G.target), moves: G.moves, hints: G.hints,
+  }));
+}
+function clearSaved(wrap) { saved[wrap ? 1 : 0] = null; save(SAVE_KEYS[wrap ? 1 : 0], ''); }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); G.press = null; Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { if (G.sol && G.phase === 'idle') saveCurrent(); clearFx(); setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonPipes.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function toggleWrap() {
+  wrapOn = !wrapOn;
+  save('neonPipes.wrap', wrapOn ? 1 : 0);
+}
+
+// ============================================================
+// 4. Play: turning, locking, hints, undo
+// ============================================================
+// Starts the current level: from a saved puzzle, or a fresh one
+function startLevel(from) {
+  Sfx.init();
+  clearFx();
+  if (from) {
+    Object.assign(G, {
+      level: from.level, n: from.n, wrap: from.wrap, src: from.src, sol: from.sol, start: from.start,
+      cur: from.cur.slice(), lock: from.lock.slice(), target: from.target, moves: from.moves, hints: from.hints,
+    });
+  } else {
+    const level = curLevel(), n = sizeFor(level), src = pickSource(n);
+    const sol = genTree(n, wrapOn, src), start = scramble(sol, n, wrapOn, src);
+    Object.assign(G, {
+      level, n, wrap: wrapOn, src, sol, start, cur: start.slice(), lock: new Uint8Array(n * n), target: sol, moves: 0, hints: 0,
+    });
+  }
+  G.N2 = G.n * G.n;
+  G.undo = []; G.press = null; G.phase = 'idle'; G.winT = 0; G.introT = 0; G.cursor = G.src;
+  G.lit.fill(0); G.spinFrom.fill(0); G.spinT.fill(1); G.wig.fill(0); G.glow.fill(0); G.fired.fill(0);
+  layoutBoard(G.n);
+  buildBoardArt();
+  refreshLit();
+  saveCurrent();
+  setState('play');
+}
+function continueGame() { startLevel(savedFor()); }
+
+// Which tiles the light reaches, and where it leaks out of an open pipe end
+function refreshLit() {
+  const n = G.n, N2 = G.N2;
+  G.litCount = litMap(G.cur, n, G.wrap, G.src, G.depth, G.parent);
+  G.leaks.length = 0;
+  for (let k = 0; k < N2; k++) {
+    if (G.depth[k] < 0) continue;
+    const m = G.cur[k];
+    for (let d = 0; d < 4; d++) {
+      if (!(m & (1 << d))) continue;
+      const j = nb(k, d, n, G.wrap);
+      if (j < 0 || !(G.cur[j] & (1 << ((d + 2) & 3)))) G.leaks.push(k * 4 + d);
+    }
+  }
+}
+
+const spinNow = k => G.spinFrom[k] * (1 - easeOut(G.spinT[k]));
+// The tile already faces its new way; it is drawn turned back by q quarter turns, easing to 0
+function startSpin(k, q) { G.spinFrom[k] = spinNow(k) + q; G.spinT[k] = 0; }
+function spinTo(k, from, to) {
+  const s = cwSteps(from, to);
+  if (s === 1 || s === 2) startSpin(k, -s); else if (s === 3) startSpin(k, 1);
+}
+
+function snapshot() { return { cur: G.cur.slice(), lock: G.lock.slice(), moves: G.moves, hints: G.hints, target: G.target }; }
+
+function afterChange() {
+  const before = G.litCount;
+  refreshLit();
+  if (G.litCount > before) Sfx.connect(G.litCount / G.N2);
+  if (isSolved(G.cur, G.n, G.wrap, G.src)) onSolved();
+  else saveCurrent();
+}
+
+// dir +1 turns clockwise, -1 counter-clockwise. Returns true if the tile turned.
+function rotateAt(k, dir) {
+  if (G.phase !== 'idle' || k < 0 || k >= G.N2) return false;
+  if (G.lock[k]) { G.wig[k] = 1; Sfx.nope(); return false; }
+  G.undo.push(snapshot());
+  G.cur[k] = dir > 0 ? rotCW(G.cur[k]) : rotCCW(G.cur[k]);
+  startSpin(k, dir > 0 ? -1 : 1);
+  G.moves++;
+  Sfx.turn();
+  afterChange();
+  return true;
+}
+
+function toggleLock(k) {
+  if (G.phase !== 'idle' || k < 0 || k >= G.N2) return false;
+  G.undo.push(snapshot());
+  if (G.lock[k]) { G.lock[k] = 0; Sfx.unlock(); } else { G.lock[k] = 1; Sfx.lock(); }
+  saveCurrent();
+  return true;
+}
+
+// A full solution to aim for: keep every lock if possible, else just the hint locks, else the last known one.
+function findTarget() {
+  const b = CFG.solverBudget;
+  return solveNear(G.cur, G.lock, 1, G.target, G.n, G.wrap, G.src, b)
+    || solveNear(G.cur, G.lock, 2, G.target, G.n, G.wrap, G.src, b)
+    || G.target;
+}
+
+// Turns one wrong tile the right way (nearest the source first, so the light grows), then locks it.
+// Returns the tile, or -1.
+function doHint() {
+  if (G.phase !== 'idle') return -1;
+  const S = findTarget(), N2 = G.N2;
+  litMap(S, G.n, G.wrap, G.src, SOLVE_DEPTH, null);
+  let best = -1, bestD = 1e9, bestL = -1, bestLD = 1e9;
+  for (let k = 0; k < N2; k++) {
+    if (G.cur[k] === S[k]) continue;
+    const d = SOLVE_DEPTH[k];
+    if (!G.lock[k]) { if (d < bestD) { bestD = d; best = k; } }
+    else if (d < bestLD) { bestLD = d; bestL = k; }
+  }
+  if (best < 0) best = bestL;
+  if (best < 0) return -1;
+  G.undo.push(snapshot());
+  const wasLocked = G.lock[best];
+  spinTo(best, G.cur[best], S[best]);
+  G.cur[best] = S[best];
+  G.lock[best] = 2;
+  G.target = S;
+  G.hints++;
+  G.glow[best] = 1;
+  G.cursor = best;
+  ring(cellX(best), cellY(best), CELL * 0.2, CELL * 0.9, 0.7, '#ffffff', 2);
+  if (wasLocked) showToast('A locked tile needed a turn, so the hint freed it');
+  Sfx.hint();
+  afterChange();
+  return best;
+}
+
+function undo() {
+  if (G.phase !== 'idle') return false;
+  const s = G.undo.pop();
+  if (!s) { Sfx.tick(); showToast('Nothing to undo'); return false; }
+  for (let k = 0; k < G.N2; k++) if (G.cur[k] !== s.cur[k]) spinTo(k, G.cur[k], s.cur[k]);
+  G.cur = s.cur; G.lock = s.lock; G.moves = s.moves; G.hints = s.hints; G.target = s.target;
+  Sfx.undo();
+  afterChange();
+  return true;
+}
+
+// Back to how the level began. It can be undone.
+function restartLevel() {
+  if (G.phase !== 'idle') return false;
+  let same = G.moves === 0 && G.hints === 0;
+  for (let k = 0; k < G.N2 && same; k++) if (G.cur[k] !== G.start[k] || G.lock[k]) same = false;
+  if (same) { showToast('Already at the start'); Sfx.tick(); return false; }
+  G.undo.push(snapshot());
+  for (let k = 0; k < G.N2; k++) if (G.cur[k] !== G.start[k]) spinTo(k, G.cur[k], G.start[k]);
+  G.cur = G.start.slice(); G.lock = new Uint8Array(G.N2); G.moves = 0; G.hints = 0;
+  showToast('Level restarted · Undo brings it back');
+  Sfx.restart();
+  afterChange();
+  return true;
+}
+
+function onSolved() {
+  G.phase = 'celebrate'; G.winT = 0; G.fired.fill(0); G.press = null;
+  let md = 0;
+  for (let k = 0; k < G.N2; k++) md = Math.max(md, G.depth[k]);
+  G.winLen = Math.max(CFG.anim.celebrate, md * CFG.anim.wave + 1.4);
+  G.word = WIN_WORDS[(G.level - 1) % WIN_WORDS.length];
+  // Progress is saved straight away
+  setLevel(G.level + 1);
+  solvedTotal++;
+  save('neonPipes.solved', solvedTotal);
+  clearSaved(G.wrap);
+  ring(cellX(G.src), cellY(G.src), 8, BW * 0.5, 1.2, levelTint(), 3);
+  Sfx.win();
+}
+
+function showWin() {
+  resultInfo = { level: G.level, n: G.n, wrap: G.wrap, moves: G.moves, hints: G.hints, word: G.word, next: curLevel() };
+  setState('win');
+}
+
+// Animations: turning, wiggles, hint glow, and light flowing out from the source
+function stepTiles(dt) {
+  const A = CFG.anim;
+  G.introT += dt;
+  for (let k = 0; k < G.N2; k++) {
+    if (G.spinT[k] < 1) G.spinT[k] = Math.min(1, G.spinT[k] + dt / (A.turn * (0.6 + 0.4 * Math.abs(G.spinFrom[k]))));
+    if (G.wig[k] > 0) G.wig[k] = Math.max(0, G.wig[k] - dt * 3);
+    if (G.glow[k] > 0) G.glow[k] = Math.max(0, G.glow[k] - dt * 0.7);
+    const d = G.depth[k];
+    const on = d >= 0 && (d === 0 || G.lit[G.parent[k]] > 0.55); // a tile lights once the light has reached it
+    G.lit[k] = on ? Math.min(1, G.lit[k] + dt * A.litUp) : Math.max(0, G.lit[k] - dt * A.litDown);
+  }
+  if (G.phase === 'celebrate') {
+    G.winT += dt;
+    for (let k = 0; k < G.N2; k++) {
+      if (G.fired[k] || G.winT < G.depth[k] * A.wave) continue;
+      G.fired[k] = 1;
+      if (bits(G.cur[k]) === 1) { burst(cellX(k), cellY(k), tintIndex(), LOW_RES ? 4 : 9, 110, 0.9, 7); Sfx.lamp(); }
+    }
+    if (G.winT >= G.winLen && state === 'play') showWin();
+  }
+}
+
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const SIDE_BTNS = [
+  { id: 'undo', label: 'Undo', x: 40, y: 290, w: 176, h: 48 },
+  { id: 'hint', label: 'Hint', x: 40, y: 350, w: 176, h: 48 },
+  { id: 'restart', label: 'Restart', x: 40, y: 410, w: 176, h: 48 },
+];
+function sideAction(id) {
+  if (id === 'undo') undo();
+  else if (id === 'hint') doHint();
+  else if (id === 'restart') restartLevel();
+}
+
+// Cursor (keyboard / controller), tap or click to turn, hold or right-click to lock
+function boardInput(dt) {
+  const I = Input, m = I.mouse;
+  if (m.clicked) {
+    if (inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+    if (inRect(m, SOUND_BTN)) { toggleSound(); return; }
+    for (const b of SIDE_BTNS) if (inRect(m, b)) { sideAction(b.id); return; }
+  }
+  const n = G.n, dr = I.navUp ? -1 : I.navDown ? 1 : 0, dc = dr ? 0 : I.navLeft ? -1 : I.navRight ? 1 : 0;
+  if (dr || dc) {
+    let r = ((G.cursor / n) | 0) + dr, c = (G.cursor % n) + dc;
+    if (G.wrap) { r = (r + n) % n; c = (c + n) % n; } else { r = clamp(r, 0, n - 1); c = clamp(c, 0, n - 1); }
+    if (r * n + c !== G.cursor) { G.cursor = r * n + c; Sfx.tick(); }
+  }
+  if (G.phase !== 'idle') { G.press = null; return; }
+  if (I.act) rotateAt(G.cursor, 1);
+  if (I.rotL) rotateAt(G.cursor, -1);
+  if (I.lock) toggleLock(G.cursor);
+  if (I.hint) doHint();
+  if (I.undo) undo();
+  if (I.restart) restartLevel();
+  if (m.clicked) {
+    const k = cellAt(m.x, m.y);
+    if (k >= 0) { G.press = { k, t: 0, x: m.x, y: m.y, done: false }; G.cursor = k; }
+  }
+  const p = G.press;
+  if (p && m.down && !p.done) {
+    p.t += dt;
+    if (Math.hypot(m.x - p.x, m.y - p.y) > CELL * 0.45) G.press = null; // slid away: cancel
+    else if (p.t >= CFG.longPress) { p.done = true; toggleLock(p.k); }
+  }
+  if (m.released && G.press) {
+    const q = G.press;
+    G.press = null;
+    if (!q.done && cellAt(m.x, m.y) === q.k) rotateAt(q.k, 1);
+  }
+  if (m.rclick) {
+    const k = cellAt(m.x, m.y);
+    if (k >= 0) { G.cursor = k; toggleLock(k); }
+  }
+}
+
+function updatePlay(dt) {
+  boardInput(dt);
+  if (state !== 'play') return; // paused from the on-screen button
+  stepTiles(dt);
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 140 : 320, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(32, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 24); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: i % TINTS.length });
+}
+
+function burst(x, y, ci, n, speed, life = 0.7, size = 7) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s - 30;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+function clearFx() { parts.clear(); rings.clear(); }
+
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 20 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    o.life -= dt;
+    if (o.life <= 0) o.active = false;
+  }
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function titleItems() {
+  const lvl = curLevel(), fresh = lvl === 1 && !savedFor(), n = sizeFor(lvl);
+  const board = `${n} × ${n} board${wrapOn ? ' with wrap edges' : ''}`;
+  return [
+    {
+      id: 'continue', label: fresh ? 'Play (level 1)' : `Continue (level ${lvl})`,
+      hint: fresh ? `Start with a small ${board}. No timer, no limits.` : `${board}  ·  ${solvedTotal} solved so far`,
+    },
+    confirmT > 0
+      ? { id: 'restart', label: 'Really start over?', hint: 'Select again to go back to level 1.' }
+      : { id: 'restart', label: 'Restart from level 1', hint: `Start over from a small 4 × 4 board${wrapOn ? ' (wrap edges)' : ''}.` },
+    { id: 'wrap', label: 'Wrap edges', value: wrapOn ? 'On' : 'Off', cycle: () => toggleWrap(), hint: 'For experts: pipes may run off one edge and come back on the other.' },
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Controls, tiles and tips.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() {
+  return [{ id: 'resume', label: 'Resume' }, { id: 'restart', label: 'Restart level' }, soundItem(), { id: 'quit', label: 'Quit to menu' }];
+}
+function winItems() { return [{ id: 'next', label: `Next level (${resultInfo ? resultInfo.next : ''})` }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (confirmT > 0) confirmT = Math.max(0, confirmT - dt);
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (menuSel !== 1) confirmT = 0;
+      if (id === 'continue') continueGame();
+      else if (id === 'restart') {
+        if (confirmT > 0) { confirmT = 0; setLevel(1); clearSaved(wrapOn); startLevel(null); showToast('Back to level 1'); }
+        else confirmT = 3;
+      }
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 4; Sfx.blip(); }
+      break;
+    case 'play':
+      if (Input.pause) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') { resumeGame(); restartLevel(); }
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'win':
+      stepTiles(dt);
+      if (stateT > 0.8) {
+        const id = menuInput(winItems());
+        if (id === 'next') startLevel(null);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.12 + 0.09 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function cellPath(k, inset) {
+  rrPath(BX + (k % G.n) * CELL + inset, BY + ((k / G.n) | 0) * CELL + inset, CELL - inset * 2, CELL - inset * 2, Math.min(12, CELL * 0.18));
+}
+// How far the tile has popped in at the start of a level (0..1)
+function introP(k) {
+  const n = G.n, d = Math.abs(((k / n) | 0) - ((G.src / n) | 0)) + Math.abs((k % n) - (G.src % n));
+  return clamp((G.introT - d * 0.035) / CFG.anim.intro, 0, 1);
+}
+function drawTile(m, l, x, y, a) {
+  if (l < 1) { ctx.globalAlpha = a; ctx.drawImage(PIPES.dim[m], x, y, CELL, CELL); }
+  if (l > 0) { ctx.globalAlpha = a * l; ctx.drawImage(PIPES.lit[m], x, y, CELL, CELL); }
+  ctx.globalAlpha = 1;
+}
+
+function renderBoard() {
+  const n = G.n, N2 = G.N2, tint = levelTint(), C = CFG.color;
+  ctx.drawImage(boardCanvas, BX - 20, BY - 20, BW + 40, BW + 40);
+  const cel = G.phase === 'celebrate' ? Math.max(0, 1 - G.winT / G.winLen) : 0;
+  rrPath(BX - 10, BY - 10, BW + 20, BW + 20, 16);
+  ctx.globalAlpha = Math.min(1, 0.4 + 0.12 * Math.sin(time * 0.8) + cel * 0.6);
+  if (G.wrap) ctx.setLineDash([10, 8]);
+  glowStroke(tint, 1.5 + cel * 2);
+  if (G.wrap) ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+
+  // Wrap edges: short stubs show pipes that run off the board and come back on the other side
+  if (G.wrap) {
+    ctx.lineCap = 'round'; ctx.lineWidth = Math.max(3, CELL * 0.1);
+    for (let k = 0; k < N2; k++) {
+      const r = (k / n) | 0, c = k % n, m = G.cur[k];
+      const x = BX + (c + 0.5) * CELL, y = BY + (r + 0.5) * CELL, e = 12;
+      ctx.strokeStyle = G.lit[k] > 0.5 ? tint : C.pipe;
+      ctx.globalAlpha = G.lit[k] > 0.5 ? 0.8 : 0.6;
+      ctx.beginPath();
+      if (r === 0 && (m & 1)) { ctx.moveTo(x, BY - 2); ctx.lineTo(x, BY - e); }
+      if (c === n - 1 && (m & 2)) { ctx.moveTo(BX + BW + 2, y); ctx.lineTo(BX + BW + e, y); }
+      if (r === n - 1 && (m & 4)) { ctx.moveTo(x, BY + BW + 2); ctx.lineTo(x, BY + BW + e); }
+      if (c === 0 && (m & 8)) { ctx.moveTo(BX - 2, y); ctx.lineTo(BX - e, y); }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1; ctx.lineCap = 'butt';
+  }
+
+  // Tiles: a still tile is one or two drawImages; only turning or popping tiles need a transform
+  for (let k = 0; k < N2; k++) {
+    const r = (k / n) | 0, c = k % n, x = BX + c * CELL, y = BY + r * CELL, m = G.cur[k];
+    if (G.lock[k]) {
+      rrPath(x + 3, y + 3, CELL - 6, CELL - 6, Math.min(9, CELL * 0.15));
+      ctx.fillStyle = G.lock[k] === 2 ? hexA(tint, 0.07) : 'rgba(255,216,138,0.07)'; ctx.fill();
+    }
+    let ang = spinNow(k);
+    if (G.wig[k] > 0) ang += Math.sin(G.wig[k] * 18) * 0.07 * G.wig[k];
+    const ip = introP(k);
+    if (ang !== 0 || ip < 1) {
+      ctx.save();
+      ctx.translate(x + CELL / 2, y + CELL / 2);
+      if (ang !== 0) ctx.rotate(ang * Math.PI / 2);
+      if (ip < 1) { const s = 0.55 + 0.45 * backOut(ip); ctx.scale(s, s); }
+      drawTile(m, G.lit[k], -CELL / 2, -CELL / 2, ip);
+      ctx.restore();
+    } else drawTile(m, G.lit[k], x, y, 1);
+  }
+
+  // Locks: small corner brackets (warm for yours, level colour for hints)
+  for (let pass = 1; pass <= 2; pass++) {
+    let any = false;
+    ctx.beginPath();
+    for (let k = 0; k < N2; k++) {
+      if (G.lock[k] !== pass) continue;
+      any = true;
+      const x0 = BX + (k % n) * CELL + 6, y0 = BY + ((k / n) | 0) * CELL + 6, s = CELL - 12, L = Math.max(5, CELL * 0.15);
+      ctx.moveTo(x0, y0 + L); ctx.lineTo(x0, y0); ctx.lineTo(x0 + L, y0);
+      ctx.moveTo(x0 + s - L, y0); ctx.lineTo(x0 + s, y0); ctx.lineTo(x0 + s, y0 + L);
+      ctx.moveTo(x0 + s, y0 + s - L); ctx.lineTo(x0 + s, y0 + s); ctx.lineTo(x0 + s - L, y0 + s);
+      ctx.moveTo(x0 + L, y0 + s); ctx.lineTo(x0, y0 + s); ctx.lineTo(x0, y0 + s - L);
+    }
+    if (any) { ctx.globalAlpha = 0.85; glowStroke(pass === 1 ? C.warn : tint, 1.6); ctx.globalAlpha = 1; }
+  }
+
+  // The source orb, gently breathing
+  const sx = cellX(G.src), sy = cellY(G.src);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.25 + 0.12 * Math.sin(time * 2);
+  const hd = CELL * 1.5;
+  ctx.drawImage(dotSprites[tintIndex()], sx - hd / 2, sy - hd / 2, hd, hd);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = clamp(G.introT / 0.2, 0, 1);
+  ctx.drawImage(PIPES.src, sx - CELL / 2, sy - CELL / 2, CELL, CELL);
+  ctx.globalAlpha = 1;
+
+  // Light leaking out of an open pipe end
+  if (G.phase === 'idle' && G.leaks.length) {
+    ctx.fillStyle = tint;
+    ctx.globalAlpha = 0.5 + 0.3 * Math.sin(time * 4);
+    ctx.beginPath();
+    for (const e of G.leaks) {
+      const k = e >> 2, d = e & 3;
+      if (G.lit[k] < 0.9 || G.spinT[k] < 1) continue;
+      const x = cellX(k) + DC[d] * CELL * 0.47, y = cellY(k) + DR[d] * CELL * 0.47;
+      ctx.moveTo(x + 3.5, y); ctx.arc(x, y, 3.5, 0, TAU);
+    }
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // Hint glow and the finishing pulse of light
+  ctx.globalCompositeOperation = 'lighter';
+  for (let k = 0; k < N2; k++) {
+    const gl = G.glow[k];
+    if (gl > 0) {
+      ctx.globalAlpha = gl * 0.5;
+      const d = CELL * 1.6;
+      ctx.drawImage(dotSprites[TINTS.length], cellX(k) - d / 2, cellY(k) - d / 2, d, d);
+    }
+    if (G.phase === 'celebrate') {
+      const f = G.winT - G.depth[k] * CFG.anim.wave;
+      if (f > 0 && f < 0.5) {
+        const a = Math.sin((f / 0.5) * Math.PI);
+        ctx.globalAlpha = a * 0.9;
+        ctx.drawImage(PIPES.lit[G.cur[k]], BX + (k % n) * CELL, BY + ((k / n) | 0) * CELL, CELL, CELL);
+        ctx.globalAlpha = a * 0.3;
+        const d = CELL * 1.2;
+        ctx.drawImage(dotSprites[TINTS.length], cellX(k) - d / 2, cellY(k) - d / 2, d, d);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function renderMarks() {
+  const dev = Input.device, keyish = dev === 'kb' || dev === 'pad', m = Input.mouse;
+  if (G.phase !== 'idle') return;
+  if (dev === 'mouse' && !m.down) {
+    const k = cellAt(m.x, m.y);
+    if (k >= 0) { cellPath(k, 2); ctx.globalAlpha = 0.35; glowStroke('#ffffff', 1.2); ctx.globalAlpha = 1; }
+  }
+  if (keyish) {
+    cellPath(G.cursor, 1);
+    ctx.globalAlpha = 0.7 + 0.3 * Math.sin(time * 4);
+    glowStroke('#ffffff', 2);
+    ctx.globalAlpha = 1;
+  }
+  const p = G.press;
+  if (p && m.down && !p.done && p.t > 0.12) { // a ring fills while you hold to lock
+    const f = clamp((p.t - 0.12) / (CFG.longPress - 0.12), 0, 1);
+    ctx.beginPath(); ctx.arc(cellX(p.k), cellY(p.k), CELL * 0.44, -Math.PI / 2, -Math.PI / 2 + TAU * f);
+    glowStroke(CFG.color.warn, 2.5);
+  }
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? 'rgba(198,248,107,0.14)' : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+// Undo / Hint / Restart pills on the left (for mouse and touch; the key for each is shown on the right)
+function drawSideButton(b) {
+  const C = CFG.color, hover = Input.device === 'mouse' && inRect(Input.mouse, b);
+  const enabled = G.phase === 'idle' && state === 'play' && (b.id !== 'undo' || G.undo.length > 0);
+  ctx.globalAlpha = enabled ? 1 : 0.4;
+  rrPath(b.x, b.y, b.w, b.h, b.h / 2);
+  ctx.fillStyle = hover && enabled ? 'rgba(198,248,107,0.13)' : 'rgba(20,26,52,0.65)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * (hover && enabled ? 1 : 0.5); glowStroke(C.title, 1.2); ctx.globalAlpha = a;
+  const cx = b.x + 30, cy = b.y + b.h / 2;
+  ctx.fillStyle = C.text; ctx.strokeStyle = C.text; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  ctx.beginPath();
+  if (b.id === 'undo') {
+    ctx.arc(cx, cy + 1, 8, Math.PI, Math.PI * 2.3); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx - 12.5, cy - 1); ctx.lineTo(cx - 3.5, cy - 1); ctx.lineTo(cx - 8, cy + 6); ctx.closePath(); ctx.fill();
+  } else if (b.id === 'hint') {
+    const s = [[0, -10], [3, -3], [10, 0], [3, 3], [0, 10], [-3, 3], [-10, 0], [-3, -3]];
+    s.forEach(([x, y], i) => (i ? ctx.lineTo(cx + x, cy + y) : ctx.moveTo(cx + x, cy + y)));
+    ctx.closePath(); ctx.fill();
+  } else {
+    ctx.arc(cx, cy, 8, Math.PI * 0.15, Math.PI * 1.75); ctx.stroke();
+    const px = cx + 8 * Math.cos(Math.PI * 1.75), py = cy + 8 * Math.sin(Math.PI * 1.75);
+    ctx.beginPath(); ctx.moveTo(px + 5.5, py + 4.5); ctx.lineTo(px - 1, py - 5); ctx.lineTo(px + 6.5, py - 4); ctx.closePath(); ctx.fill();
+  }
+  ctx.lineCap = 'butt';
+  ctx.textAlign = 'left';
+  text(b.label, b.x + 52, cy + 1, `700 18px ${SANS}`, C.text);
+  const NN = padNames();
+  const key = usingPad() ? { undo: NN.lb, hint: NN.x, restart: '' }[b.id]
+    : Input.device === 'kb' ? { undo: 'U', hint: 'H', restart: 'R' }[b.id] : '';
+  if (key) { ctx.textAlign = 'right'; text(key, b.x + b.w - 20, cy + 1, `700 13px ${SANS}`, C.faint); }
+  ctx.textAlign = 'center';
+  ctx.globalAlpha = 1;
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return ['D-pad: move', `${NN.a}: turn  ·  ${NN.b}: turn back`, `${NN.y}: lock  ·  ${NN.x}: hint`, `${NN.lb}: undo  ·  ${NN.start}: pause`];
+    case 'mouse': return ['Click a tile to turn it', 'Right-click: lock it', 'Hold to lock works too', 'Esc or ‖ button: pause'];
+    case 'touch': return ['Tap a tile to turn it', 'Hold a tile to lock it', 'Undo, Hint, Restart:', 'buttons on the left'];
+    default: return ['Arrows: move', 'Space: turn', 'Shift+Space: turn back', 'L: lock  ·  H: hint', 'U: undo  ·  Esc: pause'];
+  }
+}
+
+function drawHUD() {
+  const C = CFG.color, LX = 128, RX = W - 128, tint = levelTint();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  // Left: level, size, light progress, soft counters, buttons
+  text('LEVEL', LX, 58, `800 12px ${SANS}`, C.faint);
+  glowText(String(G.level), LX, 96, `800 44px ${SANS}`, tint);
+  text(`${G.n} × ${G.n}${G.wrap ? '  ·  wrap edges' : ''}`, LX, 136, `600 15px ${SANS}`, C.dim);
+  const p = G.litCount / G.N2;
+  rrPath(LX - 80, 168, 160, 10, 5); ctx.fillStyle = 'rgba(131,144,189,0.18)'; ctx.fill();
+  if (p > 0.04) { rrPath(LX - 80, 168, 160 * p, 10, 5); ctx.fillStyle = tint; ctx.fill(); }
+  text(`${G.litCount} of ${G.N2} tiles lit`, LX, 198, `600 15px ${SANS}`, C.text);
+  text(`Moves ${G.moves}   ·   Hints ${G.hints}`, LX, 238, `500 15px ${SANS}`, C.dim);
+  for (const b of SIDE_BTNS) drawSideButton(b);
+  // Right: sound and pause buttons, controls for the current device
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  text('CONTROLS', RX, 170, `800 12px ${SANS}`, C.faint);
+  controlLines().forEach((s, i) => text(s, RX, 198 + i * 26, `500 15px ${SANS}`, i < 2 ? C.text : C.dim));
+  text('Join every pipe into', RX, 420, `500 14px ${SANS}`, C.faint);
+  text('one glowing network.', RX, 441, `500 14px ${SANS}`, C.faint);
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  renderBoard();
+  drawFx();
+  if (state === 'play') renderMarks();
+  drawHUD();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 340, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(198,248,107,0.09)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    const a = ctx.globalAlpha;
+    ctx.globalAlpha = a * (enabled ? 1 : 0.4);
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 104, y, `700 16px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = a;
+  });
+}
+
+// The title's big network: dim pipes with light rippling out from the source
+function drawDecor() {
+  const D = DECOR, S = D.cell, art = DECOR_ART, rows = Math.ceil(H / S), oy = (H - rows * S) / 2;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < D.n; c++) {
+      const k = r * D.n + c, m = D.mask[k], x = c * S, y = oy + r * S;
+      ctx.globalAlpha = 0.3;
+      ctx.drawImage(art.dim[m], x, y, S, S);
+      const w = Math.sin(time * 1.1 - D.depth[k] * 0.42);
+      if (w > 0) { ctx.globalAlpha = w * w * 0.5; ctx.drawImage(art.lit[m], x, y, S, S); }
+    }
+  }
+  ctx.globalAlpha = 0.55;
+  ctx.drawImage(art.src, (D.src % D.n) * S, oy + ((D.src / D.n) | 0) * S, S, S);
+  ctx.globalAlpha = 1;
+}
+
+function drawTitle() {
+  const C = CFG.color;
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawDecor();
+  drawMotes();
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 400);
+  shade.addColorStop(0, 'rgba(5,7,15,0.9)'); shade.addColorStop(1, 'rgba(5,7,15,0.25)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON PIPES', W / 2, 76, `800 64px ${SANS}`, C.title);
+  text('a calm pipe-turning puzzle', W / 2, 120, `500 16px ${SANS}`, C.dim);
+  const items = titleItems(), y0 = 174, gap = 44;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap + 4, `500 15px ${SANS}`, C.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, y0 + items.length * gap + 30, `500 13px ${SANS}`, C.faint);
+
+  const yb = H - 24, pad = Input.pad;
+  ctx.fillStyle = 'rgba(5,7,15,0.7)'; ctx.fillRect(0, yb - 16, W, 32);
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? C.good : C.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, C.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, C.dim);
+  ctx.textAlign = 'right';
+  text(`Level ${curLevel()}  ·  ${solvedTotal} solved`, W - 24, yb, `600 12px ${MONO}`, C.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, C.faint);
+  }
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 34, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Move the cursor', 'D-pad / left stick', 'Arrows / W A S D', '–'],
+    ['Turn a tile', NN.a, 'Space or Enter', 'Tap or click it'],
+    ['Turn it back', NN.b, 'Shift + Space', '–'],
+    ['Lock / unlock', NN.y, 'L', 'Hold it, or right-click'],
+    ['Hint', NN.x, 'H', 'Hint button'],
+    ['Undo', NN.lb, 'U or Z', 'Undo button'],
+    ['Restart level', 'Pause menu', 'R', 'Restart button'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [236, 260, 450, 640];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 70, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 70, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 70, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 94 + i * 23;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 306, W - 120, 1);
+  const col = (title, x, lines, y0 = 354) => {
+    text(title, x, 328, `800 12px ${SANS}`, C.faint);
+    lines.forEach(([s, c], i) => text(s, x, y0 + i * 23, `500 15px ${SANS}`, c || C.text));
+  };
+  col('GOAL', 60, [
+    ['Turn the tiles until every'], ['pipe joins one network,'], ['with no open ends.'],
+    ['Light flows out from the', C.dim], ['glowing source as you go.', C.dim],
+  ]);
+  text('TILES', 360, 328, `800 12px ${SANS}`, C.faint);
+  const art = DECOR_ART;
+  [[1, 'end'], [5, 'straight'], [3, 'corner'], [7, 'T']].forEach(([m, name], i) => {
+    const x = 360 + i * 66;
+    rrPath(x - 3, 341, 56, 56, 10); ctx.fillStyle = 'rgba(120,150,255,0.09)'; ctx.fill();
+    ctx.drawImage(art.lit[m], x, 344, 50, 50);
+    ctx.textAlign = 'center'; text(name, x + 25, 408, `500 13px ${SANS}`, C.dim); ctx.textAlign = 'left';
+  });
+  text('Tiles only turn; they', 360, 436, `500 15px ${SANS}`, C.text);
+  text('never move. Ends are lamps.', 360, 459, `500 15px ${SANS}`, C.dim);
+  col('TIPS', 660, [
+    ['Edge and corner tiles have'], ['fewer ways to face: start there.'], ['Lock tiles you are sure of.'],
+    ['No timer, no move limit.', C.dim], ['Wrap edges: pipes may run off', C.dim], ['one side and in the other.', C.dim],
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 22, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the board
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.94)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  card(W / 2 - 240, 70, 480, 400);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 132, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time.', W / 2, 174, `500 16px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 236, true, 50);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start} or ${NN.b}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 438, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawWin() {
+  overlay(Math.min(0.55, stateT * 1.5));
+  const r = resultInfo, C = CFG.color, tint = TINTS[(r.level - 1) % TINTS.length];
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 240, 86, 480, 368);
+  glowText('Network complete', W / 2, 142, `800 42px ${SANS}`, tint);
+  text(r.word, W / 2, 186, `500 17px ${SANS}`, C.dim);
+  text(`Level ${r.level}  ·  ${r.n} × ${r.n}${r.wrap ? '  ·  wrap edges' : ''}`, W / 2, 230, `700 20px ${SANS}`, C.text);
+  text(`${r.moves} ${r.moves === 1 ? 'move' : 'moves'}   ·   ${r.hints} ${r.hints === 1 ? 'hint' : 'hints'}`, W / 2, 262, `500 16px ${SANS}`, C.dim);
+  drawMenu(winItems(), 332, stateT > 0.8, 54);
+  const NN = padNames();
+  text(usingPad() ? `${NN.a}: choose   ·   ${NN.b}: main menu` : Input.device === 'touch' ? 'Tap an option' : 'Enter: choose   ·   Esc: main menu',
+    W / 2, 428, `500 13px ${SANS}`, C.faint);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 15px ${SANS}`;
+  const y = state === 'play' ? H - 18 : H - 56, w = ctx.measureText(toast.text).width + 32;
+  rrPath(W / 2 - w / 2, y - 14, w, 28, 14);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  text(toast.text, W / 2, y, `600 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'win') drawWin();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

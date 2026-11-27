@@ -1,0 +1,1927 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Mahjong</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const TW = 46, TH = 58;                 // tile face size
+const LX = 5, LY = 6;                   // each layer sits this far up and left; also the thickness of a tile's edge
+const PAD = 10;                         // sprite margin around a tile (room for the glow and the shadow)
+const SW = TW + LX + PAD * 2, SH = TH + LY + PAD * 2;   // tile sprite size
+const BOARD_CX = 480, BOARD_CY = 282;   // centre of the board area
+const GLYPH_R = 14.5;                   // glyph size on a tile face
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  hintTime: 8,        // seconds a hint keeps glowing
+  stuckWait: 1.5,     // seconds the "No pairs left" message shows before the gentle shuffle
+  glide: 0.6,         // seconds for a matched pair to glide away
+  intro: 0.8,         // seconds for the tiles to settle in (plus a little per layer)
+  shuffle: 0.45,      // seconds to fade the board out, and again to fade it back in, when shuffling
+  dealCandidates: 6,  // solvable deals made per game; the friendliest one is kept
+  dealPlayouts: 12,   // quick random tries used to judge how friendly a deal is
+  hintTries: 150,     // quick tries when looking for a hint that keeps the board clearable
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', title: '#ff8fa3', good: '#7dffc0', warn: '#ffd88a', sky: '#8fd8ff',
+  },
+};
+
+// 22 tile kinds. Each has its own colour AND its own shape, so they're easy to tell apart.
+const KINDS = [
+  { shape: 'moon',   color: '#fff1b8' },
+  { shape: 'leaf',   color: '#6dff7e' },
+  { shape: 'wave',   color: '#45dcff' },
+  { shape: 'star',   color: '#fff06a' },
+  { shape: 'drop',   color: '#5b8cff' },
+  { shape: 'flame',  color: '#ff7e4f' },
+  { shape: 'gem',    color: '#ff5fd8' },
+  { shape: 'flower', color: '#ff8fc4' },
+  { shape: 'sun',    color: '#ffab3d' },
+  { shape: 'heart',  color: '#ff5470' },
+  { shape: 'bolt',   color: '#d4ff4f' },
+  { shape: 'cloud',  color: '#e4ecff' },
+  { shape: 'peaks',  color: '#36f5c8' },
+  { shape: 'snow',   color: '#b5f3ff' },
+  { shape: 'spiral', color: '#a98bff' },
+  { shape: 'bell',   color: '#e2b0ff' },
+  { shape: 'fish',   color: '#8fb0ff' },
+  { shape: 'pine',   color: '#3ddc84' },
+  { shape: 'note',   color: '#c97bff' },
+  { shape: 'shell',  color: '#ffbfa3' },
+  { shape: 'crown',  color: '#ffd34d' },
+  { shape: 'orbit',  color: '#8fd8ff' },
+];
+
+// Layouts. Each row is [layer, y, first x, how many tiles], in half-tile steps.
+// Tile counts are multiples of 4: every kind used appears exactly 4 times.
+const LAYOUT_DEFS = [
+  { id: 'terrace', name: 'Terrace', blurb: 'gentle steps', rows: [
+    [0, 0, 5, 6], [0, 2, 3, 8], [0, 4, 1, 10], [0, 6, 1, 10], [0, 8, 3, 8], [0, 10, 5, 6],
+    [1, 2, 7, 4], [1, 4, 5, 6], [1, 6, 5, 6], [1, 8, 7, 4],
+    [2, 4, 9, 2], [2, 6, 9, 2],
+  ] },
+  { id: 'bridge', name: 'Bridge', blurb: 'two towers and a long span', rows: [
+    [0, 0, 0, 3], [0, 2, 0, 3], [0, 4, 0, 3], [0, 6, 0, 3], [0, 8, 0, 13], [0, 10, 0, 13], [0, 12, 0, 3],
+    [0, 0, 20, 3], [0, 2, 20, 3], [0, 4, 20, 3], [0, 6, 20, 3], [0, 12, 20, 3],
+    [1, 1, 1, 2], [1, 3, 1, 2], [1, 5, 1, 2], [1, 7, 1, 2], [1, 9, 9, 4],
+    [1, 1, 21, 2], [1, 3, 21, 2], [1, 5, 21, 2], [1, 7, 21, 2],
+    [2, 2, 2, 1], [2, 4, 2, 1], [2, 2, 22, 1], [2, 4, 22, 1],
+  ] },
+  { id: 'bloom', name: 'Bloom', blurb: 'a flower with four petals', rows: [
+    [0, 0, 10, 3], [0, 2, 9, 4], [0, 1, 3, 2], [0, 1, 19, 2],
+    [0, 4, 1, 2], [0, 4, 7, 6], [0, 4, 21, 2],
+    [0, 6, 0, 3], [0, 6, 7, 6], [0, 6, 20, 3],
+    [0, 8, 1, 2], [0, 8, 7, 6], [0, 8, 21, 2],
+    [0, 10, 9, 4], [0, 12, 10, 3], [0, 11, 3, 2], [0, 11, 19, 2],
+    [1, 1, 11, 2], [1, 5, 9, 4], [1, 7, 9, 4], [1, 11, 11, 2],
+    [1, 5, 1, 2], [1, 7, 1, 2], [1, 5, 21, 2], [1, 7, 21, 2],
+    [2, 5, 10, 3], [2, 7, 10, 3], [2, 6, 2, 1], [2, 6, 22, 1],
+    [3, 6, 11, 2],
+  ] },
+  { id: 'lantern', name: 'Lantern', blurb: 'a tall glowing lantern', rows: [
+    [0, 0, 9, 4], [0, 2, 5, 8], [0, 4, 3, 10], [0, 6, 1, 12], [0, 8, 3, 10], [0, 10, 5, 8], [0, 12, 9, 4],
+    [1, 3, 9, 4], [1, 5, 6, 7], [1, 7, 6, 7], [1, 9, 9, 4],
+    [2, 5, 9, 4], [2, 7, 9, 4],
+    [3, 6, 11, 2],
+  ] },
+];
+const NOTES = [392, 440, 523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51, 1567.98, 1760]; // pentatonic
+const WIN_WORDS = ['Calm and clear.', 'Every pair found.', 'A peaceful finish.', 'Lovely, unhurried play.', 'Nicely done.'];
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);  // smooth in and out
+const easeOut = t => 1 - (1 - t) * (1 - t) * (1 - t);
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+function shuffleArr(a) {
+  for (let i = a.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; const t = a[i]; a[i] = a[j]; a[j] = t; }
+  return a;
+}
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// 2. Board model: positions, the free-tile rule, solvable deals
+// ============================================================
+// A tile at (x, y, z) covers [x, x+2) x [y, y+2) on layer z (half-tile units).
+function prepLayout(def) {
+  const pos = [];
+  for (const [z, y, x0, count] of def.rows) for (let k = 0; k < count; k++) pos.push({ x: x0 + 2 * k, y, z });
+  pos.sort((a, b) => a.z - b.z || a.y - b.y || a.x - b.x);   // draw order: layer, then row, then column
+  const n = pos.length;
+  const above = [], below = [], left = [], right = [];
+  for (let i = 0; i < n; i++) { above.push([]); below.push([]); left.push([]); right.push([]); }
+  for (let i = 0; i < n; i++) {
+    const a = pos[i];
+    for (let j = 0; j < n; j++) {
+      if (i === j) continue;
+      const b = pos[j], dx = b.x - a.x, dy = b.y - a.y;
+      if (Math.abs(dy) >= 2) continue;
+      if (Math.abs(dx) < 2) { if (b.z > a.z) above[i].push(j); else if (b.z < a.z) below[i].push(j); }
+      else if (b.z === a.z) { if (dx === -2) left[i].push(j); else if (dx === 2) right[i].push(j); }
+    }
+  }
+  // Centre the whole stack (edges included) in the board area
+  const px = pos.map(p => p.x * TW / 2 - p.z * LX), py = pos.map(p => p.y * TH / 2 - p.z * LY);
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (let i = 0; i < n; i++) {
+    x0 = Math.min(x0, px[i]); x1 = Math.max(x1, px[i] + TW + LX);
+    y0 = Math.min(y0, py[i]); y1 = Math.max(y1, py[i] + TH + LY);
+  }
+  const ox = Math.round(BOARD_CX - (x0 + x1) / 2), oy = Math.round(BOARD_CY - (y0 + y1) / 2);
+  const sx = px.map(v => v + ox), sy = py.map(v => v + oy);
+  let maxZ = 0;
+  for (const p of pos) maxZ = Math.max(maxZ, p.z);
+  const byLayer = [];
+  for (let z = 0; z <= maxZ; z++) byLayer.push([]);
+  pos.forEach((p, i) => byLayer[p.z].push(i));
+  return {
+    id: def.id, name: def.name, blurb: def.blurb || '', pos, n, above, below, left, right, maxZ, byLayer,
+    sx, sy, cx: sx.map(v => v + TW / 2), cy: sy.map(v => v + TH / 2),
+    bounds: { x0: x0 + ox, y0: y0 + oy, x1: x1 + ox, y1: y1 + oy },
+  };
+}
+const LAYOUTS = LAYOUT_DEFS.map(prepLayout);
+
+// A tile is free when nothing lies on top of it and its left or right side is open.
+function isFree(lay, t, i) {
+  if (t[i] < 0) return false;
+  for (const j of lay.above[i]) if (t[j] >= 0) return false;
+  let open = true;
+  for (const j of lay.left[i]) if (t[j] >= 0) { open = false; break; }
+  if (open) return true;
+  for (const j of lay.right[i]) if (t[j] >= 0) return false;
+  return true;
+}
+
+// Every pair of free tiles of the same kind: [[a, b], ...]
+function freePairs(lay, t) {
+  const byKind = new Map(), out = [];
+  for (let i = 0; i < lay.n; i++) {
+    if (!isFree(lay, t, i)) continue;
+    const k = t[i];
+    if (!byKind.has(k)) byKind.set(k, []);
+    byKind.get(k).push(i);
+  }
+  for (const list of byKind.values()) {
+    for (let a = 0; a < list.length; a++) for (let b = a + 1; b < list.length; b++) out.push([list[a], list[b]]);
+  }
+  return out;
+}
+
+// --- Solvable deals: place pairs in reverse removal order ---
+// The board is built up from empty, one pair at a time. Each new pair must be free the moment it lands,
+// so taking the pairs away in the opposite order always clears the board.
+const anyPlaced = (list, placed) => { for (const j of list) if (placed[j]) return true; return false; };
+// Would placing i trap empty spots between it and another placed tile in the same row? (They could never be filled.)
+function traps(links, i, placed, allowed) {
+  const stack = [], seen = new Set();
+  for (const j of links[i]) if (!placed[j] && (!allowed || allowed[j])) stack.push(j);
+  while (stack.length) {
+    const u = stack.pop();
+    if (seen.has(u)) continue;
+    seen.add(u);
+    for (const v of links[u]) {
+      if (allowed && !allowed[v]) continue;
+      if (placed[v]) return true;
+      stack.push(v);
+    }
+  }
+  return false;
+}
+function placeable(lay, placed, allowed, i) {
+  if (placed[i] || (allowed && !allowed[i])) return false;
+  for (const j of lay.below[i]) if (!placed[j] && (!allowed || allowed[j])) return false;  // build from the bottom up
+  for (const j of lay.above[i]) if (placed[j]) return false;
+  if (anyPlaced(lay.left[i], placed) && anyPlaced(lay.right[i], placed)) return false;
+  return !traps(lay.left, i, placed, allowed) && !traps(lay.right, i, placed, allowed);
+}
+// Returns positions in placement order (pairs back to back), or null.
+// allowed: which positions may be used (null = all). prefer: positions to fill first when possible.
+function buildOrder(lay, allowed, count, prefer, attempts = 300) {
+  const n = lay.n, placed = new Uint8Array(n);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    placed.fill(0);
+    const order = [];
+    while (order.length < count) {
+      const cands = [];
+      for (let i = 0; i < n; i++) if (placeable(lay, placed, allowed, i)) cands.push(i);
+      shuffleArr(cands);
+      if (prefer) cands.sort((a, b) => prefer[b] - prefer[a]);   // stable: keeps the random order within each group
+      let pick = null;
+      for (let ai = 0; ai < cands.length && !pick; ai++) {
+        const a = cands[ai];
+        placed[a] = 1;
+        for (const b of cands) {
+          if (b === a || !placeable(lay, placed, allowed, b)) continue;
+          placed[b] = 1;
+          const aFree = !anyPlaced(lay.left[a], placed) || !anyPlaced(lay.right[a], placed);
+          placed[b] = 0;
+          if (aFree) { pick = [a, b]; break; }
+        }
+        placed[a] = 0;
+      }
+      if (!pick) break;
+      placed[pick[0]] = placed[pick[1]] = 1;
+      order.push(pick[0], pick[1]);
+    }
+    if (order.length >= count) return order;
+  }
+  return null;
+}
+// Placement order -> removal plan (the last pair placed is the first one to take away)
+function orderToPlan(order) {
+  const plan = [];
+  for (let p = order.length / 2 - 1; p >= 0; p--) plan.push([order[2 * p], order[2 * p + 1]]);
+  return plan;
+}
+// One deal: picks n/4 kinds at random, 4 tiles of each, with a known way to clear it.
+function dealOnce(lay) {
+  let order = null;
+  while (!order) order = buildOrder(lay, null, lay.n, null);
+  const kinds = shuffleArr(KINDS.map((_, i) => i)).slice(0, lay.n / 4);
+  const pairKinds = shuffleArr(kinds.concat(kinds));
+  const t = new Int8Array(lay.n).fill(-1);
+  for (let p = 0; p < order.length / 2; p++) t[order[2 * p]] = t[order[2 * p + 1]] = pairKinds[p];
+  return { tiles: t, plan: orderToPlan(order) };
+}
+// A fresh deal: of a few solvable candidates, keeps the friendliest (the one random play clears most often).
+function deal(lay) {
+  let best = null, bestScore = -1;
+  for (let c = 0; c < CFG.dealCandidates; c++) {
+    const d = dealOnce(lay);
+    let score = 0;
+    for (let i = 0; i < CFG.dealPlayouts; i++) if (playout(lay, d.tiles)) score++;
+    if (score > bestScore) { bestScore = score; best = d; }
+  }
+  return best;
+}
+// Rearranges the remaining tiles so the board can still be cleared.
+// Uses the same spots when possible; otherwise (e.g. the last two tiles are stacked) some tiles move to open spots.
+function shuffleTiles(lay, t) {
+  const alive = new Uint8Array(lay.n), kinds = [];
+  for (let i = 0; i < lay.n; i++) if (t[i] >= 0) { alive[i] = 1; kinds.push(t[i]); }
+  const out = new Int8Array(lay.n).fill(-1);
+  if (!kinds.length) return { tiles: out, moved: false, plan: [] };
+  kinds.sort((a, b) => a - b);
+  const pairs = [];
+  for (let i = 0; i < kinds.length; i += 2) pairs.push(kinds[i]);   // every kind has an even count left
+  shuffleArr(pairs);
+  let order = buildOrder(lay, alive, kinds.length, null, 120), moved = false;
+  if (!order) { order = buildOrder(lay, null, kinds.length, alive); moved = true; }
+  for (let p = 0; p < pairs.length; p++) out[order[2 * p]] = out[order[2 * p + 1]] = pairs[p];
+  return { tiles: out, moved, plan: orderToPlan(order) };
+}
+// Does tile a sit on top of tile b, directly or through other tiles still on the board?
+function sitsOn(lay, t, a, b) {
+  const stack = [b], seen = new Set([b]);
+  while (stack.length) {
+    const u = stack.pop();
+    for (const v of lay.above[u]) {
+      if (t[v] < 0 || seen.has(v)) continue;
+      if (v === a) return true;
+      seen.add(v); stack.push(v);
+    }
+  }
+  return false;
+}
+// One quick random try at clearing the board: safe moves first, otherwise a random open pair
+// (never one that leaves the last two of its kind stacked on each other). Returns the pairs, or null if it got stuck.
+function playout(lay, t0) {
+  const n = lay.n, t = Int8Array.from(t0), path = [], cnt = new Int16Array(KINDS.length);
+  let left = 0;
+  for (let i = 0; i < n; i++) if (t[i] >= 0) { cnt[t[i]]++; left++; }
+  const byKind = new Map();
+  while (left) {
+    byKind.clear();
+    for (let i = 0; i < n; i++) {
+      if (!isFree(lay, t, i)) continue;
+      const k = t[i];
+      if (!byKind.has(k)) byKind.set(k, []);
+      byKind.get(k).push(i);
+    }
+    let move = null;
+    for (const [k, list] of byKind) if (list.length >= 2 && list.length === cnt[k]) { move = [list[0], list[1]]; break; }
+    if (!move) {
+      const cands = [];
+      for (const [k, list] of byKind) {
+        for (let x = 0; x < list.length; x++) {
+          for (let y = x + 1; y < list.length; y++) {
+            if (cnt[k] === 4) {
+              const rest = [];
+              for (let i = 0; i < n; i++) if (t[i] === k && i !== list[x] && i !== list[y]) rest.push(i);
+              if (sitsOn(lay, t, rest[0], rest[1]) || sitsOn(lay, t, rest[1], rest[0])) continue;
+            }
+            cands.push([list[x], list[y]]);
+          }
+        }
+      }
+      if (!cands.length) return null;
+      move = cands[(Math.random() * cands.length) | 0];
+    }
+    cnt[t[move[0]]] -= 2; left -= 2;
+    t[move[0]] = t[move[1]] = -1;
+    path.push(move);
+  }
+  return path;
+}
+// Several quick tries; returns a full clearing path or null
+function findPath(lay, t, tries) {
+  for (let i = 0; i < tries; i++) { const p = playout(lay, t); if (p) return p; }
+  return null;
+}
+// Does this list of pairs clear the board from here, every pair matching and free in turn?
+function planWorks(lay, t0, plan) {
+  if (!plan) return false;
+  const t = Int8Array.from(t0);
+  for (const [a, b] of plan) {
+    if (a === b || t[a] < 0 || t[a] !== t[b] || !isFree(lay, t, a) || !isFree(lay, t, b)) return false;
+    t[a] = t[b] = -1;
+  }
+  for (let i = 0; i < lay.n; i++) if (t[i] >= 0) return false;
+  return true;
+}
+// After the player clears (a, b), keep the plan going if possible. `t` is the board after the move.
+function updatePlan(lay, t, plan, a, b) {
+  if (!plan) return null;
+  const same = plan.findIndex(([x, y]) => (x === a && y === b) || (x === b && y === a));
+  if (same >= 0) { const p = plan.slice(); p.splice(same, 1); return planWorks(lay, t, p) ? p : null; }
+  // a and b came from two different planned pairs: their partners now pair up instead
+  const ia = plan.findIndex(pr => pr.includes(a)), ib = plan.findIndex(pr => pr.includes(b));
+  if (ia < 0 || ib < 0) return null;
+  const u = plan[ia][0] === a ? plan[ia][1] : plan[ia][0], v = plan[ib][0] === b ? plan[ib][1] : plan[ib][0];
+  const rest = plan.filter((_, i) => i !== ia && i !== ib);
+  for (let at = Math.min(ia, ib) - 1; at <= rest.length; at++) {
+    if (at < 0) continue;
+    const p = rest.slice(); p.splice(at, 0, [u, v]);
+    if (planWorks(lay, t, p)) return p;
+  }
+  return null;
+}
+
+// ============================================================
+// Canvas + art (tiles are drawn once into sprites; the board is cached until it changes)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null, boardCache = null, boardDirty = true;
+let faceSprites = [], slabSprites = [], shadowSprite = null, dimSprite = null, dotSprites = [];
+
+function layer(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * rs); c.height = Math.ceil(h * rs);
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  return { c, g };
+}
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  buildArt();
+}
+
+function rr(g, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+// One neon glyph, centred on (0, 0). Shapes are simple, original symbols.
+function glyph(g, shape, R, col) {
+  g.lineJoin = 'round'; g.lineCap = 'round';
+  const neon = w => { // wide faint strokes under a thin bright one
+    g.strokeStyle = col;
+    g.globalAlpha = 0.13; g.lineWidth = w + 6.5; g.stroke();
+    g.globalAlpha = 0.32; g.lineWidth = w + 2.4; g.stroke();
+    g.globalAlpha = 1; g.lineWidth = w; g.stroke();
+  };
+  const solid = () => { g.fillStyle = hexA(col, 0.28); g.fill(); neon(2.2); };
+  const dot = (x, y, r, c) => { g.beginPath(); g.arc(x, y, r, 0, TAU); g.fillStyle = c || col; g.fill(); };
+  const poly = pts => { pts.forEach(([x, y], i) => (i ? g.lineTo(x * R, y * R) : g.moveTo(x * R, y * R))); g.closePath(); };
+  g.beginPath();
+  switch (shape) {
+    case 'moon': { // a crescent: one circle minus another
+      const d = R * 0.52, r = R * 0.8;
+      const ix = (d * d + R * R - r * r) / (2 * d), iy = Math.sqrt(R * R - ix * ix);
+      const a1 = Math.atan2(iy, ix), a2 = Math.atan2(iy, ix - d);
+      g.rotate(-0.45);
+      g.arc(0, 0, R * 1.02, a1, TAU - a1, false);
+      g.arc(d, 0, r, -a2, a2, true);
+      g.closePath(); solid();
+      break;
+    }
+    case 'leaf':
+      g.rotate(0.6);
+      g.moveTo(0, -R * 1.1);
+      g.quadraticCurveTo(R * 1.05, -R * 0.1, 0, R * 0.95);
+      g.quadraticCurveTo(-R * 1.05, -R * 0.1, 0, -R * 1.1);
+      solid();
+      g.beginPath(); g.moveTo(0, -R * 0.7); g.lineTo(0, R * 1.25); neon(1.5);
+      break;
+    case 'wave':
+      for (const y of [-R * 0.36, R * 0.42]) {
+        g.moveTo(-R * 1.08, y);
+        for (let i = 0; i < 4; i++) {
+          const x0 = -R * 1.08 + i * R * 0.54;
+          g.quadraticCurveTo(x0 + R * 0.27, y + (i % 2 ? R * 0.34 : -R * 0.34), x0 + R * 0.54, y);
+        }
+      }
+      neon(2.6);
+      break;
+    case 'star':
+      for (let i = 0; i < 10; i++) {
+        const a = -Math.PI / 2 + i * Math.PI / 5, d = i % 2 ? R * 0.47 : R * 1.12;
+        if (i) g.lineTo(Math.cos(a) * d, Math.sin(a) * d); else g.moveTo(Math.cos(a) * d, Math.sin(a) * d);
+      }
+      g.closePath(); solid();
+      break;
+    case 'drop':
+      g.moveTo(0, -R * 1.15);
+      g.bezierCurveTo(R * 0.25, -R * 0.6, R * 0.82, -R * 0.1, R * 0.82, R * 0.32);
+      g.arc(0, R * 0.32, R * 0.82, 0, Math.PI, false);
+      g.bezierCurveTo(-R * 0.82, -R * 0.1, -R * 0.25, -R * 0.6, 0, -R * 1.15);
+      g.closePath(); solid();
+      g.beginPath(); g.arc(0, R * 0.32, R * 0.48, Math.PI * 0.6, Math.PI * 0.95); neon(1.3);
+      break;
+    case 'flame':
+      g.moveTo(R * 0.05, -R * 1.2);
+      g.bezierCurveTo(R * 0.35, -R * 0.6, R * 0.95, -R * 0.3, R * 0.8, R * 0.4);
+      g.bezierCurveTo(R * 0.66, R * 1.02, -R * 0.66, R * 1.02, -R * 0.8, R * 0.4);
+      g.bezierCurveTo(-R * 0.92, -R * 0.1, -R * 0.45, -R * 0.25, -R * 0.3, -R * 0.65);
+      g.bezierCurveTo(-R * 0.12, -R * 0.35, -R * 0.05, -R * 0.8, R * 0.05, -R * 1.2);
+      g.closePath(); solid();
+      g.beginPath();
+      g.moveTo(0, -R * 0.12);
+      g.bezierCurveTo(R * 0.42, R * 0.22, R * 0.4, R * 0.72, 0, R * 0.74);
+      g.bezierCurveTo(-R * 0.4, R * 0.72, -R * 0.42, R * 0.22, 0, -R * 0.12);
+      g.fillStyle = hexA(col, 0.75); g.fill();
+      break;
+    case 'gem':
+      poly([[-0.55, -0.8], [0.55, -0.8], [1.05, -0.22], [0, 1.05], [-1.05, -0.22]]); solid();
+      g.beginPath();
+      g.moveTo(-R * 1.05, -R * 0.22); g.lineTo(R * 1.05, -R * 0.22);
+      g.moveTo(-R * 0.55, -R * 0.8); g.lineTo(-R * 0.28, -R * 0.22); g.lineTo(0, R * 1.05);
+      g.lineTo(R * 0.28, -R * 0.22); g.lineTo(R * 0.55, -R * 0.8);
+      g.globalAlpha = 0.75; g.strokeStyle = col; g.lineWidth = 1.1; g.stroke(); g.globalAlpha = 1;
+      break;
+    case 'flower':
+      for (let i = 0; i < 5; i++) {
+        const a = -Math.PI / 2 + i * TAU / 5, x = Math.cos(a) * R * 0.58, y = Math.sin(a) * R * 0.58;
+        g.moveTo(x + R * 0.44, y); g.arc(x, y, R * 0.44, 0, TAU);
+      }
+      solid();
+      dot(0, 0, R * 0.3, '#fff6d8');
+      break;
+    case 'sun':
+      g.arc(0, 0, R * 0.5, 0, TAU); solid();
+      g.beginPath();
+      for (let i = 0; i < 8; i++) {
+        const a = i * TAU / 8;
+        g.moveTo(Math.cos(a) * R * 0.78, Math.sin(a) * R * 0.78); g.lineTo(Math.cos(a) * R * 1.12, Math.sin(a) * R * 1.12);
+      }
+      neon(2);
+      break;
+    case 'heart':
+      g.moveTo(0, R * 1.0);
+      g.bezierCurveTo(-R * 0.35, R * 0.7, -R * 1.15, R * 0.2, -R * 1.05, -R * 0.35);
+      g.bezierCurveTo(-R * 0.95, -R * 1.0, -R * 0.2, -R * 1.05, 0, -R * 0.5);
+      g.bezierCurveTo(R * 0.2, -R * 1.05, R * 0.95, -R * 1.0, R * 1.05, -R * 0.35);
+      g.bezierCurveTo(R * 1.15, R * 0.2, R * 0.35, R * 0.7, 0, R * 1.0);
+      g.closePath(); solid();
+      break;
+    case 'bolt':
+      poly([[0.25, -1.15], [-0.62, 0.12], [-0.05, 0.12], [-0.3, 1.15], [0.66, -0.18], [0.08, -0.18]]); solid();
+      break;
+    case 'cloud': {
+      // Stroke every puff, then cover the inside so only the outer outline shows
+      const puffs = [[-0.5, 0.2, 0.46], [0.05, -0.16, 0.6], [0.58, 0.22, 0.42]];
+      const path = () => {
+        g.beginPath();
+        for (const [x, y, r] of puffs) { g.moveTo(R * (x + r), R * y); g.arc(R * x, R * y, R * r, 0, TAU); }
+        g.rect(-R * 0.5, R * 0.2, R * 1.08, R * 0.44);
+      };
+      path(); neon(3.2);
+      path(); g.fillStyle = '#161e44'; g.fill(); g.fillStyle = hexA(col, 0.28); g.fill();
+      break;
+    }
+    case 'peaks':
+      poly([[-1.1, 0.75], [-0.3, -0.9], [0.18, -0.08], [0.5, -0.45], [1.1, 0.75]]); solid();
+      g.beginPath(); g.moveTo(-R * 0.62, -R * 0.24); g.lineTo(-R * 0.45, -R * 0.36); g.lineTo(-R * 0.3, -R * 0.2); g.lineTo(-R * 0.12, -R * 0.36);
+      neon(1.3);
+      break;
+    case 'snow':
+      for (let i = 0; i < 6; i++) {
+        const a = i * Math.PI / 3 - Math.PI / 2, c = Math.cos(a), s = Math.sin(a);
+        g.moveTo(0, 0); g.lineTo(c * R * 1.1, s * R * 1.1);
+        const px = c * R * 0.62, py = s * R * 0.62;
+        for (const da of [-0.75, 0.75]) { g.moveTo(px, py); g.lineTo(px + Math.cos(a + da) * R * 0.36, py + Math.sin(a + da) * R * 0.36); }
+      }
+      neon(1.9);
+      break;
+    case 'spiral': {
+      const turns = 2.4 * TAU;
+      for (let a = 0; a <= turns + 0.001; a += 0.15) {
+        const r = R * (0.1 + 1.0 * a / turns), x = Math.cos(a - 1.2) * r, y = Math.sin(a - 1.2) * r;
+        if (a) g.lineTo(x, y); else g.moveTo(x, y);
+      }
+      neon(2.3);
+      break;
+    }
+    case 'bell':
+      g.moveTo(-R * 0.98, R * 0.6);
+      g.bezierCurveTo(-R * 0.62, R * 0.35, -R * 0.8, -R * 0.92, 0, -R * 0.92);
+      g.bezierCurveTo(R * 0.8, -R * 0.92, R * 0.62, R * 0.35, R * 0.98, R * 0.6);
+      g.closePath(); solid();
+      dot(0, R * 0.86, R * 0.2);
+      g.beginPath(); g.moveTo(0, -R * 0.94); g.lineTo(0, -R * 1.16); neon(1.8);
+      break;
+    case 'fish':
+      g.ellipse(-R * 0.2, 0, R * 0.78, R * 0.52, 0, 0, TAU);
+      g.moveTo(R * 0.46, 0); g.lineTo(R * 1.08, -R * 0.52); g.lineTo(R * 1.08, R * 0.52); g.closePath();
+      solid();
+      dot(-R * 0.58, -R * 0.1, R * 0.12, '#ffffff');
+      break;
+    case 'pine':
+      poly([[0, -1.2], [0.5, -0.45], [0.27, -0.45], [0.76, 0.25], [0.45, 0.25], [0.98, 0.84],
+        [-0.98, 0.84], [-0.45, 0.25], [-0.76, 0.25], [-0.27, -0.45], [-0.5, -0.45]]);
+      solid();
+      g.beginPath(); g.moveTo(0, R * 0.9); g.lineTo(0, R * 1.2); neon(2.4);
+      break;
+    case 'note':
+      g.ellipse(-R * 0.36, R * 0.64, R * 0.44, R * 0.31, -0.45, 0, TAU);
+      g.fillStyle = hexA(col, 0.7); g.fill(); neon(1.8);
+      g.beginPath(); g.moveTo(R * 0.06, R * 0.56); g.lineTo(R * 0.06, -R * 1.08);
+      g.bezierCurveTo(R * 0.24, -R * 0.66, R * 0.9, -R * 0.66, R * 0.74, -R * 0.1);
+      neon(2.2);
+      break;
+    case 'shell':
+      g.moveTo(0, R * 0.95);
+      g.lineTo(-R * 0.98, -R * 0.12);
+      g.arc(0, -R * 0.12, R * 0.98, Math.PI, TAU, false);
+      g.closePath(); solid();
+      g.beginPath();
+      for (let k = 1; k < 5; k++) {
+        const a = Math.PI + k * Math.PI / 5;
+        g.moveTo(0, R * 0.95); g.lineTo(Math.cos(a) * R * 0.9, -R * 0.12 + Math.sin(a) * R * 0.9);
+      }
+      neon(1.1);
+      break;
+    case 'crown':
+      poly([[-0.95, 0.7], [-1.05, -0.55], [-0.5, -0.02], [0, -0.95], [0.5, -0.02], [1.05, -0.55], [0.95, 0.7]]); solid();
+      for (const [x, y] of [[-1.05, -0.55], [0, -0.95], [1.05, -0.55]]) dot(x * R, y * R - 2, R * 0.14);
+      break;
+    case 'orbit':
+      g.arc(0, 0, R * 0.55, 0, TAU); solid();
+      g.beginPath(); g.ellipse(0, 0, R * 1.18, R * 0.36, -0.38, 0, TAU); neon(1.7);
+      break;
+  }
+  g.globalAlpha = 1;
+}
+
+// Tile face: dark navy with a soft colour wash, a pale rim and the glyph
+function makeFace(k) {
+  const { c, g } = layer(SW, SH), col = KINDS[k].color;
+  g.translate(PAD, PAD);
+  rr(g, 0, 0, TW, TH, 7);
+  const grad = g.createLinearGradient(0, 0, 0, TH);
+  grad.addColorStop(0, '#1d2652'); grad.addColorStop(1, '#0f1533');
+  g.fillStyle = grad; g.fill();
+  const halo = g.createRadialGradient(TW / 2, TH / 2, 2, TW / 2, TH / 2, TW * 0.62);
+  halo.addColorStop(0, hexA(col, 0.15)); halo.addColorStop(1, hexA(col, 0));
+  g.fillStyle = halo; g.fill();
+  rr(g, 3, 3, TW - 6, TH * 0.32, 5); g.fillStyle = 'rgba(255,255,255,0.045)'; g.fill();
+  rr(g, 0.75, 0.75, TW - 1.5, TH - 1.5, 6.5); g.strokeStyle = 'rgba(190,206,255,0.45)'; g.lineWidth = 1.5; g.stroke();
+  g.save(); g.translate(TW / 2, TH / 2); glyph(g, KINDS[k].shape, GLYPH_R, col); g.restore();
+  return c;
+}
+// The tile's edge (a slab under the face). Higher layers get a slightly lighter edge.
+const EDGE = ['#1a2248', '#242e5e', '#2f3a72', '#3a4687'];
+function makeSlab(z) {
+  const { c, g } = layer(SW, SH);
+  g.translate(PAD, PAD);
+  for (let s = 1; s <= 6; s++) { rr(g, (LX * s) / 6, (LY * s) / 6, TW, TH, 7); g.fillStyle = EDGE[z]; g.fill(); }
+  rr(g, LX, LY, TW, TH, 7);
+  g.strokeStyle = hexA('#9fb6ff', 0.22 + z * 0.08); g.lineWidth = 1.2; g.stroke();
+  rr(g, 0, 0, TW, TH, 7); g.fillStyle = '#0d1230'; g.fill();   // under the face, in case a face is drawn faded
+  return c;
+}
+function makeShadow() {
+  const { c, g } = layer(SW, SH);
+  g.translate(PAD, PAD);
+  rr(g, LX + 1, LY + 2, TW + 4, TH + 4, 9); g.fillStyle = 'rgba(0,0,0,0.16)'; g.fill();
+  rr(g, LX + 2, LY + 3, TW, TH, 8); g.fillStyle = 'rgba(0,0,0,0.3)'; g.fill();
+  return c;
+}
+function makeDim() {
+  const { c, g } = layer(SW, SH);
+  g.translate(PAD, PAD);
+  rr(g, 0, 0, TW, TH, 7); g.fillStyle = 'rgba(4,6,18,0.52)'; g.fill();
+  return c;
+}
+function drawDot(col) {
+  const { c, g } = layer(24, 24);
+  const rg = g.createRadialGradient(12, 12, 0, 12, 12, 12);
+  rg.addColorStop(0, 'rgba(255,255,255,0.95)'); rg.addColorStop(0.25, hexA(col, 0.85)); rg.addColorStop(1, hexA(col, 0));
+  g.fillStyle = rg; g.fillRect(0, 0, 24, 24);
+  return c;
+}
+
+function buildArt() {
+  // Background: deep blue gradient with a few soft colour clouds
+  const L = layer(W, H), g = L.g;
+  const grad = g.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#05070f'); grad.addColorStop(1, '#0a0d1c');
+  g.fillStyle = grad; g.fillRect(0, 0, W, H);
+  for (const [x, y, r, col, a] of [[150, 120, 300, '#ff4f8a', 0.07], [820, 430, 320, '#a64dff', 0.08], [860, 80, 220, '#20c0d0', 0.05], [90, 470, 240, '#3a5cff', 0.07]]) {
+    const rg = g.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, hexA(col, a)); rg.addColorStop(1, hexA(col, 0));
+    g.fillStyle = rg; g.fillRect(0, 0, W, H);
+  }
+  bgCanvas = L.c;
+  boardCache = layer(W, H);
+  boardDirty = true;
+  faceSprites = KINDS.map((_, k) => makeFace(k));
+  slabSprites = EDGE.map((_, z) => makeSlab(z));
+  shadowSprite = makeShadow();
+  dimSprite = makeDim();
+  dotSprites = [...KINDS.map(m => m.color), '#ffffff'].map(drawDot);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Soft sine bells only.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.3;
+        this.master.connect(this.ctx.destination);
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A note with a soft attack and a gentle fade (no clicks)
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.012) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0, dur = 0.5) {
+    this.tone(f, f, dur, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, dur * 0.45, 'sine', vol * 0.22, delay);
+  },
+  match(step) { // a soft chime that climbs gently as the board clears
+    if (!this.ok('match', 0.05)) return;
+    const f = NOTES[clamp(step, 0, NOTES.length - 1)];
+    this.bell(f, 0.1, 0, 0.7);
+    this.bell(f * 1.5, 0.035, 0.07, 0.55);
+    this.tone(f / 2, f / 2, 0.35, 'triangle', 0.03);
+  },
+  sparkle() { if (this.ok('sparkle', 0.06)) { const f = NOTES[(Math.random() * NOTES.length) | 0] * 2; this.tone(f, f, 0.25, 'sine', 0.02); } },
+  grab()    { if (this.ok('grab', 0.04)) this.tone(660, 740, 0.09, 'sine', 0.04); },
+  drop()    { if (this.ok('grab', 0.04)) this.tone(600, 520, 0.09, 'sine', 0.035); },
+  nope()    { if (this.ok('nope', 0.1)) { this.tone(392, 392, 0.14, 'sine', 0.04, 0.02); this.tone(330, 330, 0.2, 'sine', 0.035, 0.12); } },
+  bump()    { if (this.ok('bump', 0.08)) this.tone(300, 280, 0.09, 'sine', 0.03); },
+  hint()    { if (this.ok('hint', 0.2)) { this.bell(1318.51, 0.04, 0, 0.5); this.bell(1567.98, 0.03, 0.1, 0.6); } },
+  undo()    { if (this.ok('undo', 0.06)) this.tone(700, 470, 0.2, 'sine', 0.045); },
+  shuffle() { if (this.ok('shuffle', 0.3)) { this.tone(330, 660, 0.5, 'sine', 0.04); this.tone(660, 440, 0.5, 'sine', 0.03, 0.45); } },
+  finish()  { if (this.ok()) [261.63, 329.63, 392, 493.88, 523.25, 659.25].forEach((f, i) => this.bell(f, 0.06, i * 0.12, 1.6)); },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(880, 880, 0.05, 'sine', 0.03); },
+  select()  { if (this.ok()) { this.tone(660, 660, 0.09, 'sine', 0.05); this.tone(990, 990, 0.13, 'sine', 0.045, 0.06); } },
+  blip()    { if (this.ok()) this.tone(600, 600, 0.08, 'sine', 0.04); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.3;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  // One pointer (mouse, pen or finger) in world coordinates
+  mouse: { x: W / 2, y: H / 2, clicked: false, released: false, moved: false, down: false, id: null, type: 'mouse' },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',     // 'kb', 'pad', 'mouse' or 'touch': whatever was used last
+  ls: { x: 0, y: 0, m: 0 },
+  act: false, pause: false, mute: false, select: false, back: false, hint: false, undo: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.mouse.id = null; });
+    canvas.addEventListener('pointerdown', e => {
+      const m = this.mouse;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (m.down && m.id !== e.pointerId) return; // ignore a second finger
+      e.preventDefault();
+      this.toWorld(e);
+      m.down = true; m.id = e.pointerId; m.clicked = true; m.moved = true;
+      m.type = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      this.device = m.type;
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const m = this.mouse;
+      if (m.down && m.id !== e.pointerId) return;
+      this.toWorld(e); m.moved = true;
+      if (e.pointerType === 'mouse' && this.device !== 'mouse' && !this.pad) this.device = 'mouse';
+    });
+    const up = e => {
+      const m = this.mouse;
+      if (!m.down || m.id !== e.pointerId) return;
+      this.toWorld(e);
+      m.down = false; m.id = null; m.released = true;
+      Sfx.init(); // touch only unlocks audio on release
+    };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  // Map a pointer event to the 960x540 world
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, K = this.navKeys;
+    let act = P.has('Space') || P.has('Enter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let hint = P.has('KeyH');
+    let undo = P.has('KeyU') || P.has('KeyZ');
+    let up = K.has('ArrowUp') || K.has('KeyW'), down = K.has('ArrowDown') || K.has('KeyS');
+    let left = K.has('ArrowLeft') || K.has('KeyA'), right = K.has('ArrowRight') || K.has('KeyD');
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      const fresh = !prev.length;
+      if (fresh) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(0)) act = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      if (tap(3)) hint = true;
+      if (tap(4)) undo = true;
+      // D-pad or left stick as a cursor: one step per push, auto-repeat when held.
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      let dir = 0;
+      if (on(12)) dir = 1; else if (on(13)) dir = 2; else if (on(14)) dir = 3; else if (on(15)) dir = 4;
+      else if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (fresh) { this.stickDir = dir; this.stickHold = 0; }
+      else if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.act = act; this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.hint = hint; this.undo = undo;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.released = false; this.mouse.moved = false;
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', y: '△', lb: 'L1', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', y: 'Y', lb: 'LB', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let layoutIdx = Math.max(0, LAYOUTS.findIndex(l => l.id === load('neonMahjong.layout', 'terrace')));
+let dimBlocked = load('neonMahjong.dim', '1') === '1';
+const wins = {};
+for (const l of LAYOUTS) wins[l.id] = Number(load('neonMahjong.wins.' + l.id, 0)) || 0;
+Sfx.muted = load('neonMahjong.muted', '0') === '1';
+const toast = { text: '', t: 0 };
+let resultInfo = null;
+
+let LAY = LAYOUTS[layoutIdx];                 // the layout being played
+let tiles = new Int8Array(LAY.n).fill(-1);    // kind at each position, -1 once cleared
+let freeArr = new Uint8Array(LAY.n);          // 1 where the tile is free
+
+function showToast(text) { toast.text = text; toast.t = 2.4; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { clearFx(); setState('title'); }
+function toggleSound() {
+  Sfx.toggle();
+  save('neonMahjong.muted', Sfx.muted ? 1 : 0);
+  showToast(Sfx.muted ? 'Sound off' : 'Sound on');
+}
+function cycleLayout(d) {
+  layoutIdx = (layoutIdx + d + LAYOUTS.length) % LAYOUTS.length;
+  save('neonMahjong.layout', LAYOUTS[layoutIdx].id);
+}
+function toggleDim() {
+  dimBlocked = !dimBlocked;
+  save('neonMahjong.dim', dimBlocked ? 1 : 0);
+  boardDirty = true;
+}
+const totalWins = () => LAYOUTS.reduce((s, l) => s + wins[l.id], 0);
+
+// ============================================================
+// 3. Play: picking, matching, hints, undo, shuffle
+// ============================================================
+const G = {
+  phase: 'intro', phaseT: 0, sel: -1, cursor: -1, hint: null, hintT: 0, plan: null,
+  undo: [], matched: 0, shuffles: 0, hints: 0, undos: 0,
+  left: 0, pairs: [], openKinds: 0, flash: -1, flashT: 0, blockedTips: 0,
+  banner: '', bannerSub: '', bannerColor: '#fff', bannerT: 0, bannerMax: 1,
+  boardAlpha: 1, doneT: 0,
+};
+
+function startGame() {
+  Sfx.init();
+  clearFx();
+  LAY = LAYOUTS[layoutIdx];
+  const d = deal(LAY);
+  tiles = d.tiles;
+  freeArr = new Uint8Array(LAY.n);
+  Object.assign(G, {
+    plan: d.plan,
+    phase: 'intro', phaseT: 0, sel: -1, cursor: -1, hint: null, hintT: 0,
+    undo: [], matched: 0, shuffles: 0, hints: 0, undos: 0,
+    flash: -1, flashT: 0, bannerT: 0, boardAlpha: 1, doneT: 0,
+  });
+  refresh();
+  G.cursor = nearestFree(BOARD_CX, BOARD_CY);
+  setState('play');
+}
+
+function banner(title, sub, color, t = 2.4) {
+  G.banner = title; G.bannerSub = sub; G.bannerColor = color; G.bannerT = G.bannerMax = t;
+}
+
+// Recompute which tiles are free and which pairs are open, after any change to the board
+function refresh() {
+  let left = 0;
+  for (let i = 0; i < LAY.n; i++) { freeArr[i] = isFree(LAY, tiles, i) ? 1 : 0; if (tiles[i] >= 0) left++; }
+  G.left = left;
+  G.pairs = freePairs(LAY, tiles);
+  const kinds = new Set();
+  for (const [a] of G.pairs) kinds.add(tiles[a]);
+  G.openKinds = kinds.size;
+  if (G.sel >= 0 && !freeArr[G.sel]) G.sel = -1;
+  if (G.cursor < 0 || !freeArr[G.cursor]) {
+    G.cursor = G.cursor >= 0 ? nearestFree(LAY.cx[G.cursor], LAY.cy[G.cursor]) : nearestFree(BOARD_CX, BOARD_CY);
+  }
+  boardDirty = true;
+}
+
+function nearestFree(x, y) {
+  let best = -1, bd = Infinity;
+  for (let i = 0; i < LAY.n; i++) {
+    if (!freeArr[i]) continue;
+    const d = Math.hypot(LAY.cx[i] - x, LAY.cy[i] - y);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+// Cursor moves: jump to the nearest free tile in that direction, favouring ones in line
+const DIRS = [[0, -1], [0, 1], [-1, 0], [1, 0]]; // up, down, left, right
+function navTarget(from, d) {
+  const [dx, dy] = DIRS[d], fx = LAY.cx[from], fy = LAY.cy[from];
+  let best = -1, bestS = Infinity;
+  for (let i = 0; i < LAY.n; i++) {
+    if (i === from || !freeArr[i]) continue;
+    const vx = LAY.cx[i] - fx, vy = LAY.cy[i] - fy;
+    const along = vx * dx + vy * dy;
+    if (along < 8) continue;
+    const s = along + Math.abs(vx * dy - vy * dx) * 2.2;
+    if (s < bestS) { bestS = s; best = i; }
+  }
+  return best;
+}
+
+// Topmost tile under a point (faces first, then the edges), or -1
+function tileAt(x, y) {
+  for (let z = LAY.maxZ; z >= 0; z--) {
+    const ids = LAY.byLayer[z];
+    for (let pass = 0; pass < 2; pass++) {
+      for (let j = ids.length - 1; j >= 0; j--) {
+        const i = ids[j];
+        if (tiles[i] < 0) continue;
+        const sx = LAY.sx[i], sy = LAY.sy[i];
+        if (pass === 0 ? x >= sx && x <= sx + TW && y >= sy && y <= sy + TH
+          : x >= sx && x <= sx + TW + LX && y >= sy && y <= sy + TH + LY) return i;
+      }
+    }
+  }
+  return -1;
+}
+// For taps: the tile under the finger, or a free tile very close by (generous targets)
+function pickAt(x, y) {
+  const i = tileAt(x, y);
+  if (i >= 0) return i;
+  let best = -1, bd = 34;
+  for (let j = 0; j < LAY.n; j++) {
+    if (!freeArr[j]) continue;
+    const dx = Math.max(LAY.sx[j] - x, 0, x - (LAY.sx[j] + TW)), dy = Math.max(LAY.sy[j] - y, 0, y - (LAY.sy[j] + TH));
+    const d = Math.hypot(dx, dy);
+    if (d < bd && d <= 14) { bd = d; best = j; }
+  }
+  return best;
+}
+
+function pushUndo() { G.undo.push({ tiles: Int8Array.from(tiles), matched: G.matched, plan: G.plan }); }
+
+function pick(i) {
+  if (i < 0 || G.phase !== 'idle') return;
+  if (!freeArr[i]) {
+    G.flash = i; G.flashT = 0.5;
+    Sfx.nope();
+    if (G.blockedTips < 3) { G.blockedTips++; showToast('That tile is blocked: free tiles have nothing on top and an open side'); }
+    return;
+  }
+  G.cursor = i;
+  if (G.sel === i) { G.sel = -1; Sfx.drop(); return; }
+  if (G.sel >= 0 && tiles[G.sel] === tiles[i]) { matchPair(G.sel, i); return; }
+  G.sel = i; Sfx.grab();
+}
+
+function matchPair(a, b) {
+  pushUndo();
+  const ka = tiles[a];
+  spawnGlider(a, b, ka); spawnGlider(b, a, ka);
+  tiles[a] = tiles[b] = -1;
+  G.plan = updatePlan(LAY, tiles, G.plan, a, b);   // keep a known way to clear the board, when we can
+  G.matched++;
+  G.sel = -1; G.hint = null;
+  const cx = G.cursor;
+  refresh();
+  if (cx === a || cx === b) G.cursor = nearestFree(LAY.cx[cx], LAY.cy[cx]);
+  Sfx.match(Math.floor((G.matched / (LAY.n / 2)) * NOTES.length));
+  if (G.left === 0) { G.phase = 'done'; G.doneT = 0; }
+  else if (!G.pairs.length) {
+    G.phase = 'stuck'; G.phaseT = 0;
+    banner('No pairs left', 'Shuffling the tiles gently…', CFG.color.sky, CFG.stuckWait + CFG.shuffle);
+  }
+}
+
+function doHint() {
+  if (G.phase === 'stuck' || (G.phase === 'idle' && !G.pairs.length)) { startShuffle(); return; }
+  if (G.phase !== 'idle') return;
+  // Prefer a pair from a known way to clear the board; look for one if we don't have it
+  if (!planWorks(LAY, tiles, G.plan)) G.plan = findPath(LAY, tiles, CFG.hintTries);
+  let pair = G.plan && G.plan.length ? G.plan[0] : null;
+  if (!pair) { // none found: pick the open pair that uncovers the most tiles
+    let bestN = -1;
+    for (const p of G.pairs) {
+      const t = Int8Array.from(tiles); t[p[0]] = t[p[1]] = -1;
+      let n = 0;
+      for (let i = 0; i < LAY.n; i++) if (isFree(LAY, t, i)) n++;
+      if (n > bestN) { bestN = n; pair = p; }
+    }
+  }
+  G.hint = pair; G.hintT = CFG.hintTime; G.hints++;
+  if (Input.device === 'kb' || Input.device === 'pad') G.cursor = pair[0];
+  Sfx.hint();
+}
+
+function doUndo() {
+  if (G.phase !== 'idle' && G.phase !== 'stuck') return;
+  if (!G.undo.length) { showToast('Nothing to undo yet'); Sfx.bump(); return; }
+  const snap = G.undo.pop(), before = Int8Array.from(tiles);
+  tiles.set(snap.tiles);
+  G.matched = snap.matched; G.plan = snap.plan; G.undos++;
+  G.sel = -1; G.hint = null; G.phase = 'idle'; G.bannerT = 0;
+  refresh();
+  let changed = 0;
+  for (let i = 0; i < LAY.n; i++) if (tiles[i] >= 0 && before[i] !== tiles[i]) changed++;
+  if (changed <= 4) {
+    for (let i = 0; i < LAY.n; i++) {
+      if (tiles[i] >= 0 && before[i] !== tiles[i]) ring(LAY.cx[i], LAY.cy[i], 10, 42, 0.45, KINDS[tiles[i]].color, 2);
+    }
+  }
+  Sfx.undo();
+  if (!G.pairs.length) showToast('No pairs here: undo again, or shuffle');
+}
+
+function startShuffle() {
+  if (G.left === 0 || (G.phase !== 'idle' && G.phase !== 'stuck')) return false;
+  G.phase = 'shuffleOut'; G.phaseT = 0;
+  G.sel = -1; G.hint = null;
+  Sfx.shuffle();
+  return true;
+}
+
+function finishWin() {
+  wins[LAY.id] = (wins[LAY.id] || 0) + 1;
+  save('neonMahjong.wins.' + LAY.id, wins[LAY.id]);
+  resultInfo = {
+    name: LAY.name, wins: wins[LAY.id], pairs: G.matched, shuffles: G.shuffles,
+    word: WIN_WORDS[(Math.random() * WIN_WORDS.length) | 0],
+  };
+  setState('win');
+  Sfx.finish();
+}
+
+function stepBoard(dt) {
+  G.phaseT += dt;
+  if (G.hintT > 0) { G.hintT -= dt; if (G.hintT <= 0) G.hint = null; }
+  if (G.flashT > 0) G.flashT = Math.max(0, G.flashT - dt);
+  switch (G.phase) {
+    case 'intro':
+      if (G.phaseT >= CFG.intro + LAY.maxZ * 0.18) { G.phase = 'idle'; G.phaseT = 0; boardDirty = true; }
+      break;
+    case 'stuck':
+      if (G.phaseT >= CFG.stuckWait) startShuffle();
+      break;
+    case 'shuffleOut':
+      G.boardAlpha = 1 - ease(Math.min(1, G.phaseT / CFG.shuffle));
+      if (G.phaseT >= CFG.shuffle) {
+        pushUndo();
+        const r = shuffleTiles(LAY, tiles);
+        tiles.set(r.tiles);
+        G.plan = r.plan;
+        G.shuffles++;
+        refresh();
+        G.phase = 'shuffleIn'; G.phaseT = 0;
+        banner('Shuffled', 'Every pair can be cleared now.', CFG.color.sky, 2);
+      }
+      break;
+    case 'shuffleIn':
+      G.boardAlpha = ease(Math.min(1, G.phaseT / CFG.shuffle));
+      if (G.phaseT >= CFG.shuffle) { G.boardAlpha = 1; G.phase = 'idle'; G.phaseT = 0; }
+      break;
+    case 'done':
+      G.doneT += dt;
+      if (G.doneT > 0.15 && G.doneT - dt <= 0.15) celebrate();
+      if (G.doneT > 1.3) finishWin();
+      break;
+  }
+}
+
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const HINT_BTN = { x: 20, y: 290, w: 128, h: 56 };
+const UNDO_BTN = { x: 20, y: 358, w: 128, h: 56 };
+
+function boardInput() {
+  const I = Input, m = I.mouse;
+  if (m.clicked) {
+    if (inRect(m, PAUSE_BTN)) { pauseGame(); return; }
+    if (inRect(m, SOUND_BTN)) { toggleSound(); return; }
+    if (inRect(m, HINT_BTN)) { doHint(); return; }
+    if (inRect(m, UNDO_BTN)) { doUndo(); return; }
+  }
+  if (I.undo) doUndo();
+  if (I.hint) doHint();
+  const d = I.navUp ? 0 : I.navDown ? 1 : I.navLeft ? 2 : I.navRight ? 3 : -1;
+  if (d >= 0 && G.left > 0) {
+    if (G.cursor < 0 || !freeArr[G.cursor]) { G.cursor = nearestFree(BOARD_CX, BOARD_CY); Sfx.tick(); }
+    else {
+      const t = navTarget(G.cursor, d);
+      if (t >= 0) { G.cursor = t; Sfx.tick(); } else Sfx.bump();
+    }
+  }
+  if (I.act && G.phase === 'idle') pick(G.cursor);
+  if (I.back && G.sel >= 0) { G.sel = -1; Sfx.drop(); }
+  if (m.clicked && G.phase === 'idle') {
+    const i = pickAt(m.x, m.y);
+    if (i >= 0) pick(i);
+    else if (G.sel >= 0) { G.sel = -1; Sfx.drop(); }
+  }
+}
+
+function updatePlay(dt) {
+  boardInput();
+  if (state !== 'play') return; // paused from the on-screen button
+  stepBoard(dt);
+  if (G.bannerT > 0) G.bannerT = Math.max(0, G.bannerT - dt);
+}
+
+// ============================================================
+// Effects
+// ============================================================
+const parts = new Pool(LOW_RES ? 140 : 320, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, ci: 0, size: 6 }));
+const rings = new Pool(40, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const gliders = new Pool(12, () => ({ k: 0, z: 0, x0: 0, y0: 0, mx: 0, my: 0, t: 0, lead: false }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 10 : 24); i++) {
+  motes.push({ x: Math.random() * W, y: Math.random() * H, vx: rand(-6, 6), vy: rand(-12, -4), s: rand(6, 16), ph: Math.random() * TAU, ci: i % KINDS.length });
+}
+
+function burst(x, y, ci, n, speed, life = 0.7, size = 7) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.ci = ci; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, life, color, w = 2) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.r0 = r0; o.r1 = r1; o.life = o.max = life; o.color = color; o.w = w;
+}
+// A matched tile rises, drifts toward its partner and fades with a sparkle
+function spawnGlider(i, other, k) {
+  const o = gliders.get();
+  if (!o) return;
+  o.k = k; o.z = LAY.pos[i].z; o.t = 0; o.lead = i < other;
+  o.x0 = LAY.sx[i]; o.y0 = LAY.sy[i];
+  o.mx = (LAY.sx[i] + LAY.sx[other]) / 2; o.my = Math.min(LAY.sy[i], LAY.sy[other]) - 26;
+}
+function celebrate() {
+  for (let i = 0; i < LAY.n; i += LOW_RES ? 6 : 3) burst(LAY.cx[i], LAY.cy[i], (i * 7) % KINDS.length, 3, 120, 1.1, 8);
+  ring(BOARD_CX, BOARD_CY, 20, 340, 1.4, CFG.color.title, 2.5);
+}
+function clearFx() { parts.clear(); rings.clear(); gliders.clear(); }
+
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag + 40 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    o.life -= dt;
+    if (o.life <= 0) o.active = false;
+  }
+  for (const o of gliders.items) {
+    if (!o.active) continue;
+    o.t += dt;
+    if (o.t >= CFG.glide) {
+      o.active = false;
+      const x = o.mx + TW / 2, y = o.my + TH / 2;
+      burst(x, y, o.k, LOW_RES ? 5 : 9, 110, 0.7, 7);
+      if (o.lead) { ring(x, y, 8, 46, 0.45, KINDS[o.k].color, 1.8); Sfx.sparkle(); }
+    }
+  }
+  for (const m of motes) {
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.y < -20) { m.y = H + 20; m.x = Math.random() * W; }
+    if (m.x < -20) m.x = W + 20; else if (m.x > W + 20) m.x = -20;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function soundItem() {
+  return { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes on or off.' };
+}
+function layoutHint(l) {
+  const w = wins[l.id];
+  return `${l.name}: ${l.blurb}. ${l.n} tiles on ${l.maxZ + 1} layers${w ? `, cleared ${plural(w, 'time')}` : ''}.`;
+}
+function titleItems() {
+  const l = LAYOUTS[layoutIdx];
+  return [
+    { id: 'play', label: 'Play', hint: `A fresh ${l.name} deal. Every deal can be cleared.` },
+    { id: 'layout', label: 'Layout', value: l.name, cycle: d => cycleLayout(d), hint: layoutHint(l) },
+    { id: 'dim', label: 'Dim blocked', value: dimBlocked ? 'On' : 'Off', cycle: () => toggleDim(), hint: 'Shades the tiles you can\'t pick yet.' },
+    soundItem(),
+    { id: 'howto', label: 'How to Play', hint: 'Controls, the rules and a few tips.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() {
+  return [{ id: 'resume', label: 'Resume' }, { id: 'shuffle', label: 'Shuffle' }, { id: 'new', label: 'New deal' }, { id: 'quit', label: 'Quit to menu' }];
+}
+function winItems() { return [{ id: 'again', label: 'Next deal' }, { id: 'menu', label: 'Main menu' }]; }
+
+function menuInput(items) {
+  const I = Input, m = I.mouse, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (m.moved || m.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(m, r) && menuSel !== i) { menuSel = i; if (!m.clicked) Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = m.clicked && r && inRect(m, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'play') startGame();
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 4; Sfx.blip(); }
+      break;
+    case 'play':
+      // Esc lets go of a picked tile first; a second Esc pauses
+      if (Input.pause && !(Input.back && G.sel >= 0)) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'shuffle') {
+        resumeGame();
+        if (!startShuffle()) showToast('Wait a moment, then try again');
+      } else if (id === 'new') startGame();
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'win':
+      if (stateT > 0.8) {
+        const id = menuInput(winItems());
+        if (id === 'again') startGame();
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) { rr(ctx, x, y, w, h, r); }
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawMotes() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.13 + 0.1 * Math.sin(time * 0.9 + m.ph);
+    ctx.drawImage(dotSprites[m.ci], m.x - m.s / 2, m.y - m.s / 2, m.s, m.s);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// Draws every tile, layer by layer: shadows, then edges, then faces (so neighbours hide the edges they touch).
+// `fade(i)` (optional) gives each tile an alpha for the intro.
+function drawTiles(g, fade) {
+  for (let z = 0; z <= LAY.maxZ; z++) {
+    const ids = LAY.byLayer[z];
+    for (let pass = z ? 0 : 1; pass < 3; pass++) {
+      for (const i of ids) {
+        const k = tiles[i];
+        if (k < 0) continue;
+        const x = LAY.sx[i];
+        let y = LAY.sy[i];
+        if (fade) {
+          const a = fade(i);
+          if (a <= 0) continue;
+          g.globalAlpha = a; y -= (1 - a) * 22;
+        }
+        const spr = pass === 0 ? shadowSprite : pass === 1 ? slabSprites[z] : faceSprites[k];
+        g.drawImage(spr, x - PAD, y - PAD, SW, SH);
+        if (pass === 2 && dimBlocked && !freeArr[i] && !fade) g.drawImage(dimSprite, x - PAD, y - PAD, SW, SH);
+      }
+    }
+  }
+  g.globalAlpha = 1;
+}
+function rebuildBoardCache() {
+  const g = boardCache.g;
+  g.clearRect(0, 0, W, H);
+  drawTiles(g, null);
+  boardDirty = false;
+}
+const introAlpha = i => {
+  const p = LAY.pos[i];
+  return easeOut(clamp((G.phaseT - p.z * 0.18 - (p.x + p.y) * 0.012) / 0.4, 0, 1));
+};
+
+function tileRect(i, pad, dx = 0) { rrPath(LAY.sx[i] - pad + dx, LAY.sy[i] - pad, TW + pad * 2, TH + pad * 2, 7 + pad); }
+
+function renderMarks() {
+  const dev = Input.device, keyish = dev === 'kb' || dev === 'pad', C = CFG.color;
+  const pulse = 0.5 + 0.5 * Math.sin(time * 3.2);
+  if (G.hint && G.phase === 'idle') { // a matching pair glows softly
+    const col = KINDS[tiles[G.hint[0]]] ? KINDS[tiles[G.hint[0]]].color : '#ffffff';
+    for (const i of G.hint) {
+      if (tiles[i] < 0) continue;
+      tileRect(i, 2); ctx.fillStyle = `rgba(255,255,255,${0.07 + 0.1 * pulse})`; ctx.fill();
+      ctx.globalAlpha = 0.55 + 0.45 * pulse; glowStroke(col, 2.4); ctx.globalAlpha = 1;
+    }
+  }
+  if (G.sel >= 0) {
+    tileRect(G.sel, 1.5); ctx.fillStyle = 'rgba(255,216,138,0.16)'; ctx.fill();
+    ctx.globalAlpha = 0.8 + 0.2 * Math.sin(time * 5); glowStroke(C.warn, 2.6); ctx.globalAlpha = 1;
+  }
+  if (dev === 'mouse' && !Input.mouse.down && G.phase === 'idle') {
+    const i = tileAt(Input.mouse.x, Input.mouse.y);
+    if (i >= 0 && freeArr[i] && i !== G.sel) { tileRect(i, 1.5); ctx.globalAlpha = 0.5; glowStroke('#ffffff', 1.4); ctx.globalAlpha = 1; }
+  }
+  if (keyish && G.cursor >= 0 && tiles[G.cursor] >= 0 && G.phase !== 'intro') {
+    tileRect(G.cursor, 5);
+    ctx.globalAlpha = 0.8 + 0.2 * Math.sin(time * 4); glowStroke('#ffffff', 2.8); ctx.globalAlpha = 1;
+  }
+  if (G.flash >= 0 && G.flashT > 0 && tiles[G.flash] >= 0) { // a blocked tile gives a tiny shake
+    const f = G.flashT / 0.5;
+    tileRect(G.flash, 1.5, Math.sin(time * 45) * 2.5 * f);
+    ctx.fillStyle = `rgba(4,6,18,${0.35 * f})`; ctx.fill();
+    ctx.globalAlpha = f; glowStroke(C.dim, 1.6); ctx.globalAlpha = 1;
+  }
+}
+
+function drawGliders() {
+  for (const o of gliders.items) {
+    if (!o.active) continue;
+    const p = clamp(o.t / CFG.glide, 0, 1), e = ease(p);
+    const x = o.x0 + (o.mx - o.x0) * e, y = o.y0 + (o.my - o.y0) * e - Math.sin(p * Math.PI) * 14;
+    const s = 1 + 0.1 * Math.sin(p * Math.PI) - 0.45 * p * p;
+    ctx.globalAlpha = 1 - clamp((p - 0.55) / 0.45, 0, 1);
+    const cx = x + TW / 2, cy = y + TH / 2, ox = (PAD + TW / 2) * s, oy = (PAD + TH / 2) * s;
+    ctx.drawImage(slabSprites[o.z], cx - ox, cy - oy, SW * s, SH * s);
+    ctx.drawImage(faceSprites[o.k], cx - ox, cy - oy, SW * s, SH * s);
+    if (p > 0.3) { // a soft white flash as the pair meets
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = clamp((p - 0.3) / 0.7, 0, 1) * 0.5;
+      const d = 70 * s;
+      ctx.drawImage(dotSprites[KINDS.length], cx - d / 2, cy - d / 2, d, d);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const p = 1 - o.life / o.max;
+    ctx.globalAlpha = (1 - p) * 0.85;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * easeOut(p), 0, TAU);
+    glowStroke(o.color, o.w);
+  }
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.ci], p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawButton(r, icon) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = hover ? hexA(CFG.color.title, 0.16) : 'rgba(20,26,52,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 1 : 0.55; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+// Big labelled buttons for Hint and Undo (touch players have no keys)
+function drawWideButton(r, label, sub, enabled, accent) {
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  ctx.globalAlpha = enabled ? 1 : 0.45;
+  rrPath(r.x, r.y, r.w, r.h, 16);
+  ctx.fillStyle = hover && enabled ? hexA(accent, 0.18) : 'rgba(16,22,48,0.75)'; ctx.fill();
+  ctx.globalAlpha *= hover ? 1 : 0.7; glowStroke(accent, 1.4);
+  ctx.globalAlpha = enabled ? 1 : 0.45;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text(label, r.x + r.w / 2, r.y + r.h / 2 - 8, `800 19px ${SANS}`, CFG.color.text);
+  text(sub, r.x + r.w / 2, r.y + r.h / 2 + 13, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.globalAlpha = 1;
+}
+
+function controlLines() {
+  const NN = padNames();
+  switch (Input.device) {
+    case 'pad': return ['D-pad: move', `${NN.a}: pick  ·  ${NN.b}: let go`, `${NN.y}: hint  ·  ${NN.lb}: undo`, `${NN.start}: pause`];
+    case 'mouse': return ['Click two matching', 'free tiles to clear them', 'Esc or ‖: pause'];
+    case 'touch': return ['Tap two matching', 'free tiles to clear them', '‖ button: pause'];
+    default: return ['Arrows: move', 'Space: pick', 'Esc: let go', 'H: hint  ·  U: undo', 'P: pause'];
+  }
+}
+
+function drawHUD() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const LXC = 84, RX = W - 84, C = CFG.color, NN = padNames(), keyish = Input.device === 'kb' || Input.device === 'pad';
+  // Left: layout, tiles left, open pairs, Hint and Undo
+  glowText(LAY.name.toUpperCase(), LXC, 62, `800 24px ${SANS}`, C.title);
+  text(`${LAY.maxZ + 1} layers  ·  no clock`, LXC, 88, `500 13px ${SANS}`, C.dim);
+  text('TILES LEFT', LXC, 132, `800 12px ${SANS}`, C.faint);
+  text(String(G.left), LXC, 162, `800 34px ${MONO}`, C.text);
+  text('OPEN PAIRS', LXC, 208, `800 12px ${SANS}`, C.faint);
+  text(String(G.openKinds), LXC, 236, `800 28px ${MONO}`, G.openKinds ? C.good : C.warn);
+  const stuck = G.left > 0 && !G.pairs.length;
+  const dev = usingPad() ? 'pad' : Input.device;
+  const hintKey = dev === 'pad' ? NN.y : dev === 'kb' ? 'H key' : dev === 'mouse' ? 'or press H' : stuck ? 'mix the tiles' : 'tap for a pair';
+  const undoKey = dev === 'pad' ? NN.lb : dev === 'kb' ? 'U key' : dev === 'mouse' ? 'or press U' : 'step back';
+  drawWideButton(HINT_BTN, stuck ? 'Shuffle' : 'Hint', hintKey,
+    G.phase === 'idle' || G.phase === 'stuck', stuck ? C.sky : C.good);
+  drawWideButton(UNDO_BTN, 'Undo', undoKey, G.undo.length > 0 && (G.phase === 'idle' || G.phase === 'stuck'), C.warn);
+  text(`${plural(G.matched, 'pair')} cleared`, LXC, 446, `500 13px ${SANS}`, C.dim);
+
+  // Right: buttons, the picked tile, controls
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  text('PICKED', RX, 116, `800 12px ${SANS}`, C.faint);
+  if (G.sel >= 0 && tiles[G.sel] >= 0) {
+    const s = 1.35, k = tiles[G.sel];
+    const x = RX - (TW / 2) * s - PAD * s, y = 182 - (TH / 2) * s - PAD * s;
+    ctx.drawImage(slabSprites[0], x, y, SW * s, SH * s);
+    ctx.drawImage(faceSprites[k], x, y, SW * s, SH * s);
+    text('find its twin', RX, 248, `500 13px ${SANS}`, C.dim);
+  } else {
+    rrPath(RX - (TW * 1.35) / 2, 182 - (TH * 1.35) / 2, TW * 1.35, TH * 1.35, 10);
+    ctx.setLineDash([5, 5]); ctx.strokeStyle = 'rgba(131,144,189,0.35)'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    text(keyish ? 'pick a free tile' : Input.device === 'mouse' ? 'click a free tile' : 'tap a free tile', RX, 248, `500 13px ${SANS}`, C.dim);
+  }
+  controlLines().forEach((s, i) => text(s, RX, 410 + i * 20, `500 13px ${SANS}`, i === 0 ? C.dim : C.faint));
+}
+
+function drawBanner() {
+  if (G.bannerT <= 0) return;
+  const a = Math.min(1, G.bannerT * 2, (G.bannerMax - G.bannerT) * 5);
+  ctx.globalAlpha = a;
+  rrPath(W / 2 - 190, H / 2 - 46, 380, 92, 20);
+  ctx.fillStyle = 'rgba(6,9,22,0.88)'; ctx.fill();
+  glowStroke(G.bannerColor, 1.5);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(G.banner, W / 2, H / 2 - 12, `800 30px ${SANS}`, G.bannerColor);
+  text(G.bannerSub, W / 2, H / 2 + 22, `500 15px ${SANS}`, CFG.color.dim);
+  ctx.globalAlpha = 1;
+}
+
+function renderPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  if (G.phase === 'intro' && state === 'play') drawTiles(ctx, introAlpha);
+  else {
+    if (boardDirty) rebuildBoardCache();
+    ctx.globalAlpha = G.boardAlpha;
+    ctx.drawImage(boardCache.c, 0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+  if (state === 'play') renderMarks();
+  drawGliders();
+  drawFx();
+  drawHUD();
+  drawBanner();
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 340, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = hexA(CFG.color.title, 0.1); ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 50, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 16px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+// A small picture of a layout's shape (higher layers are brighter)
+function drawLayoutPreview(l, cx, cy, s) {
+  const b = l.bounds, ox = cx - ((b.x0 + b.x1) / 2) * s, oy = cy - ((b.y0 + b.y1) / 2) * s;
+  for (let i = 0; i < l.n; i++) {
+    const z = l.pos[i].z;
+    rrPath(ox + l.sx[i] * s, oy + l.sy[i] * s, TW * s - 1, TH * s - 1, 2.5);
+    ctx.fillStyle = EDGE[z]; ctx.fill();
+    ctx.strokeStyle = hexA(CFG.color.title, 0.35 + z * 0.17); ctx.lineWidth = 1; ctx.stroke();
+  }
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  // Big tiles drifting slowly behind the menu
+  for (let i = 0; i < 11; i++) {
+    const x = ((i * 131 + time * (8 + (i % 3) * 5)) % (W + 160)) - 80;
+    const y = 50 + ((i * 197) % 420) + Math.sin(time * 0.6 + i) * 14;
+    const s = 0.95 + (i % 3) * 0.2;
+    ctx.globalAlpha = 0.13 + (i % 3) * 0.05;
+    const k = (i * 5) % KINDS.length;
+    ctx.drawImage(slabSprites[0], x - (SW * s) / 2, y - (SH * s) / 2, SW * s, SH * s);
+    ctx.drawImage(faceSprites[k], x - (SW * s) / 2, y - (SH * s) / 2, SW * s, SH * s);
+  }
+  ctx.globalAlpha = 1;
+  const shade = ctx.createRadialGradient(W / 2, H / 2, 60, W / 2, H / 2, 400);
+  shade.addColorStop(0, 'rgba(5,7,15,0.85)'); shade.addColorStop(1, 'rgba(5,7,15,0)');
+  ctx.fillStyle = shade; ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON MAHJONG', W / 2, 76, `800 60px ${SANS}`, CFG.color.title);
+  text('a calm tile-pairing game', W / 2, 120, `500 16px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), y0 = 172, gap = 44;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], NN = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap + 4, `500 15px ${SANS}`, CFG.color.dim);
+  const side = it.value !== undefined ? '   ·   ← → change' : '';
+  const keys = Input.device === 'touch' ? 'Tap to choose'
+    : Input.device === 'mouse' ? 'Click to choose'
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${NN.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`;
+  text(keys, W / 2, y0 + items.length * gap + 30, `500 13px ${SANS}`, CFG.color.faint);
+
+  // The chosen layout's shape, beside the menu
+  const l = LAYOUTS[layoutIdx], pcx = 828, pcy = 290;
+  rrPath(pcx - 108, pcy - 84, 216, 186, 18);
+  ctx.fillStyle = 'rgba(8,11,26,0.72)'; ctx.fill();
+  ctx.globalAlpha = menuSel === 1 ? 0.9 : 0.4; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  drawLayoutPreview(l, pcx, pcy - 4, 0.3);
+  text(l.name.toUpperCase(), pcx, pcy - 64, `800 13px ${SANS}`, CFG.color.title);
+  text(`${l.n} tiles  ·  ${plural(wins[l.id], 'win')}`, pcx, pcy + 80, `600 13px ${SANS}`, CFG.color.dim);
+
+  const yb = H - 26, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`Boards cleared ${totalWins()}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) {
+    text(Input.device === 'touch' ? 'tap for sound' : 'click for sound', W - 24, 24, `500 12px ${SANS}`, CFG.color.faint);
+  }
+}
+
+// A small round mark: a tick for a free tile, a dash for a blocked one
+function badge(x, y, ok) {
+  ctx.beginPath(); ctx.arc(x, y, 9, 0, TAU);
+  ctx.fillStyle = ok ? CFG.color.good : '#3a4266'; ctx.fill();
+  ctx.strokeStyle = ok ? '#05301e' : CFG.color.text; ctx.lineWidth = 2.2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  if (ok) { ctx.moveTo(x - 4, y); ctx.lineTo(x - 1, y + 3.5); ctx.lineTo(x + 4.5, y - 3.5); }
+  else { ctx.moveTo(x - 4, y); ctx.lineTo(x + 4, y); }
+  ctx.stroke(); ctx.lineCap = 'butt';
+}
+// Draws one tile (edge + face) at a given top-left, scaled
+function drawTileAt(k, x, y, s, z = 0, dim = false) {
+  ctx.drawImage(slabSprites[z], x - PAD * s, y - PAD * s, SW * s, SH * s);
+  ctx.drawImage(faceSprites[k], x - PAD * s, y - PAD * s, SW * s, SH * s);
+  if (dim) ctx.drawImage(dimSprite, x - PAD * s, y - PAD * s, SW * s, SH * s);
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  drawMotes();
+  overlay(0.45);
+  const NN = padNames(), C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 38, `800 30px ${SANS}`, C.title);
+  const rows = [
+    ['Move the cursor', 'D-pad / left stick', 'Arrows / W A S D', '–'],
+    ['Pick a tile', NN.a, 'Space or Enter', 'Click or tap it'],
+    ['Let go of it', NN.b, 'Esc', 'Tap it again'],
+    ['Hint', NN.y, 'H', 'Hint button'],
+    ['Undo', NN.lb, 'U or Z', 'Undo button'],
+    ['Pause', NN.start, 'Esc or P', '‖ button, top right'],
+    ['Sound on / off', NN.select, 'M', 'Speaker button'],
+  ];
+  const cx = [232, 252, 442, 622];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', cx[1], 76, `800 12px ${SANS}`, C.faint);
+  text('KEYBOARD', cx[2], 76, `800 12px ${SANS}`, C.faint);
+  text('MOUSE / TOUCH', cx[3], 76, `800 12px ${SANS}`, C.faint);
+  rows.forEach((r, i) => {
+    const y = 100 + i * 23;
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 15px ${SANS}`, C.dim);
+    ctx.textAlign = 'left';
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 15px ${SANS}`, C.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(60, 268, W - 120, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 290, `800 12px ${SANS}`, C.faint);
+    lines.forEach(([s, c], i) => text(s, x, 316 + i * 23, `500 15px ${SANS}`, c || C.text));
+  };
+  ctx.textAlign = 'left';
+  col('THE RULES', 60, [
+    ['Clear the board in pairs.'],
+    ['Pick two free tiles that match:'],
+    ['same shape, same colour.'],
+    ['A tile is free when nothing'],
+    ['lies on it and its left or'],
+    ['right side is open.'],
+  ]);
+  // A small picture: a row of three, and a tile resting on another (a tick marks the free ones)
+  text('FREE OR BLOCKED', 376, 290, `800 12px ${SANS}`, C.faint);
+  const s = 0.9, tw = TW * s, th = TH * s, y = 322, rx = 384, sx = 560;
+  drawTileAt(2, rx, y, s);
+  drawTileAt(9, rx + tw, y, s, 0, true);
+  drawTileAt(2, rx + tw * 2, y, s);
+  drawTileAt(14, sx, y + 4, s, 0, true);
+  drawTileAt(7, sx - LX, y + 4 - LY, s, 1);
+  badge(rx + tw - 4, y + 2, true); badge(rx + tw * 2 - 4, y + 2, false); badge(rx + tw * 3 - 4, y + 2, true);
+  badge(sx - LX + tw - 4, y - LY + 6, true); badge(sx + tw + 2, y + th - 6, false);
+  ctx.textAlign = 'center';
+  text('ends: free', rx + tw * 1.5, y + th + 24, `600 14px ${SANS}`, C.good);
+  text('middle: blocked', rx + tw * 1.5, y + th + 44, `600 14px ${SANS}`, C.dim);
+  text('top: free', sx + tw / 2, y + th + 24, `600 14px ${SANS}`, C.good);
+  text('under: waits', sx + tw / 2, y + th + 44, `600 14px ${SANS}`, C.dim);
+  ctx.textAlign = 'left';
+  col('TIPS', 676, [
+    ['Hint glows a pair that keeps'],
+    ['the board clearable.'],
+    ['Undo as often as you like.'],
+    ['No pairs left? The tiles'],
+    ['shuffle themselves gently.'],
+    ['Every deal can be cleared.', C.good],
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${NN.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 24, `600 14px ${SANS}`, C.dim);
+}
+
+// A calm card behind a menu so it never competes with the board
+function card(x, y, w, h) {
+  rrPath(x, y, w, h, 24);
+  ctx.fillStyle = 'rgba(7,10,24,0.94)'; ctx.fill();
+  const a = ctx.globalAlpha;
+  ctx.globalAlpha = a * 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = a;
+}
+
+function drawPause() {
+  overlay(0.5);
+  card(W / 2 - 240, 70, 480, 400);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 132, `800 46px ${SANS}`, CFG.color.text);
+  text('Take your time.', W / 2, 176, `500 15px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 238, true, 50);
+  const NN = padNames();
+  text(usingPad() ? `${NN.start}: resume   ·   ${NN.select}: sound` : Input.device === 'touch' ? 'Tap an option' : 'Esc: resume   ·   M: sound',
+    W / 2, 440, `500 13px ${SANS}`, CFG.color.faint);
+}
+
+function drawWin() {
+  overlay(Math.min(0.55, stateT * 1.5));
+  const r = resultInfo, C = CFG.color;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  card(W / 2 - 240, 70, 480, 400);
+  glowText('Board cleared', W / 2, 128, `800 46px ${SANS}`, C.title);
+  text(r.word, W / 2, 174, `500 17px ${SANS}`, C.text);
+  text(`${r.name}  ·  cleared ${r.wins === 1 ? 'for the first time' : plural(r.wins, 'time')}`, W / 2, 218, `600 16px ${SANS}`, C.dim);
+  text(`${plural(r.pairs, 'pair')} matched${r.shuffles ? `  ·  ${plural(r.shuffles, 'shuffle')}` : ''}`, W / 2, 248, `500 15px ${SANS}`, C.faint);
+  drawMenu(winItems(), 328, stateT > 0.8);
+  text(usingPad() ? `${padNames().a}: choose` : Input.device === 'touch' ? 'Tap an option' : 'Enter or click: choose', W / 2, 440, `500 13px ${SANS}`, C.faint);
+  ctx.globalAlpha = 1;
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `600 15px ${SANS}`;
+  const y = state === 'play' ? H - 20 : H - 52, w = ctx.measureText(toast.text).width + 32;
+  rrPath(W / 2 - w / 2, y - 14, w, 28, 14);
+  ctx.fillStyle = 'rgba(10,14,32,0.92)'; ctx.fill();
+  text(toast.text, W / 2, y, `600 15px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'win') drawWin();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>
