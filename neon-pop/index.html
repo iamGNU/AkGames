@@ -1,0 +1,1300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Pop</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #05070f; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block; touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  // Sheet mode: a 12 x 7 sheet of bubble wrap (odd rows shifted half a bubble, like the real thing)
+  sheet: { cols: 12, rows: 7, gap: 68, r: 30, cy: 290, doneWait: 1.0, slide: 1.3 },
+  // Drift mode: bubbles float up forever. Nothing happens if they float away.
+  drift: { max: 22, every: [0.42, 0.8], rise: [34, 62], r: [17, 44], bigEvery: [14, 24], bigR: 62, split: 6 },
+  cursor: { speed: 560, snap: 22, reach: 12 },   // controller/keyboard cursor: px/s, snap rate, pop reach
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', good: '#5dff9e', warn: '#ffd27a', title: '#8fe9ff',
+  },
+};
+
+// Bubble colour themes. Each fresh sheet takes the next colour; Rainbow colours each row.
+const THEME_IDS = ['rainbow', 'ocean', 'candy', 'mint', 'sunset'];
+const THEMES = {
+  rainbow: { label: 'Rainbow', rows: true, cols: ['#6fd8ff', '#7dffb4', '#ffe08a', '#ffb38a', '#ff9ad5', '#b9a2ff'] },
+  ocean:   { label: 'Ocean', cols: ['#5fd3ff', '#7fa8ff', '#62f0d8', '#a6ccff'] },
+  candy:   { label: 'Candy', cols: ['#ff9ad5', '#c7a2ff', '#ffa8b8', '#e9a6ff'] },
+  mint:    { label: 'Mint', cols: ['#7dffb4', '#62f0d8', '#c2ff8f', '#8fffe6'] },
+  sunset:  { label: 'Sunset', cols: ['#ffb38a', '#ffe08a', '#ff9aa8', '#ffc9a0'] },
+};
+const SOUND_IDS = ['soft', 'crisp', 'off'];
+const SOUND_LABEL = { soft: 'Soft', crisp: 'Crisp', off: 'Off' };
+const PAUSE_BTN = { x: W - 56, y: 10, w: 44, h: 44 };   // on-screen pause button for touch
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const dist = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+const easeInOut = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const fmtNum = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+  const t = l2 ? clamp(((px - ax) * dx + (py - ay) * dy) / l2, 0, 1) : 0;
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+const RGB = {};
+function hexRgb(h) {
+  if (!RGB[h]) RGB[h] = [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)).join(',');
+  return RGB[h];
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// Sheet geometry (bubble centres are computed from this)
+const G = (() => {
+  const c = CFG.sheet, rowH = c.gap * Math.sqrt(3) / 2;
+  const gw = (c.cols - 1) * c.gap + c.gap / 2, gh = (c.rows - 1) * rowH;
+  const x0 = W / 2 - gw / 2, y0 = c.cy - gh / 2, pad = 22;
+  return { rowH, x0, y0, panel: { x: x0 - c.r - pad, y: y0 - c.r - pad * 0.9, w: gw + 2 * c.r + 2 * pad, h: gh + 2 * c.r + 1.8 * pad } };
+})();
+
+// ============================================================
+// Canvas, background and bubble sprites (glow is drawn once into offscreen canvases)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let bgCanvas = null;
+const sprites = { full: [], big: [], dimple: [] };
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width = canvas.width; bgCanvas.height = canvas.height;
+  const g = bgCanvas.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  drawBackground(g);
+  buildSprites();
+}
+
+function drawBackground(g) {
+  const gr = g.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, '#0a0d1c'); gr.addColorStop(1, '#05070f');
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  const blob = (x, y, r, rgb, a) => {
+    const b = g.createRadialGradient(x, y, 0, x, y, r);
+    b.addColorStop(0, `rgba(${rgb},${a})`); b.addColorStop(1, `rgba(${rgb},0)`);
+    g.fillStyle = b; g.fillRect(x - r, y - r, r * 2, r * 2);
+  };
+  blob(210, 150, 380, '80,200,255', 0.06);
+  blob(770, 410, 400, '170,120,255', 0.05);
+  blob(520, 560, 300, '90,255,200', 0.03);
+}
+
+function buildSprites() {
+  const cols = THEMES[theme].cols;
+  sprites.full = cols.map(c => bubbleSprite(c, 32, false));
+  sprites.big = cols.map(c => bubbleSprite(c, 64, false));
+  sprites.dimple = cols.map((c, i) => bubbleSprite(c, 32, true, i + 3));
+}
+
+function bubbleSprite(hex, R, flat, seed = 1) {
+  const pad = Math.ceil(R * 0.32) + 4, S = 2 * (R + pad);
+  const px = Math.ceil(S * rs), k = px / S;
+  const c = document.createElement('canvas');
+  c.width = px; c.height = px;
+  const g = c.getContext('2d');
+  g.setTransform(k, 0, 0, k, px / 2, px / 2);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  const rgb = hexRgb(hex);
+  const circle = rad => { g.beginPath(); g.arc(0, 0, rad, 0, TAU); };
+  if (!flat) {
+    // Soft halo, then a glassy body, a bright rim and a couple of highlights
+    g.strokeStyle = hex;
+    for (let i = 0; i < 4; i++) { circle(R); g.globalAlpha = 0.05; g.lineWidth = R * (0.1 + i * 0.13); g.stroke(); }
+    const gr = g.createRadialGradient(-R * 0.35, -R * 0.4, R * 0.05, 0, 0, R);
+    gr.addColorStop(0, `rgba(${rgb},0.55)`);
+    gr.addColorStop(0.5, `rgba(${rgb},0.16)`);
+    gr.addColorStop(0.85, `rgba(${rgb},0.2)`);
+    gr.addColorStop(1, `rgba(${rgb},0.5)`);
+    g.globalAlpha = 1; circle(R); g.fillStyle = gr; g.fill();
+    circle(R - 1); g.lineWidth = Math.max(1.8, R * 0.07); g.strokeStyle = hex; g.globalAlpha = 0.95; g.stroke();
+    circle(R * 0.84); g.lineWidth = 1; g.strokeStyle = '#ffffff'; g.globalAlpha = 0.08; g.stroke();
+    g.strokeStyle = '#ffffff';
+    g.beginPath(); g.arc(0, 0, R * 0.66, Math.PI * 1.1, Math.PI * 1.4); g.globalAlpha = 0.75; g.lineWidth = R * 0.11; g.stroke();
+    g.beginPath(); g.arc(R * 0.1, -R * 0.66, R * 0.055, 0, TAU); g.fillStyle = '#ffffff'; g.globalAlpha = 0.7; g.fill();
+    g.beginPath(); g.arc(0, 0, R * 0.7, Math.PI * 0.15, Math.PI * 0.4); g.globalAlpha = 0.16; g.lineWidth = R * 0.06; g.stroke();
+  } else {
+    // A popped bubble: flattened, crumpled plastic with a few creases
+    let s = (seed * 7919 + 13) % 233280;
+    const rnd = () => (s = (s * 9301 + 49297) % 233280) / 233280;
+    const poly = pts => { g.beginPath(); pts.forEach((p, i) => (i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1]))); g.closePath(); };
+    const rim = [];
+    for (let i = 0; i < 22; i++) { const a = (i / 22) * TAU, rr = R * (0.86 + rnd() * 0.08); rim.push([Math.cos(a) * rr, Math.sin(a) * rr]); }
+    poly(rim); g.fillStyle = `rgba(${rgb},0.08)`; g.globalAlpha = 1; g.fill();
+    g.strokeStyle = hex; g.globalAlpha = 0.12; g.lineWidth = 5; g.stroke();
+    g.globalAlpha = 0.5; g.lineWidth = 1.3; g.stroke();
+    const inner = [];
+    for (let i = 0; i < 7; i++) { const a = (i / 7) * TAU + rnd() * 0.6, rr = R * (0.26 + rnd() * 0.26); inner.push([Math.cos(a) * rr, Math.sin(a) * rr]); }
+    poly(inner); g.strokeStyle = '#ffffff'; g.globalAlpha = 0.14; g.lineWidth = 1.1; g.stroke();
+    g.beginPath();
+    for (let i = 0; i < inner.length; i += 2) {
+      const x = inner[i][0], y = inner[i][1], e = (R * (0.8 + rnd() * 0.06)) / (Math.hypot(x, y) || 1);
+      g.moveTo(x, y); g.lineTo(x * e, y * e);
+    }
+    g.globalAlpha = 0.1; g.stroke();
+  }
+  return { c, S, R };
+}
+
+function drawSprite(sp, x, y, rx, ry) {
+  const kx = rx / sp.R, ky = ry / sp.R;
+  ctx.drawImage(sp.c, x - (sp.S / 2) * kx, y - (sp.S / 2) * ky, sp.S * kx, sp.S * ky);
+}
+function drawSpriteRot(sp, x, y, r, a) {
+  const k = r / sp.R, c = Math.cos(a) * rs, s = Math.sin(a) * rs;
+  ctx.setTransform(c, s, -s, c, x * rs, y * rs);
+  ctx.drawImage(sp.c, -(sp.S / 2) * k, -(sp.S / 2) * k, sp.S * k, sp.S * k);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Everything is soft and short.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, style: 'soft', last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.35;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.006) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0, swell = false) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(freq, t);
+    if (swell) { // whoosh: fade in, then out
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.35);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    } else {
+      f.frequency.exponentialRampToValueAtTime(Math.max(80, freq * 0.2), t + dur);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    }
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  // The pop: a tiny filtered noise snap plus a short pitched "thup", with a little random pitch.
+  pop(pitch = 1) {
+    if (!this.ok('pop', 0.024)) return;
+    const c = this.ctx, t = c.currentTime, crisp = this.style === 'crisp';
+    const v = pitch * (0.9 + Math.random() * 0.22);
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf;
+    f.type = 'bandpass'; f.Q.value = crisp ? 0.8 : 1.2;
+    f.frequency.setValueAtTime((crisp ? 2300 : 1100) * v, t);
+    const nd = crisp ? 0.03 : 0.05;
+    g.gain.setValueAtTime(crisp ? 0.5 : 0.45, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + nd);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t, Math.random() * 0.4); s.stop(t + nd + 0.02);
+    const f0 = (crisp ? 880 : 430) * v;
+    this.tone(f0, f0 * (crisp ? 0.5 : 0.6), crisp ? 0.045 : 0.09, crisp ? 'triangle' : 'sine', crisp ? 0.15 : 0.24, 0, 0.002);
+  },
+  chime() { if (this.ok('chime', 0.5)) [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => this.tone(f, f, 1.0, 'sine', 0.055, i * 0.1, 0.01)); },
+  swish() { if (this.ok('swish', 0.4)) this.noise(1.1, 0.05, 650, 0, true); },
+  sparkle() { if (this.ok('sparkle', 0.15)) [784, 988, 1175].forEach((f, i) => this.tone(f, f, 0.4, 'sine', 0.04, 0.04 + i * 0.06, 0.008)); },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(660, 660, 0.05, 'sine', 0.05); },
+  select()  { if (this.ok()) { this.tone(523, 523, 0.09, 'sine', 0.08); this.tone(784, 784, 0.14, 'sine', 0.07, 0.07); } },
+  blip()    { if (this.ok()) this.tone(523, 523, 0.08, 'sine', 0.07); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.35;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const DPAD = [12, 13, 14, 15];   // up, down, left, right
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  mouse: { x: W / 2, y: H / 2, clicked: false, moved: false },
+  ptrs: new Map(), strokes: [], ptrType: 'mouse',   // pointers held down, and pop strokes since last frame
+  pad: null, padIndex: null, prev: [], rep: [], stickDir: 0, stickHold: 0,
+  device: 'pointer',
+  ls: { x: 0, y: 0, m: 0 }, rstick: { x: 0, y: 0, m: 0 },
+  aim: { x: 0, y: 0 }, hold: { x: 0, y: 0 },          // analog sticks / digital held directions
+  popTap: false, popHeld: false,
+  pause: false, mute: false, select: false, back: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,   // menus (D-pad, keys, left stick)
+  dUp: false, dDown: false, dLeft: false, dRight: false,           // bubble hops (D-pad, keys)
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.ptrs.clear(); });
+    canvas.addEventListener('pointerdown', e => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (e.preventDefault) e.preventDefault();
+      this.toWorld(e);
+      this.mouse.clicked = true; this.mouse.moved = true;
+      this.device = 'pointer'; this.ptrType = e.pointerType || 'mouse';
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not supported */ }
+      const x = this.mouse.x, y = this.mouse.y;
+      // Only a press that starts during play pops (not the tap that started the game).
+      const pop = isPlaying() && !inRect(this.mouse, PAUSE_BTN);
+      this.ptrs.set(e.pointerId, { x, y, pop });
+      if (pop) this.strokes.push({ x0: x, y0: y, x1: x, y1: y, tap: true, touch: this.ptrType !== 'mouse' });
+      Sfx.init();
+    });
+    canvas.addEventListener('pointermove', e => {
+      const p = this.ptrs.get(e.pointerId), ox = this.mouse.x, oy = this.mouse.y;
+      this.toWorld(e); this.mouse.moved = true;
+      if (!p) {
+        if (e.pointerType === 'mouse' && dist(ox, oy, this.mouse.x, this.mouse.y) > 3) { this.device = 'pointer'; this.ptrType = 'mouse'; }
+        return;
+      }
+      const x = this.mouse.x, y = this.mouse.y;
+      if (p.pop) this.strokes.push({ x0: p.x, y0: p.y, x1: x, y1: y, tap: false });
+      p.x = x; p.y = y;
+    });
+    const up = e => { this.ptrs.delete(e.pointerId); Sfx.init(); };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (isPlaying()) pauseGame();
+    });
+  },
+
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const k = this.keys, P = this.pressed, N = this.navKeys;
+    let hx = (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0) - (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0);
+    let hy = (k.has('KeyS') || k.has('ArrowDown') ? 1 : 0) - (k.has('KeyW') || k.has('ArrowUp') ? 1 : 0);
+    let ax = 0, ay = 0;
+    let popTap = P.has('Space') || P.has('Enter');
+    let popHeld = k.has('Space') || k.has('Enter');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let up = N.has('ArrowUp') || N.has('KeyW'), down = N.has('ArrowDown') || N.has('KeyS');
+    let left = N.has('ArrowLeft') || N.has('KeyA'), right = N.has('ArrowRight') || N.has('KeyD');
+    const hop = [up, down, left, right];
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      if (!prev.length) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      radial(pad.axes[2] || 0, pad.axes[3] || 0, 0.2, this.rstick);
+      ax = this.ls.x + this.rstick.x; ay = this.ls.y + this.rstick.y;
+      const dx = (on(15) ? 1 : 0) - (on(14) ? 1 : 0);
+      const dy = (on(13) ? 1 : 0) - (on(12) ? 1 : 0);
+      hx += dx; hy += dy;
+      if (tap(0) || tap(2) || tap(5) || tap(7)) popTap = true;     // A, X, RB, RT pop
+      if (on(0) || on(2) || on(5) || on(7)) popHeld = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      // D-pad: one step per press, auto-repeat when held (menus and bubble hops).
+      DPAD.forEach((b, j) => {
+        let fire = false;
+        if (!on(b)) this.rep[b] = 0;
+        else if (!prev[b]) { fire = true; this.rep[b] = 0.34; }
+        else { this.rep[b] -= dt; if (this.rep[b] <= 0) { fire = true; this.rep[b] = 0.11; } }
+        if (fire) hop[j] = true;
+      });
+      up = up || hop[0]; down = down || hop[1]; left = left || hop[2]; right = right || hop[3];
+      // Left stick as a menu cursor: one step per push, auto-repeat when held.
+      const lx = pad.axes[0] || 0, ly = pad.axes[1] || 0;
+      let dir = 0;
+      if (Math.abs(ly) > 0.6 && Math.abs(ly) >= Math.abs(lx)) dir = ly < 0 ? 1 : 2;
+      else if (Math.abs(lx) > 0.6) dir = lx < 0 ? 3 : 4;
+      let step = 0;
+      if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0 || this.rstick.m > 0 || dx || dy) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    const am = Math.hypot(ax, ay);
+    if (am > 1) { ax /= am; ay /= am; }
+    this.aim.x = ax; this.aim.y = ay;
+    const hm = Math.hypot(hx, hy);
+    if (hm > 1) { hx /= hm; hy /= hm; }
+    this.hold.x = hx; this.hold.y = hy;
+    this.popTap = popTap; this.popHeld = popHeld;
+    this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+    this.dUp = hop[0]; this.dDown = hop[1]; this.dLeft = hop[2]; this.dRight = hop[3];
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear(); this.strokes.length = 0;
+    this.mouse.clicked = false; this.mouse.moved = false;
+  },
+
+  rumble(strong, weak, ms) {
+    const a = this.pad && this.pad.vibrationActuator;
+    if (!a || !a.playEffect) return;
+    try {
+      const r = a.playEffect('dual-rumble', { duration: ms, strongMagnitude: strong, weakMagnitude: weak });
+      if (r && r.catch) r.catch(() => {});
+    } catch (e) { /* rumble not supported */ }
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps
+    ? { a: '✕', b: '○', x: '□', rb: 'R1', rt: 'R2', start: 'Options', select: 'Create' }
+    : { a: 'A', b: 'B', x: 'X', rb: 'RB', rt: 'RT', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let scene = 'sheet';      // which mode sits behind the pause screen
+let pausedFrom = 'sheet';
+let theme = THEME_IDS.includes(load('neonPop.theme', 'rainbow')) ? load('neonPop.theme', 'rainbow') : 'rainbow';
+let soundSet = SOUND_IDS.includes(load('neonPop.sound', 'soft')) ? load('neonPop.sound', 'soft') : 'soft';
+let lastStyle = soundSet === 'off' ? 'soft' : soundSet;
+let total = Math.max(0, parseInt(load('neonPop.total', '0'), 10) || 0);   // lifetime bubbles popped
+let dirty = false, saveT = 0;
+let session = 0, counterBump = 0, hintT = 0, lastBuzz = -1;
+const toast = { text: '', t: 0 };
+const parts = new Pool(LOW_RES ? 160 : 320, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, color: '#fff', size: 2 }));
+const rings = new Pool(48, () => ({ x: 0, y: 0, r: 0, t: 0, max: 1, color: '#fff' }));
+
+function showToast(text) { toast.text = text; toast.t = 2; }
+function isPlaying() { return state === 'sheet' || state === 'drift'; }
+function saveTotal() {
+  if (dirty) { save('neonPop.total', total); dirty = false; }
+  saveT = 0;
+}
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { saveTotal(); pausedFrom = state; setState('paused'); Sfx.blip(); }
+function resumeGame() { state = pausedFrom; cur.armed = false; Sfx.blip(); }
+function toTitle() { saveTotal(); parts.clear(); rings.clear(); setState('title'); }
+
+function applySound() {
+  Sfx.style = soundSet === 'crisp' ? 'crisp' : 'soft';
+  if (Sfx.muted !== (soundSet === 'off')) Sfx.toggle();
+}
+function setSound(v) {
+  soundSet = v;
+  if (v !== 'off') lastStyle = v;
+  applySound();
+  save('neonPop.sound', v);
+}
+function setTheme(id) { theme = id; save('neonPop.theme', id); buildSprites(); }
+function palette() { return THEMES[theme].cols; }
+
+// Everything a pop does besides removing the bubble: count, sound, feel, sparkle.
+function onPop(x, y, r, color, pitch, big) {
+  total++; session++; dirty = true; counterBump = 1;
+  Sfx.pop(pitch);
+  if (big) Sfx.sparkle();
+  if (Input.device === 'pad') Input.rumble(big ? 0.3 : 0, big ? 0.5 : 0.3, big ? 90 : 30);
+  else if (Input.device === 'pointer' && Input.ptrType === 'touch') buzz(big ? 18 : 7);
+  puff(x, y, r, color, big);
+}
+function buzz(ms) {
+  if (time - lastBuzz < 0.05 || !navigator.vibrate) return;
+  lastBuzz = time;
+  try { navigator.vibrate(ms); } catch (e) { /* no vibration */ }
+}
+
+// ============================================================
+// 2. Controller / keyboard cursor
+// ============================================================
+const cur = { x: W / 2, y: H / 2, lx: W / 2, ly: H / 2, snap: -1, armed: false };
+let hot = null;   // the bubble that would pop now (highlighted)
+
+function cursorShown() {
+  if (Input.device !== 'pad' && Input.device !== 'kb') return false;
+  return scene !== 'sheet' || SH.phase !== 'slide';
+}
+// Smooth analog movement (sticks; in Drift also the D-pad and arrow keys).
+function moveCursor(dt, digital) {
+  let mx = Input.aim.x, my = Input.aim.y;
+  if (digital) { mx += Input.hold.x; my += Input.hold.y; }
+  const m = Math.hypot(mx, my);
+  if (m < 0.02) return false;
+  const k = Math.min(1, m), sp = CFG.cursor.speed * (0.15 + 0.85 * k * k);
+  cur.x += (mx / m) * sp * dt; cur.y += (my / m) * sp * dt;
+  cur.snap = -1;
+  return true;
+}
+// Holding a pop button only sweeps if it was pressed during play (not still held from a menu).
+function cursorPops(tapFn, sweepFn) {
+  if (Input.popTap) { cur.armed = true; tapFn(); }
+  if (!Input.popHeld) cur.armed = false;
+  else if (cur.armed) sweepFn(cur.lx, cur.ly, cur.x, cur.y);
+}
+
+// ============================================================
+// 3. Sheet mode
+// ============================================================
+const SH = { sheet: null, old: null, phase: 'play', t: 0, num: 1, ci: 0 };
+
+function makeSheet(num, ci) {
+  const c = CFG.sheet, list = [];
+  for (let r = 0; r < c.rows; r++) {
+    for (let k = 0; k < c.cols; k++) {
+      list.push({ x: G.x0 + k * c.gap + (r % 2 ? c.gap / 2 : 0), y: G.y0 + r * G.rowH, r: c.r, row: r, popped: false, popT: 0, rot: Math.random() * TAU });
+    }
+  }
+  return { num, ci, list, left: list.length };
+}
+function sheetColorIndex(sh, b) {
+  const n = palette().length;
+  return THEMES[theme].rows ? (sh.ci + b.row) % n : sh.ci % n;
+}
+
+function startSheet() {
+  scene = 'sheet'; setState('sheet');
+  session = 0; hintT = 0; parts.clear(); rings.clear();
+  SH.num = 1; SH.ci = Math.floor(Math.random() * palette().length);
+  SH.sheet = makeSheet(1, SH.ci); SH.old = null; SH.phase = 'play'; SH.t = 0;
+  const mid = Math.floor(CFG.sheet.rows / 2) * CFG.sheet.cols + Math.floor(CFG.sheet.cols / 2) - 1;
+  cur.snap = mid; cur.x = cur.lx = SH.sheet.list[mid].x; cur.y = cur.ly = SH.sheet.list[mid].y;
+  cur.armed = false;
+}
+
+// Slide the current sheet away and a fresh one (in the next colour) in.
+function nextSheet() {
+  SH.old = SH.sheet;
+  SH.ci = (SH.ci + 1) % palette().length;
+  SH.num++;
+  SH.sheet = makeSheet(SH.num, SH.ci);
+  SH.phase = 'slide'; SH.t = 0;
+  cur.armed = false;
+  Sfx.swish();
+}
+
+function popSheet(b) {
+  if (b.popped || SH.phase !== 'play') return;
+  b.popped = true; b.popT = 0;
+  SH.sheet.left--;
+  onPop(b.x, b.y, b.r, palette()[sheetColorIndex(SH.sheet, b)], 1, false);
+  if (SH.sheet.left <= 0) { SH.phase = 'done'; SH.t = 0; Sfx.chime(); }
+}
+function sheetNearest(x, y, reach) {
+  let best = null, bd = Infinity;
+  for (const b of SH.sheet.list) {
+    if (b.popped) continue;
+    const d = dist(x, y, b.x, b.y);
+    if (d < b.r + reach && d < bd) { bd = d; best = b; }
+  }
+  return best;
+}
+function sheetNearestIndex(x, y) {
+  let best = 0, bd = Infinity;
+  SH.sheet.list.forEach((b, i) => { const d = dist(x, y, b.x, b.y); if (d < bd) { bd = d; best = i; } });
+  return best;
+}
+function sheetTap(x, y, reach) { const b = sheetNearest(x, y, reach); if (b) popSheet(b); }
+function sheetSweep(x0, y0, x1, y1, tol) {
+  for (const b of SH.sheet.list) if (!b.popped && segDist(b.x, b.y, x0, y0, x1, y1) <= b.r + tol) popSheet(b);
+}
+// D-pad / arrows hop bubble to bubble. Vertical hops keep the column, so they zig-zag down the offset rows.
+function gridStep(i, dx, dy) {
+  const c = CFG.sheet;
+  const row = clamp(Math.floor(i / c.cols) + dy, 0, c.rows - 1), col = clamp((i % c.cols) + dx, 0, c.cols - 1);
+  return row * c.cols + col;
+}
+
+function updateSheet(dt) {
+  SH.t += dt;
+  for (const sh of [SH.sheet, SH.old]) {
+    if (sh) for (const b of sh.list) if (b.popped && b.popT < 1) b.popT += dt;
+  }
+  if (SH.phase === 'done' && SH.t > CFG.sheet.doneWait) nextSheet();
+  else if (SH.phase === 'slide' && SH.t >= CFG.sheet.slide) {
+    SH.phase = 'play'; SH.old = null; SH.t = 0;
+    cur.snap = sheetNearestIndex(cur.x, cur.y);
+  }
+  if (SH.phase === 'slide') { hot = null; return; }
+
+  const I = Input, list = SH.sheet.list, p = G.panel;
+  cur.lx = cur.x; cur.ly = cur.y;
+  moveCursor(dt, false);
+  const dx = (I.dRight ? 1 : 0) - (I.dLeft ? 1 : 0), dy = (I.dDown ? 1 : 0) - (I.dUp ? 1 : 0);
+  if (dx || dy) cur.snap = gridStep(cur.snap >= 0 ? cur.snap : sheetNearestIndex(cur.x, cur.y), dx, dy);
+  if (cur.snap >= 0) {
+    const b = list[cur.snap], k = Math.min(1, dt * CFG.cursor.snap);
+    cur.x += (b.x - cur.x) * k; cur.y += (b.y - cur.y) * k;
+  }
+  cur.x = clamp(cur.x, p.x + 8, p.x + p.w - 8); cur.y = clamp(cur.y, p.y + 8, p.y + p.h - 8);
+
+  if (SH.phase === 'play') {
+    const target = () => (cur.snap >= 0 && !list[cur.snap].popped ? list[cur.snap] : sheetNearest(cur.x, cur.y, CFG.cursor.reach));
+    cursorPops(() => { const b = target(); if (b) popSheet(b); }, (a, b, c, d) => sheetSweep(a, b, c, d, 2));
+    for (const s of I.strokes) {
+      if (s.tap) sheetTap(s.x1, s.y1, s.touch ? 10 : 4);
+      else sheetSweep(s.x0, s.y0, s.x1, s.y1, 3);
+    }
+    if (cursorShown()) hot = target();
+    else if (I.ptrType === 'mouse' && !I.ptrs.size) hot = sheetNearest(I.mouse.x, I.mouse.y, 0);
+    else hot = null;
+  } else hot = null;
+}
+
+// ============================================================
+// 4. Drift mode: bubbles rise and wobble; big ones burst into little ones
+// ============================================================
+const FIELD_DRIFT = { max: CFG.drift.max, every: CFG.drift.every, rise: CFG.drift.rise, big: true };
+const FIELD_AMBIENT = { max: 14, every: [0.9, 1.5], rise: [22, 40], big: false };   // title screen
+function makeField(o) { return { list: [], spawnT: 0, bigT: rand(6, 10), lastX: [], o }; }
+let field = makeField(FIELD_DRIFT);
+const ambient = makeField(FIELD_AMBIENT);
+
+function spawnBubble(f, big) {
+  const D = CFG.drift, o = f.o;
+  const r = big ? D.bigR : Math.random() < 0.7 ? rand(D.r[0], 32) : rand(32, D.r[1]);
+  let x = rand(r + 16, W - r - 16);
+  for (let tries = 0; tries < 5 && f.lastX.some(lx => Math.abs(lx - x) < 90); tries++) x = rand(r + 16, W - r - 16);
+  f.lastX.push(x); if (f.lastX.length > 3) f.lastX.shift();
+  const rise = rand(o.rise[0], o.rise[1]) * (big ? 0.65 : 1);
+  f.list.push({
+    bx: x, x, y: H + r + 8, r, vx: 0, vy: -rise, rise, amp: rand(5, 14), fq: rand(0.18, 0.4), ph: rand(0, TAU),
+    t: 0, ci: Math.floor(Math.random() * 6), big: !!big, grow: 1,
+  });
+}
+
+function updateField(f, dt) {
+  const o = f.o, L = f.list;
+  f.spawnT -= dt;
+  if (f.spawnT <= 0) { if (L.length < o.max) spawnBubble(f, false); f.spawnT = rand(o.every[0], o.every[1]); }
+  if (o.big) {
+    f.bigT -= dt;
+    if (f.bigT <= 0) { spawnBubble(f, true); f.bigT = rand(CFG.drift.bigEvery[0], CFG.drift.bigEvery[1]); }
+  }
+  const drag = Math.pow(0.12, dt), steer = Math.min(1, dt * 1.2);
+  for (let i = L.length - 1; i >= 0; i--) {
+    const b = L[i];
+    b.t += dt;
+    if (b.grow < 1) b.grow = Math.min(1, b.grow + dt * 4);
+    b.vx *= drag; b.vy += (-b.rise - b.vy) * steer;
+    b.bx += b.vx * dt; b.y += b.vy * dt;
+    if (b.bx < b.r) { b.bx = b.r; b.vx = Math.abs(b.vx) * 0.5; }
+    else if (b.bx > W - b.r) { b.bx = W - b.r; b.vx = -Math.abs(b.vx) * 0.5; }
+    b.x = b.bx + Math.sin(b.t * b.fq * TAU + b.ph) * b.amp;
+    if (b.y < -b.r - 30) L.splice(i, 1);   // floated away: that's fine
+  }
+  // Gentle nudge so bubbles don't sit on top of each other
+  for (let i = 0; i < L.length; i++) {
+    for (let j = i + 1; j < L.length; j++) {
+      const a = L[i], b = L[j], dx = b.x - a.x, dy = b.y - a.y, min = a.r * a.grow + b.r * b.grow + 2;
+      if (dx * dx + dy * dy >= min * min) continue;
+      const d = Math.hypot(dx, dy) || 1, push = (min - d) * 1.5 * dt;
+      a.bx -= (dx / d) * push; b.bx += (dx / d) * push;
+      a.y -= (dy / d) * push * 0.5; b.y += (dy / d) * push * 0.5;
+    }
+  }
+}
+function prewarm(f, secs) { for (let t = 0; t < secs; t += 1 / 30) updateField(f, 1 / 30); }
+
+function startDrift() {
+  scene = 'drift'; setState('drift');
+  session = 0; hintT = 0; parts.clear(); rings.clear();
+  field = makeField(FIELD_DRIFT);
+  prewarm(field, 7);
+  field.bigT = rand(5, 9);
+  cur.x = cur.lx = W / 2; cur.y = cur.ly = H * 0.6; cur.snap = -1; cur.armed = false;
+}
+
+function popDrift(i) {
+  const b = field.list[i];
+  field.list.splice(i, 1);
+  onPop(b.x, b.y, b.r, palette()[b.ci % palette().length], clamp(30 / b.r, 0.55, 1.6), b.big);
+  if (!b.big) return;
+  const n = CFG.drift.split;
+  for (let k = 0; k < n; k++) {
+    const a = (k / n) * TAU + rand(-0.3, 0.3), sp = rand(90, 150);
+    field.list.push({
+      bx: b.x + Math.cos(a) * b.r * 0.4, x: b.x, y: b.y + Math.sin(a) * b.r * 0.4, r: rand(13, 21),
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 20, rise: rand(40, 70), amp: rand(3, 8), fq: rand(0.25, 0.5), ph: 0,
+      t: 0, ci: (b.ci + k) % 6, big: false, grow: 0.2,
+    });
+  }
+}
+function driftNearest(x, y, reach) {
+  let best = -1, bd = Infinity;
+  field.list.forEach((b, i) => {
+    const d = dist(x, y, b.x, b.y);
+    if (d < b.r * b.grow + reach && d < bd) { bd = d; best = i; }
+  });
+  return best;
+}
+function driftTap(x, y, reach) { const i = driftNearest(x, y, reach); if (i >= 0) popDrift(i); }
+function driftSweep(x0, y0, x1, y1, tol) {
+  const L = field.list, n = L.length;
+  // Backwards, and only over bubbles that existed before this sweep (little ones from a split are spared)
+  for (let i = n - 1; i >= 0; i--) {
+    const b = L[i];
+    if (b && segDist(b.x, b.y, x0, y0, x1, y1) <= b.r * b.grow + tol) popDrift(i);
+  }
+}
+
+function updateDrift(dt) {
+  updateField(field, dt);
+  const I = Input;
+  cur.lx = cur.x; cur.ly = cur.y;
+  moveCursor(dt, true);
+  cur.x = clamp(cur.x, 16, W - 16); cur.y = clamp(cur.y, 16, H - 16);
+  cursorPops(() => driftTap(cur.x, cur.y, 16), (a, b, c, d) => driftSweep(a, b, c, d, 6));
+  for (const s of I.strokes) {
+    if (s.tap) driftTap(s.x1, s.y1, s.touch ? 14 : 8);
+    else driftSweep(s.x0, s.y0, s.x1, s.y1, 4);
+  }
+  // A finger (or mouse button) held still pops bubbles that float into it.
+  for (const p of I.ptrs.values()) if (p.pop) driftSweep(p.x, p.y, p.x, p.y, 2);
+  let hi = -1;
+  if (cursorShown()) hi = driftNearest(cur.x, cur.y, 16);
+  else if (I.ptrType === 'mouse' && !I.ptrs.size) hi = driftNearest(I.mouse.x, I.mouse.y, 4);
+  hot = hi >= 0 ? field.list[hi] : null;
+}
+
+// ============================================================
+// Effects
+// ============================================================
+function burst(x, y, color, n, speed, life = 0.6, size = 2.5) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.25 + Math.random() * 0.75);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.color = color; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r, color, max = 0.35) {
+  const g = rings.get();
+  if (!g) return;
+  g.x = x; g.y = y; g.r = r; g.t = 0; g.max = max; g.color = color;
+}
+function puff(x, y, r, color, big) {
+  const k = LOW_RES ? 0.5 : 1;
+  burst(x, y, color, Math.round((big ? 18 : 8) * k), r * 4, big ? 0.7 : 0.45, big ? 3.5 : 3);
+  burst(x, y, '#ffffff', Math.round((big ? 6 : 3) * k), r * 2.4, 0.3, 2);
+  ring(x, y, r, color);
+  if (big) ring(x, y, r * 1.2, '#ffffff', 0.5);
+}
+function updateFx(dt) {
+  const drag = Math.pow(0.05, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy *= drag;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const g of rings.items) {
+    if (!g.active) continue;
+    g.t += dt;
+    if (g.t >= g.max) g.active = false;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function titleItems() {
+  return [
+    { id: 'sheet', label: 'Sheet', hint: 'A sheet of bubble wrap. Pop them all for a fresh one.' },
+    { id: 'drift', label: 'Drift', hint: 'Bubbles float up forever. Pop the ones you like.' },
+    { id: 'sound', label: 'Sound', value: SOUND_LABEL[soundSet], hint: 'Soft or crisp pops, or no sound.' },
+    { id: 'theme', label: 'Colours', value: THEMES[theme].label, hint: 'Bubble colours. Rainbow mixes them all.' },
+    { id: 'howto', label: 'How to Play', hint: 'Controls and tips.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+function pauseItems() {
+  return [
+    { id: 'resume', label: 'Resume' },
+    scene === 'sheet' ? { id: 'new', label: 'New sheet' } : { id: 'restart', label: 'Restart' },
+    { id: 'sound', label: 'Sound', value: SOUND_LABEL[soundSet] },
+    { id: 'quit', label: 'Quit to menu' },
+  ];
+}
+
+function cycleSetting(id, d) {
+  if (id === 'sound') {
+    setSound(SOUND_IDS[(SOUND_IDS.indexOf(soundSet) + d + SOUND_IDS.length) % SOUND_IDS.length]);
+    Sfx.pop(1);   // let them hear the new style
+  } else if (id === 'theme') {
+    setTheme(THEME_IDS[(THEME_IDS.indexOf(theme) + d + THEME_IDS.length) % THEME_IDS.length]);
+    Sfx.tick();
+  }
+}
+
+function menuInput(items) {
+  const I = Input, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (I.mouse.moved || I.mouse.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(I.mouse, r) && menuSel !== i) { menuSel = i; Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = I.mouse.clicked && r && inRect(I.mouse, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { cycleSetting(it.id, d); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  counterBump = Math.max(0, counterBump - dt * 4);
+  if (Input.mute) { setSound(soundSet === 'off' ? lastStyle : 'off'); showToast(Sfx.muted ? 'Sound off' : 'Sound on'); }
+  updateFx(dt);
+  if (dirty) { saveT += dt; if (saveT > 1) saveTotal(); }
+
+  switch (state) {
+    case 'title': {
+      updateField(ambient, dt);
+      const id = menuInput(titleItems());
+      if (id === 'sheet') startSheet();
+      else if (id === 'drift') startDrift();
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') { saveTotal(); location.href = '../index.html'; }
+      break;
+    }
+    case 'howto':
+      updateField(ambient, dt);
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 4; Sfx.blip(); }
+      break;
+    case 'sheet':
+    case 'drift':
+      if (Input.pause || (Input.mouse.clicked && inRect(Input.mouse, PAUSE_BTN))) { pauseGame(); break; }
+      hintT += dt;
+      if (session >= 4) hintT = Math.max(hintT, 5);
+      if (state === 'sheet') updateSheet(dt); else updateDrift(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'new') { resumeGame(); nextSheet(); }
+      else if (id === 'restart') startDrift();
+      else if (id === 'quit') toTitle();
+      break;
+    }
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawSheet(sh, ox) {
+  const cols = palette(), base = cols[sh.ci % cols.length], p = G.panel;
+  rrPath(p.x + ox, p.y, p.w, p.h, 26);
+  ctx.fillStyle = `rgba(${hexRgb(base)},0.045)`; ctx.fill();
+  ctx.globalAlpha = 0.5; glowStroke(base, 1.5); ctx.globalAlpha = 1;
+  for (const b of sh.list) {
+    const ci = sheetColorIndex(sh, b), x = b.x + ox;
+    if (x < -60 || x > W + 60) continue;
+    if (b.popped) {
+      const a = Math.min(1, b.popT / 0.18);
+      if (a > 0) { ctx.globalAlpha = a; drawSpriteRot(sprites.dimple[ci], x, b.y, b.r, b.rot); }
+      if (b.popT < 0.16) {   // the bubble squashes flat as it pops
+        const k = b.popT / 0.16;
+        ctx.globalAlpha = 1 - k;
+        drawSprite(sprites.full[ci], x, b.y, b.r * (1 + 0.14 * k), b.r * (1 - 0.5 * k));
+      }
+      ctx.globalAlpha = 1;
+    } else {
+      const s = (1 + 0.02 * Math.sin(time * 1.7 - (b.x + b.y) * 0.011)) * (b === hot ? 1.06 : 1);
+      drawSprite(sprites.full[ci], x, b.y, b.r * s, b.r * s);
+    }
+  }
+}
+
+function drawField(f, alpha, clearMiddle = false) {
+  const cols = palette();
+  for (const b of f.list) {
+    const ci = b.ci % cols.length, w = Math.sin(b.t * 2.1 + b.ph) * 0.035;
+    const r = b.r * b.grow * (b === hot ? 1.06 : 1);
+    // On the title, bubbles fade while they pass behind the menu so the text stays easy to read
+    ctx.globalAlpha = clearMiddle ? alpha * (0.2 + 0.8 * clamp((Math.abs(b.x - W / 2) - 150) / 170, 0, 1)) : alpha;
+    drawSprite(r > 40 ? sprites.big[ci] : sprites.full[ci], b.x, b.y, r * (1 + w), r * (1 - w));
+    if (b.big) {   // little bubbles waiting inside
+      ctx.globalAlpha *= 0.45;
+      for (let k = 0; k < 3; k++) {
+        const a = b.t * 0.8 + (k * TAU) / 3;
+        ctx.beginPath(); ctx.arc(b.x + Math.cos(a) * r * 0.42, b.y + Math.sin(a) * r * 0.42, r * 0.15, 0, TAU);
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHot() {
+  if (!hot) return;
+  ctx.beginPath(); ctx.arc(hot.x, hot.y, hot.r * (hot.grow || 1) * 1.06 + 5, 0, TAU);
+  ctx.globalAlpha = 0.45 + 0.15 * Math.sin(time * 5);
+  glowStroke('#ffffff', 1.5);
+  ctx.globalAlpha = 1;
+}
+
+function drawFx() {
+  for (const g of rings.items) {
+    if (!g.active) continue;
+    const e = g.t / g.max;
+    ctx.beginPath(); ctx.arc(g.x, g.y, g.r * (1 + 0.55 * e), 0, TAU);
+    ctx.globalAlpha = 0.6 * (1 - e);
+    glowStroke(g.color, 2 * (1 - e) + 0.6);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawCursor() {
+  if (!cursorShown() || state === 'paused') return;
+  const held = cur.armed && Input.popHeld;
+  const r = (held ? 12 : 17) + Math.sin(time * 4) * 1.2;
+  ctx.beginPath(); ctx.arc(cur.x, cur.y, r, 0, TAU);
+  ctx.fillStyle = held ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.05)'; ctx.fill();
+  glowStroke('#ffffff', 2);
+  ctx.beginPath(); ctx.arc(cur.x, cur.y, 2.5, 0, TAU); ctx.fillStyle = '#ffffff'; ctx.fill();
+}
+
+function renderSheet() {
+  if (SH.phase === 'slide') {
+    const e = easeInOut(clamp(SH.t / CFG.sheet.slide, 0, 1)), span = W + 40;
+    if (SH.old) drawSheet(SH.old, -e * span);
+    drawSheet(SH.sheet, (1 - e) * span);
+  } else {
+    drawSheet(SH.sheet, 0);
+  }
+  drawHot();
+  drawFx();
+  if (SH.phase !== 'play') {
+    const a = SH.phase === 'done' ? Math.min(1, SH.t * 3) : Math.max(0, 1 - SH.t * 2.5);
+    if (a > 0) {
+      ctx.globalAlpha = a;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      rrPath(W / 2 - 190, CFG.sheet.cy - 52, 380, 104, 28); ctx.fillStyle = 'rgba(5,7,15,0.82)'; ctx.fill();
+      glowText('All popped!', W / 2, CFG.sheet.cy - 12, `800 42px ${SANS}`, CFG.color.title);
+      text('here comes a fresh sheet', W / 2, CFG.sheet.cy + 28, `500 15px ${SANS}`, CFG.color.dim);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+function renderDrift() {
+  drawField(field, 1);
+  drawHot();
+  drawFx();
+}
+
+function drawPauseButton() {
+  const b = PAUSE_BTN, hover = Input.ptrType === 'mouse' && inRect(Input.mouse, b);
+  rrPath(b.x, b.y, b.w, b.h, 12); ctx.fillStyle = 'rgba(12,18,40,0.6)'; ctx.fill();
+  ctx.globalAlpha = hover ? 0.9 : 0.5; glowStroke(CFG.color.dim, 1.2); ctx.globalAlpha = 1;
+  ctx.fillStyle = hover ? CFG.color.text : CFG.color.dim;
+  ctx.fillRect(b.x + 16, b.y + 14, 4, 16); ctx.fillRect(b.x + 24, b.y + 14, 4, 16);
+}
+
+function playHint() {
+  const N = padNames();
+  if (usingPad()) return `${N.a} pops   ·   hold ${N.a} and move to pop lots   ·   ${N.start} pause`;
+  if (Input.device === 'kb') {
+    return `${scene === 'sheet' ? 'Arrows hop' : 'Arrows move'}   ·   Space pops   ·   hold Space and move to pop lots   ·   Esc pause`;
+  }
+  return 'Tap or click to pop   ·   press and drag to pop lots';
+}
+
+function drawHUD() {
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  const y = 32;
+  ctx.beginPath(); ctx.arc(32, y, 9, 0, TAU);
+  ctx.fillStyle = 'rgba(143,233,255,0.12)'; ctx.fill();
+  glowStroke(CFG.color.title, 1.5);
+  const size = 22 * (1 + counterBump * 0.12);
+  ctx.font = `800 ${size.toFixed(1)}px ${MONO}`;
+  const num = fmtNum(total), nw = ctx.measureText(num).width;
+  text(num, 50, y + 1, ctx.font, CFG.color.text);
+  text('popped', 58 + nw, y + 2, `600 13px ${SANS}`, CFG.color.dim);
+  if (scene === 'sheet') {
+    ctx.textAlign = 'right';
+    text(`Sheet ${SH.num}`, PAUSE_BTN.x - 14, y, `600 14px ${SANS}`, CFG.color.dim);
+  }
+  drawPauseButton();
+  const ha = clamp(6 - hintT, 0, 1);
+  if (ha > 0 && state !== 'paused') {
+    const s = playHint(), hy = scene === 'sheet' ? H - 11 : H - 24;
+    ctx.globalAlpha = ha; ctx.textAlign = 'center';
+    ctx.font = `600 12px ${SANS}`;
+    if (scene === 'drift') {
+      const tw = ctx.measureText(s).width + 32;
+      rrPath(W / 2 - tw / 2, hy - 14, tw, 28, 14); ctx.fillStyle = 'rgba(5,7,15,0.75)'; ctx.fill();
+    }
+    text(s, W / 2, hy, ctx.font, CFG.color.dim);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 330, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(143,233,255,0.10)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 15px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+function drawTitle() {
+  overlay(0.3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON POP', W / 2, 84, `800 64px ${SANS}`, CFG.color.title);
+  text('a calm bubble-popping toy', W / 2, 128, `500 15px ${SANS}`, CFG.color.dim);
+  const items = titleItems(), y0 = 180, gap = 44;
+  drawMenu(items, y0, true, gap);
+  const it = items[menuSel] || items[0], N = padNames();
+  text(it.hint, W / 2, y0 + items.length * gap - 2, `500 14px ${SANS}`, CFG.color.dim);
+  const sideHint = it.value !== undefined ? '   ·   ← → change' : '';
+  const ctl = Input.device === 'kb' ? `↑ ↓ choose   ·   Enter select${sideHint}`
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select${sideHint}`
+    : it.value !== undefined ? 'Tap or click to change' : 'Tap or click to choose';
+  text(ctl, W / 2, y0 + items.length * gap + 24, `500 12px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 26, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`${fmtNum(total)} popped`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.muted && (!Sfx.ctx || Sfx.ctx.state !== 'running')) text('click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
+}
+
+function drawHowTo() {
+  overlay(0.8);
+  const N = padNames();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 46, `800 32px ${SANS}`, CFG.color.title);
+  const X = [250, 270, 490, 690];
+  const rows = [
+    ['Move the cursor', 'Either stick', 'Arrows / W A S D', '–'],
+    ['Sheet: hop bubble to bubble', 'D-pad', 'Arrows / W A S D', '–'],
+    ['Pop', `${N.a}  (or ${N.x}, ${N.rb}, ${N.rt})`, 'Space or Enter', 'Tap or click'],
+    ['Pop lots', `Hold ${N.a} and move`, 'Hold Space and move', 'Press and drag'],
+    ['Pause', N.start, 'Esc or P', 'II button, top right'],
+    ['Sound on / off', N.select, 'M', 'Sound in the menu'],
+  ];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', X[1], 88, `800 11px ${SANS}`, CFG.color.faint);
+  text('KEYBOARD', X[2], 88, `800 11px ${SANS}`, CFG.color.faint);
+  text('TOUCH / MOUSE', X[3], 88, `800 11px ${SANS}`, CFG.color.faint);
+  rows.forEach((r, i) => {
+    const y = 114 + i * 24;
+    ctx.textAlign = 'right'; text(r[0], X[0], y, `600 14px ${SANS}`, CFG.color.dim);
+    ctx.textAlign = 'left';
+    for (let c = 1; c < 4; c++) text(r[c], X[c], y, `600 14px ${SANS}`, CFG.color.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(90, 266, W - 180, 1);
+  const col = (title, x, lines) => {
+    text(title, x, 294, `800 11px ${SANS}`, CFG.color.faint);
+    lines.forEach((s, i) => text(s, x, 322 + i * 25, `500 14px ${SANS}`, CFG.color.text));
+  };
+  col('SHEET', 110, [
+    'Pop every bubble on the sheet,',
+    'then a fresh one slides in,',
+    'in a new colour.',
+  ]);
+  col('DRIFT', 520, [
+    'Bubbles float up forever. Pop the ones',
+    'you like; the rest just float away.',
+    'Big bubbles burst into little ones.',
+  ]);
+  ctx.textAlign = 'center';
+  text('No timers and nothing to lose. Pop at your own pace.', W / 2, 432, `600 15px ${SANS}`, CFG.color.title);
+  text(usingPad() ? `${N.b}: back` : 'Esc, click or tap: back', W / 2, H - 28, `600 13px ${SANS}`, CFG.color.dim);
+}
+
+function drawPause() {
+  overlay(0.5);
+  rrPath(W / 2 - 230, 108, 460, 370, 28);
+  ctx.fillStyle = 'rgba(6,9,20,0.92)'; ctx.fill();
+  ctx.globalAlpha = 0.5; glowStroke(CFG.color.dim, 1.2); ctx.globalAlpha = 1;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 156, `800 46px ${SANS}`, CFG.color.text);
+  text(`${fmtNum(session)} popped this time`, W / 2, 200, `500 14px ${SANS}`, CFG.color.dim);
+  drawMenu(pauseItems(), 246);
+  const N = padNames();
+  text(`${usingPad() ? N.select : 'M'}: sound on / off`, W / 2, 450, `500 12px ${SANS}`, CFG.color.faint);
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text(toast.text, W / 2, state === 'title' || state === 'howto' ? H - 50 : 32, `600 14px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#05070f'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  if (state === 'title' || state === 'howto') {
+    drawField(ambient, 0.5, true);
+    if (state === 'title') drawTitle(); else drawHowTo();
+  } else {
+    if (scene === 'sheet') renderSheet(); else renderDrift();
+    drawCursor();
+    drawHUD();
+    if (state === 'paused') drawPause();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return;
+  saveTotal();
+  if (isPlaying()) pauseGame();
+});
+addEventListener('pagehide', saveTotal);
+addEventListener('resize', resize);
+Input.init();
+applySound();
+resize();
+prewarm(ambient, 14);
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

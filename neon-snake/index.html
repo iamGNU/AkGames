@@ -1,0 +1,1287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Snake</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block; touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const COLS = 32, ROWS = 18, CELL = 26;               // the board: 32 x 18 cells
+const BW = COLS * CELL, BH = ROWS * CELL;
+const BX = (W - BW) / 2, BY = 56;                    // board top-left corner
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  speed: { slow: 4.5, normal: 7, fast: 10 },  // cells per second
+  classicRamp: 0.006,     // Classic only: +0.6% speed per cell of length...
+  classicRampMax: 0.3,    // ...up to +30%
+  startLen: 3,
+  comboMoves: 18,         // eat again within this many moves and the chime climbs a note
+  swipe: 26,              // finger travel (game pixels) that counts as a swipe
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a',
+    title: '#7df0d0', good: '#8dffc0', warn: '#ffd98a', calm: '#7de3ff', classic: '#c3a6ff',
+  },
+};
+const SPEEDS = ['slow', 'normal', 'fast'];
+const SPEED_LABEL = { slow: 'Slow', normal: 'Normal', fast: 'Fast' };
+const MODE_LABEL = { calm: 'Calm', classic: 'Classic' };
+const SNAKE_HUE = { calm: 178, classic: 155 };
+const HUE_PER_ORB = 7;                               // Calm: the snake's colour drifts as it grows
+const FOOD_HUES = [44, 24, 340, 285, 205, 130];      // gold, peach, rose, lilac, sky, mint
+const SCALE = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51]; // pentatonic: eat chimes climb it
+const DX = [1, 0, -1, 0], DY = [0, 1, 0, -1];        // directions: 0 right, 1 down, 2 left, 3 up
+const BG_RGB = [11, 14, 31];                     // board colour (for pre-mixed opaque glow)
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+const sx = cx => BX + (cx + 0.5) * CELL;             // cell coordinate -> game pixels
+const sy = cy => BY + (cy + 0.5) * CELL;
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+function loadInt(key) { const v = parseInt(load(key, '0'), 10); return Number.isFinite(v) && v > 0 ? v : 0; }
+function hslRgb(h, s, l) {
+  h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => { const k = (n + h / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+  return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))];
+}
+function hsl(h, s, l) { return `hsl(${Math.round(((h % 360) + 360) % 360)},${s}%,${l}%)`; }
+function mixBg(c, m) { // colour c pulled toward the board colour by m (0..1), kept opaque so overlaps don't show
+  return `rgb(${Math.round(c[0] + (BG_RGB[0] - c[0]) * m)},${Math.round(c[1] + (BG_RGB[1] - c[1]) * m)},${Math.round(c[2] + (BG_RGB[2] - c[2]) * m)})`;
+}
+const wrapD = (a, b, size) => { const d = b - a; return d > 1 ? d - size : d < -1 ? d + size : d; };
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas + board (drawn once into a cache)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let boardCanvas = null;
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  boardCanvas = document.createElement('canvas');
+  boardCanvas.width = canvas.width; boardCanvas.height = canvas.height;
+  const g = boardCanvas.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  drawBoard(g);
+}
+
+function drawBoard(g) {
+  const bg = g.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#05070f'); bg.addColorStop(1, '#0a0d1c');
+  g.fillStyle = bg; g.fillRect(-10, -10, W + 20, H + 20);
+  g.fillStyle = 'rgba(40,54,120,0.10)'; g.fillRect(BX, BY, BW, BH);
+  g.strokeStyle = 'rgba(130,150,230,0.05)'; g.lineWidth = 1;
+  g.beginPath();
+  for (let c = 1; c < COLS; c++) { g.moveTo(BX + c * CELL, BY); g.lineTo(BX + c * CELL, BY + BH); }
+  for (let r = 1; r < ROWS; r++) { g.moveTo(BX, BY + r * CELL); g.lineTo(BX + BW, BY + r * CELL); }
+  g.stroke();
+  g.fillStyle = 'rgba(160,180,255,0.14)';
+  for (let c = 1; c < COLS; c++) for (let r = 1; r < ROWS; r++) g.fillRect(BX + c * CELL - 1, BY + r * CELL - 1, 2, 2);
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Everything soft.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: false, last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.35;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  tone(f1, f2, dur, type, vol, delay = 0, attack = 0.006) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);   // soft attack: no clicks
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  noise(dur, vol, freq, delay = 0) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(freq, t);
+    f.frequency.exponentialRampToValueAtTime(Math.max(80, freq * 0.3), t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0) { // a soft glassy chime: a sine plus two quiet overtones
+    this.tone(f, f, 0.9, 'sine', vol, delay, 0.008);
+    this.tone(f * 2, f * 2, 0.45, 'sine', vol * 0.2, delay, 0.008);
+    this.tone(f * 3.01, f * 3.01, 0.22, 'sine', vol * 0.05, delay, 0.008);
+  },
+  eat(step) { if (this.ok('eat', 0.04)) this.bell(SCALE[Math.min(step, SCALE.length - 1)], 0.16); },
+  trim()    { if (this.ok('trim', 0.2)) { this.tone(330, 196, 0.5, 'sine', 0.12, 0, 0.03); this.noise(0.45, 0.05, 700); } },
+  bump()    { if (this.ok('bump', 0.2)) this.tone(220, 150, 0.35, 'sine', 0.16, 0, 0.01); },
+  end()     { if (this.ok('end', 0.5)) [659.25, 523.25, 392].forEach((f, i) => this.bell(f, 0.09, i * 0.22)); },
+  best()    { if (this.ok('best', 1)) [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => this.bell(f, 0.07, 0.12 + i * 0.09)); },
+  start()   { if (this.ok('start', 0.2)) { this.bell(392, 0.08); this.bell(587.33, 0.08, 0.1); } },
+  tick()    { if (this.ok('tick', 0.03)) this.tone(660, 660, 0.05, 'sine', 0.05); },
+  select()  { if (this.ok()) { this.tone(523.25, 523.25, 0.12, 'triangle', 0.07); this.tone(783.99, 783.99, 0.18, 'triangle', 0.07, 0.06); } },
+  blip()    { if (this.ok()) this.tone(587.33, 587.33, 0.08, 'sine', 0.07); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.35;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const DIR_KEYS = new Map([['ArrowRight', 0], ['KeyD', 0], ['ArrowDown', 1], ['KeyS', 1], ['ArrowLeft', 2], ['KeyA', 2], ['ArrowUp', 3], ['KeyW', 3]]);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  mouse: { x: W / 2, y: H / 2, clicked: false, moved: false },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0, steerDir: -1,
+  device: 'kb',
+  ls: { x: 0, y: 0, m: 0 },
+  evDirs: [], evTaps: [], swipe: null,
+  dirs: [], taps: [],          // this frame: direction presses (in order) and taps/clicks on the board
+  pause: false, mute: false, select: false, back: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) {
+        this.pressed.add(e.code);
+        if (DIR_KEYS.has(e.code)) this.evDirs.push(DIR_KEYS.get(e.code));
+      }
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.swipe = null; });
+    // Pointer: a mouse click acts at once; a finger either swipes (turn) or taps (menus, turn toward the tap)
+    canvas.addEventListener('pointerdown', e => {
+      const p = this.toWorld(e);
+      Sfx.init();
+      if (e.pointerType === 'mouse') {
+        if (e.button !== 0) return;
+        this.device = 'mouse'; this.mouse.clicked = true; this.evTaps.push(p);
+        return;
+      }
+      if (e.preventDefault) e.preventDefault();
+      this.device = 'touch';
+      this.swipe = { id: e.pointerId, x: p.x, y: p.y, x0: p.x, y0: p.y, swiped: false };
+      try { if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    });
+    canvas.addEventListener('pointermove', e => {
+      const p = this.toWorld(e);
+      if (e.pointerType === 'mouse') { this.mouse.moved = true; return; }
+      const s = this.swipe;
+      if (!s || s.id !== e.pointerId) return;
+      const dx = p.x - s.x, dy = p.y - s.y;
+      if (Math.hypot(dx, dy) >= CFG.swipe) {
+        this.evDirs.push(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 0 : 2) : (dy > 0 ? 1 : 3));
+        s.x = p.x; s.y = p.y; s.swiped = true; // keep sliding the finger for another turn
+      }
+    });
+    const endTouch = e => {
+      const s = this.swipe;
+      if (!s || s.id !== e.pointerId) return;
+      this.swipe = null;
+      if (e.type !== 'pointerup') return;
+      Sfx.init(); // touch browsers unlock audio on the release
+      const p = this.toWorld(e);
+      if (!s.swiped && Math.hypot(p.x - s.x0, p.y - s.y0) < CFG.swipe) { this.mouse.clicked = true; this.evTaps.push(p); }
+    };
+    canvas.addEventListener('pointerup', endTouch);
+    canvas.addEventListener('pointercancel', endTouch);
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (r.width && r.height) {
+      this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+      this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+    }
+    return { x: this.mouse.x, y: this.mouse.y };
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const P = this.pressed, N = this.navKeys, dirs = this.dirs;
+    dirs.length = 0; for (const d of this.evDirs) dirs.push(d);
+    this.taps.length = 0; for (const t of this.evTaps) this.taps.push(t);
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let up = N.has('ArrowUp') || N.has('KeyW'), down = N.has('ArrowDown') || N.has('KeyS');
+    let left = N.has('ArrowLeft') || N.has('KeyA'), right = N.has('ArrowRight') || N.has('KeyD');
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      if (!prev.length) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      if (tap(12)) { up = true; dirs.push(3); }
+      if (tap(13)) { down = true; dirs.push(1); }
+      if (tap(14)) { left = true; dirs.push(2); }
+      if (tap(15)) { right = true; dirs.push(0); }
+      const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      // Steering: a new direction when the dominant stick axis passes 0.5 (with a little hysteresis near diagonals)
+      let sd = this.steerDir;
+      const mag = Math.max(Math.abs(ax), Math.abs(ay));
+      if (mag > 0.5) {
+        const cand = Math.abs(ax) > Math.abs(ay) ? (ax > 0 ? 0 : 2) : (ay > 0 ? 1 : 3);
+        const along = d => (d === 0 ? ax : d === 2 ? -ax : d === 1 ? ay : -ay);
+        if (sd < 0 || cand === sd || along(sd) < 0.3 || along(cand) > along(sd) + 0.15) sd = cand;
+      } else if (mag < 0.35) sd = -1;
+      if (sd !== this.steerDir) { if (sd >= 0) dirs.push(sd); this.steerDir = sd; }
+      // Left stick as a menu cursor: one step per push, auto-repeat when held.
+      let dir = 0;
+      if (Math.abs(ay) > 0.6 && Math.abs(ay) >= Math.abs(ax)) dir = ay < 0 ? 1 : 2;
+      else if (Math.abs(ax) > 0.6) dir = ax < 0 ? 3 : 4;
+      let step = 0;
+      if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear(); this.mouse.clicked = false; this.mouse.moved = false;
+    this.evDirs.length = 0; this.evTaps.length = 0;
+  },
+
+  rumble(strong, weak, ms) {
+    const a = this.pad && this.pad.vibrationActuator;
+    if (!a || !a.playEffect) return;
+    try {
+      const r = a.playEffect('dual-rumble', { duration: ms, strongMagnitude: strong, weakMagnitude: weak });
+      if (r && r.catch) r.catch(() => {});
+    } catch (e) { /* rumble not supported */ }
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function usingPointer() { return Input.device === 'touch' || Input.device === 'mouse'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps ? { a: '✕', b: '○', start: 'Options', select: 'Create' } : { a: 'A', b: 'B', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+let speed = SPEEDS.includes(load('neonSnake.speed', 'normal')) ? load('neonSnake.speed', 'normal') : 'normal';
+const stats = {
+  bestCalm: loadInt('neonSnake.bestCalm'), bestClassic: loadInt('neonSnake.bestClassic'),
+  orbs: loadInt('neonSnake.orbs'), runs: loadInt('neonSnake.runs'),
+};
+const toast = { text: '', t: 0 };
+let resultInfo = null;
+const parts = new Pool(LOW_RES ? 120 : 220, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, color: '#fff', size: 2 }));
+const rings = new Pool(16, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff', w: 2 }));
+const ghosts = [];  // pieces trimmed off in Calm mode, dissolving bead by bead
+
+function showToast(text) { toast.text = text; toast.t = 2; }
+function toggleSound() { Sfx.toggle(); showToast(Sfx.muted ? 'Sound off' : 'Sound on'); }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; setState('paused'); Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Sfx.blip(); }
+function toTitle() { parts.clear(); rings.clear(); ghosts.length = 0; setState('title'); }
+
+// ============================================================
+// 2. The snake
+// ============================================================
+const run = {
+  mode: 'calm', body: [], dir: 0, queue: [], tailPrev: { x: 0, y: 0 },
+  acc: 0, p: 1, phase: 'ready', t: 0, overT: 0, reason: '', bump: 0,
+  food: { x: 0, y: 0 }, foodHue: 44, foodT: 0,
+  eaten: 0, moves: 0, lastEatMove: -999, combo: 0,
+  hue: 178, hueShown: 178, prevBest: 0, newBest: false,
+  fx: [],             // effects waiting for the head to visibly arrive (the drawing runs one step behind the logic)
+};
+const occ = new Uint8Array(COLS * ROWS);
+const bestKey = mode => (mode === 'calm' ? 'bestCalm' : 'bestClassic');
+
+function startRun(mode) {
+  run.mode = mode;
+  const cx = COLS >> 1, cy = ROWS >> 1;
+  run.body.length = 0;
+  for (let i = 0; i < CFG.startLen; i++) run.body.push({ x: cx - i, y: cy });
+  run.dir = 0; run.queue.length = 0;
+  run.tailPrev.x = cx - CFG.startLen + 1; run.tailPrev.y = cy;
+  run.acc = 0; run.p = 1; run.phase = 'ready'; run.t = 0; run.overT = 0; run.reason = ''; run.bump = 0;
+  run.eaten = 0; run.moves = 0; run.lastEatMove = -999; run.combo = 0;
+  run.hue = run.hueShown = SNAKE_HUE[mode];
+  run.prevBest = stats[bestKey(mode)]; run.newBest = false;
+  run.fx.length = 0; ghosts.length = 0; parts.clear(); rings.clear();
+  placeFood(cx + 6, cy); // the first orb waits straight ahead
+  stats.runs++; save('neonSnake.runs', stats.runs);
+  setState('play');
+  Sfx.init();
+}
+
+function placeFood(px, py) {
+  occ.fill(0);
+  for (const c of run.body) occ[c.x + c.y * COLS] = 1;
+  let idx = -1;
+  if (px != null && px >= 0 && px < COLS && py >= 0 && py < ROWS && !occ[px + py * COLS]) idx = px + py * COLS;
+  else {
+    let free = 0;
+    for (let i = 0; i < occ.length; i++) if (!occ[i]) free++;
+    if (!free) return false;
+    let k = Math.floor(Math.random() * free);
+    for (let i = 0; i < occ.length; i++) if (!occ[i] && k-- === 0) { idx = i; break; }
+  }
+  run.food.x = idx % COLS; run.food.y = (idx / COLS) | 0;
+  run.foodT = 0;
+  run.foodHue = run.mode === 'calm' ? FOOD_HUES[(Math.random() * FOOD_HUES.length) | 0] : 44;
+  return true;
+}
+
+function cellsPerSec() {
+  let v = CFG.speed[speed];
+  if (run.mode === 'classic') v *= 1 + Math.min(CFG.classicRampMax, (run.body.length - CFG.startLen) * CFG.classicRamp);
+  return v;
+}
+
+// A direction press: starts the run, or joins the turn queue (two deep, no 180° reversals)
+function wantTurn(d) {
+  if (run.phase === 'ready') { begin(d); return; }
+  if (run.phase !== 'go') return;
+  const q = run.queue, ref = q.length ? q[q.length - 1] : run.dir;
+  if (d === ref || d === (ref + 2) % 4 || q.length >= 2) return;
+  q.push(d);
+}
+
+function begin(d) {
+  if (d === (run.dir + 2) % 4) { // turning straight around at the start: just face the other way
+    run.body.reverse();
+    const t = run.body[run.body.length - 1]; run.tailPrev.x = t.x; run.tailPrev.y = t.y;
+  }
+  run.dir = d; run.queue.length = 0;
+  run.phase = 'go'; run.acc = 0;
+  Sfx.start();
+  stepSnake();
+  run.p = 0;
+}
+
+function stepSnake() {
+  if (run.queue.length) run.dir = run.queue.shift();
+  const b = run.body, n = b.length, h = b[0];
+  let nx = h.x + DX[run.dir], ny = h.y + DY[run.dir];
+  if (run.mode === 'calm') { nx = (nx + COLS) % COLS; ny = (ny + ROWS) % ROWS; }
+  else if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) { crash('wall'); return; }
+  const eating = nx === run.food.x && ny === run.food.y;
+  const last = eating ? n : n - 1; // unless we're growing, the tail moves out of the way this step
+  let hit = -1;
+  for (let i = 0; i < last; i++) if (b[i].x === nx && b[i].y === ny) { hit = i; break; }
+  if (hit >= 0 && run.mode === 'classic') { crash('self'); return; }
+  run.moves++;
+  let cell;
+  if (eating) { const t = b[n - 1]; run.tailPrev.x = t.x; run.tailPrev.y = t.y; cell = { x: nx, y: ny }; }
+  else { cell = b.pop(); run.tailPrev.x = cell.x; run.tailPrev.y = cell.y; cell.x = nx; cell.y = ny; }
+  b.unshift(cell);
+  if (hit >= 0) trimAt(hit + 1);
+  if (eating) eat();
+}
+
+// Calm mode: crossing your own body snips the tail off at that point
+function trimAt(k) {
+  const b = run.body, cut = b.splice(k);
+  run.tailPrev.x = b[0].x; run.tailPrev.y = b[0].y; // the new tail end slides out of the crossing cell
+  const delay = 0.8 / cellsPerSec();
+  ghosts.push({ cells: cut, t: -delay, hue: run.hueShown });
+  if (ghosts.length > 4) ghosts.shift();
+  run.fx.push({ t: delay, t0: delay, kind: 'trim', x: b[0].x, y: b[0].y, n: cut.length });
+}
+
+function eat() {
+  run.eaten++;
+  run.combo = run.moves - run.lastEatMove <= CFG.comboMoves ? run.combo + 1 : 0;
+  run.lastEatMove = run.moves;
+  if (run.mode === 'calm') run.hue = SNAKE_HUE.calm + run.eaten * HUE_PER_ORB;
+  stats.orbs++; save('neonSnake.orbs', stats.orbs);
+  const len = run.body.length, key = bestKey(run.mode);
+  let cheer = false;
+  if (len > stats[key]) {
+    stats[key] = len; save('neonSnake.' + key, len);
+    if (!run.newBest && run.prevBest > CFG.startLen) cheer = true;
+    run.newBest = true;
+  }
+  const delay = 0.8 / cellsPerSec();
+  run.fx.push({ t: delay, t0: delay, kind: 'eat', x: run.food.x, y: run.food.y, hue: run.foodHue, step: run.combo, cheer });
+  if (!placeFood()) { crash('full'); return; }
+  run.foodT = -delay; // the next orb appears once this one is swallowed
+}
+
+function crash(reason) {
+  run.phase = 'over'; run.overT = 0; run.reason = reason; run.p = 1; run.bump = 0;
+  run.queue.length = 0;
+  const h = run.body[0];
+  if (reason === 'full') {
+    ring(sx(h.x), sy(h.y), CFG.color.good, 1.4, 10, 260, 2.5);
+    Sfx.best();
+    return;
+  }
+  ring(sx(h.x) + DX[run.dir] * CELL * 0.5, sy(h.y) + DY[run.dir] * CELL * 0.5, CFG.color.classic, 0.9, 4, CELL * 2.4, 2);
+  Sfx.bump();
+  Input.rumble(0.1, 0.25, 140);
+}
+
+function finishRun() {
+  const key = bestKey(run.mode);
+  resultInfo = {
+    mode: run.mode, len: run.body.length, best: stats[key], eaten: run.eaten, reason: run.reason,
+    newBest: run.prevBest > 0 && run.body.length > run.prevBest,
+  };
+  setState('result');
+  if (run.reason !== 'full') Sfx.end(); // a full board already got its happy arpeggio
+}
+
+function fireFx(f) {
+  const px = sx(f.x), py = sy(f.y);
+  if (f.kind === 'eat') {
+    const c = hsl(f.hue, 95, 72);
+    bloom(px, py, c, LOW_RES ? 8 : 14);
+    ring(px, py, c, 0.55, 6, CELL * 1.7, 2);
+    Sfx.eat(f.step);
+    Input.rumble(0, 0.18, 40);
+    if (f.cheer) { showToast('New best length!'); Sfx.best(); }
+  } else if (f.kind === 'trim') {
+    const c = hsl(run.hueShown, 90, 72);
+    ring(px, py, c, 0.9, 6, CELL * 3, 2);
+    ring(px, py, c, 1.3, 4, CELL * 4.6, 1.2);
+    Sfx.trim();
+    Input.rumble(0.05, 0.12, 80);
+  }
+}
+
+// The visible head (the drawing glides one step behind the logic)
+function headPos() {
+  const b = run.body, h0 = b[0], h1 = b[1], p = run.p;
+  const dx = wrapD(h1.x, h0.x, COLS), dy = wrapD(h1.y, h0.y, ROWS);
+  let x = h1.x + dx * p, y = h1.y + dy * p;
+  if (x < -0.5 || x > COLS - 0.5 || y < -0.5 || y > ROWS - 0.5) { x = h0.x - dx * (1 - p); y = h0.y - dy * (1 - p); }
+  return { x: sx(x), y: sy(y) };
+}
+
+// Mouse click / finger tap on the board: turn toward the side of the head that was tapped
+function tapDir(tp) {
+  const hp = headPos(), dx = tp.x - hp.x, dy = tp.y - hp.y;
+  if (run.phase === 'ready') {
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < CELL * 0.5) return run.dir;
+    return Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 0 : 2) : (dy > 0 ? 1 : 3);
+  }
+  const ref = run.queue.length ? run.queue[run.queue.length - 1] : run.dir;
+  if (ref % 2 === 0) return Math.abs(dy) < CELL * 0.5 ? -1 : dy > 0 ? 1 : 3; // moving sideways: above or below?
+  return Math.abs(dx) < CELL * 0.5 ? -1 : dx > 0 ? 0 : 2;                     // moving up/down: left or right?
+}
+
+const HUD_SOUND = { x: 822, y: 10, w: 36, h: 36 };
+const HUD_PAUSE = { x: 862, y: 10, w: 36, h: 36 };
+
+function updatePlay(dt) {
+  run.t += dt;
+  run.foodT += dt;
+  run.hueShown += (run.hue - run.hueShown) * Math.min(1, dt * 1.5);
+  for (let i = run.fx.length - 1; i >= 0; i--) {
+    const f = run.fx[i];
+    f.t -= dt;
+    if (f.t <= 0) { run.fx.splice(i, 1); fireFx(f); }
+  }
+  for (let i = ghosts.length - 1; i >= 0; i--) {
+    const g = ghosts[i];
+    g.t += dt;
+    if (g.t > 0.55 + Math.min(0.6, g.cells.length * 0.025)) ghosts.splice(i, 1); // every bead has faded by then
+  }
+
+  for (const tp of Input.taps) {
+    if (inRect(tp, HUD_PAUSE)) { pauseGame(); return; }
+    if (inRect(tp, HUD_SOUND)) { toggleSound(); continue; }
+    const d = tapDir(tp);
+    if (d >= 0) wantTurn(d);
+  }
+  for (const d of Input.dirs) wantTurn(d);
+  if (run.phase === 'ready' && Input.select) begin(run.dir);
+
+  if (run.phase === 'over') {
+    run.overT += dt; run.bump += dt;
+    if (run.overT > 1.3) finishRun();
+    return;
+  }
+  if (run.phase !== 'go') return;
+  const st = 1 / cellsPerSec();
+  run.acc += dt;
+  while (run.acc >= st && run.phase === 'go') { run.acc -= st; stepSnake(); }
+  run.p = run.phase === 'go' ? Math.min(1, run.acc / st) : 1;
+}
+
+// ============================================================
+// Effects
+// ============================================================
+function emit(x, y, vx, vy, life, color, size) {
+  const p = parts.get();
+  if (!p) return;
+  p.x = x; p.y = y; p.vx = vx; p.vy = vy; p.life = p.max = life; p.color = color; p.size = size;
+}
+function bloom(x, y, color, n) { // soft petals flying outward from a small circle
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * TAU + rand(-0.2, 0.2), sp = rand(80, 170);
+    emit(x + Math.cos(a) * 9, y + Math.sin(a) * 9, Math.cos(a) * sp, Math.sin(a) * sp, rand(0.45, 0.8), color, rand(2.5, 4));
+  }
+}
+function ring(x, y, color, life, r0, r1, w) {
+  const o = rings.get();
+  if (!o) return;
+  o.x = x; o.y = y; o.color = color; o.life = o.max = life; o.r0 = r0; o.r1 = r1; o.w = w;
+}
+function updateFx(dt) {
+  const drag = Math.pow(0.05, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy *= drag;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const r of rings.items) {
+    if (!r.active) continue;
+    r.life -= dt;
+    if (r.life <= 0) r.active = false;
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function titleItems() {
+  return [
+    { id: 'calm', label: 'Calm', hint: 'Edges wrap around and you can\'t lose. Just glide and grow.' },
+    { id: 'classic', label: 'Classic', hint: 'Walls and your own tail end the run. Beat your best length.' },
+    { id: 'speed', label: 'Speed', value: SPEED_LABEL[speed], hint: 'How fast the snake glides. Slow is very relaxed.' },
+    { id: 'howto', label: 'How to Play', hint: 'Controls and tips.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+const PAUSE_ITEMS = [{ id: 'resume', label: 'Resume' }, { id: 'restart', label: 'Restart' }, { id: 'quit', label: 'Quit to menu' }];
+const RESULT_ITEMS = [{ id: 'again', label: 'Play again' }, { id: 'menu', label: 'Main menu' }];
+
+function cycleValue(id, d) {
+  if (id === 'speed') {
+    speed = SPEEDS[(SPEEDS.indexOf(speed) + d + SPEEDS.length) % SPEEDS.length];
+    save('neonSnake.speed', speed);
+  }
+}
+
+function menuInput(items) {
+  const I = Input, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (I.mouse.moved || I.mouse.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(I.mouse, r) && menuSel !== i) { menuSel = i; Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = I.mouse.clicked && r && inRect(I.mouse, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { cycleValue(it.id, d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+const TITLE_SOUND = { x: W - 52, y: 8, w: 40, h: 36 };
+const PAUSE_SOUND = { x: W / 2 - 120, y: 418, w: 240, h: 28 };
+
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  if (state !== 'paused') updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      if (Input.mouse.clicked && inRect(Input.mouse, TITLE_SOUND) && Sfx.ctx && Sfx.ctx.state === 'running') { toggleSound(); break; }
+      const id = menuInput(titleItems());
+      if (id === 'calm' || id === 'classic') startRun(id);
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 3; Sfx.blip(); }
+      break;
+    case 'play':
+      if (Input.pause) { pauseGame(); break; }
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      if (Input.mouse.clicked && inRect(Input.mouse, PAUSE_SOUND)) { toggleSound(); break; }
+      const id = menuInput(PAUSE_ITEMS);
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') startRun(run.mode);
+      else if (id === 'quit') toTitle();
+      break;
+    }
+    case 'result':
+      if (stateT > 0.6) {
+        const id = menuInput(RESULT_ITEMS);
+        if (id === 'again') startRun(resultInfo.mode);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color, halo = 10) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = halo; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill(); }
+
+// --- The snake as one smooth ribbon -------------------------------------------
+// The path runs from the head to the tail in cell units. PD is each point's distance from the head.
+// Where the snake wraps through an edge the path splits into runs that poke just past the edge;
+// the board clip hides the overhang, so the ribbon slides out of one side and into the other.
+const MAXP = 4096;
+const PX = new Float32Array(MAXP), PY = new Float32Array(MAXP), PD = new Float32Array(MAXP);
+const RS = new Int32Array(MAXP >> 1), RE = new Int32Array(MAXP >> 1);
+let nPts = 0, nRuns = 0;
+function pt(x, y, d) { if (nPts < MAXP) { PX[nPts] = x; PY[nPts] = y; PD[nPts] = d; nPts++; } }
+function runStart() { RS[nRuns] = nPts; }
+function runEnd() { RE[nRuns] = nPts; nRuns++; }
+
+function buildPath(p) {
+  const b = run.body, n = b.length, h0 = b[0], h1 = b[1];
+  nPts = 0; nRuns = 0;
+  const dx = wrapD(h1.x, h0.x, COLS), dy = wrapD(h1.y, h0.y, ROWS);
+  if (h1.x + dx !== h0.x || h1.y + dy !== h0.y) { // head passing through an edge: its far-side half
+    runStart(); pt(h0.x - dx * (1 - p), h0.y - dy * (1 - p), 0); pt(h0.x - dx, h0.y - dy, p); runEnd();
+  }
+  runStart(); pt(h1.x + dx * p, h1.y + dy * p, 0); pt(h1.x, h1.y, p);
+  for (let k = 1; k < n - 1; k++) {
+    const a = b[k], c = b[k + 1];
+    const ex = wrapD(a.x, c.x, COLS), ey = wrapD(a.y, c.y, ROWS);
+    if (a.x + ex === c.x && a.y + ey === c.y) pt(c.x, c.y, p + k);
+    else { pt(a.x + ex, a.y + ey, p + k); runEnd(); runStart(); pt(c.x - ex, c.y - ey, p + k - 1); pt(c.x, c.y, p + k); }
+  }
+  // the tail end slides from where it was toward the last cell (it stays put while growing)
+  const z = b[n - 1], tp = run.tailPrev;
+  const tx = wrapD(tp.x, z.x, COLS), ty = wrapD(tp.y, z.y, ROWS);
+  const zd = p + n - 2, tl = (Math.abs(tx) + Math.abs(ty)) * (1 - p);
+  pt(z.x - tx * (1 - p), z.y - ty * (1 - p), zd + tl);
+  runEnd();
+  if (tp.x + tx !== z.x || tp.y + ty !== z.y) {
+    runStart(); pt(tp.x + tx, tp.y + ty, zd); pt(tp.x + tx * p, tp.y + ty * p, zd + tl); runEnd();
+  }
+  return zd + tl;
+}
+
+// Adds the part of the path between distances a and b (from the head) to the current canvas path
+function tracePath(a, b) {
+  for (let r = 0; r < nRuns; r++) {
+    let pen = false;
+    for (let j = RS[r]; j < RE[r] - 1; j++) {
+      const d0 = PD[j], d1 = PD[j + 1];
+      if (d0 > b) break;
+      if (d1 < a) continue;
+      const len = d1 - d0;
+      let t0 = 0, t1 = 1;
+      if (len > 1e-6) { t0 = Math.max(0, (a - d0) / len); t1 = Math.min(1, (b - d0) / len); }
+      const x0 = PX[j], y0 = PY[j], ddx = PX[j + 1] - x0, ddy = PY[j + 1] - y0;
+      if (!pen) { ctx.moveTo(sx(x0 + ddx * t0), sy(y0 + ddy * t0)); pen = true; }
+      ctx.lineTo(sx(x0 + ddx * t1), sy(y0 + ddy * t1));
+    }
+  }
+}
+
+function drawSnake(dim) {
+  const total = buildPath(run.p);
+  const rgb = hslRgb(run.hueShown, 78, 68);
+  ctx.save();
+  if (run.mode === 'calm') { ctx.beginPath(); ctx.rect(BX, BY, BW, BH); ctx.clip(); }
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  // The ribbon is drawn in bands from the tail up to the head, thinner and dimmer toward the tail.
+  // Glow = wide strokes in colours pre-mixed with the board (the glowStroke idea, but opaque),
+  // so bands and coils never double up where they overlap. All glow first, then the cores on top.
+  const K = Math.max(1, Math.min(LOW_RES ? 6 : 12, Math.ceil(total / 2))), bl = total / K;
+  const layers = LOW_RES ? 1 : 2;
+  for (let h = 0; h < layers; h++) {
+    const base = h ? 0.7 : 0.86, wide = h ? 0.95 : 1.35;
+    for (let k = K - 1; k >= 0; k--) {
+      const f = (k + 0.5) / K;
+      ctx.beginPath(); tracePath(k * bl, (k + 1) * bl);
+      ctx.strokeStyle = mixBg(rgb, base + (1 - base) * Math.min(1, f * 0.55 + dim * 0.5));
+      ctx.lineWidth = CELL * wide * (1 - 0.3 * f);
+      ctx.stroke();
+    }
+  }
+  for (let k = K - 1; k >= 0; k--) {
+    const f = (k + 0.5) / K;
+    ctx.beginPath(); tracePath(k * bl, (k + 1) * bl);
+    ctx.strokeStyle = mixBg(rgb, f * 0.5 + dim * 0.35);
+    ctx.lineWidth = CELL * (0.6 - 0.24 * f);
+    ctx.stroke();
+  }
+  // A thin bright filament down the middle
+  ctx.beginPath(); tracePath(0, total * 0.8);
+  ctx.globalAlpha = 0.5 * (1 - dim * 0.7); ctx.strokeStyle = hsl(run.hueShown, 100, 88); ctx.lineWidth = 2.2; ctx.stroke();
+  ctx.globalAlpha = 1;
+  // Head (twice when it is half-way through an edge; the clip shows the right parts)
+  const b = run.body, h0 = b[0], h1 = b[1], p = run.p;
+  const dx = wrapD(h1.x, h0.x, COLS), dy = wrapD(h1.y, h0.y, ROWS);
+  const bump = run.phase === 'over' && run.reason !== 'full' ? Math.sin(Math.min(1, run.bump / 0.28) * Math.PI) * 0.22 : 0;
+  const ox = DX[run.dir] * bump, oy = DY[run.dir] * bump;
+  drawHead(h1.x + dx * p + ox, h1.y + dy * p + oy, dx, dy, rgb, dim);
+  if (h1.x + dx !== h0.x || h1.y + dy !== h0.y) drawHead(h0.x - dx * (1 - p), h0.y - dy * (1 - p), dx, dy, rgb, dim);
+  ctx.restore();
+}
+
+function drawHead(cx, cy, dx, dy, rgb, dim) {
+  const x = sx(cx), y = sy(cy), r = CELL * 0.4;
+  ctx.fillStyle = mixBg(rgb, dim * 0.3);
+  circle(x, y, r);
+  ctx.beginPath(); ctx.arc(x, y, r, 0, TAU);
+  ctx.globalAlpha = 0.6 * (1 - dim * 0.5); glowStroke(hsl(run.hueShown, 100, 86), 1.4);
+  ctx.globalAlpha = 1;
+  // Eyes: two friendly dots that blink now and then (and close softly when the run ends)
+  const px = -dy, py = dx, fx = x + dx * CELL * 0.1, fy = y + dy * CELL * 0.1;
+  const closed = run.phase === 'over' || (run.t % 4.3) > 4.16;
+  for (const s of [-1, 1]) {
+    const ex = fx + px * s * CELL * 0.18, ey = fy + py * s * CELL * 0.18;
+    if (closed) {
+      ctx.beginPath(); ctx.moveTo(ex - py * 3, ey + px * 3); ctx.lineTo(ex + py * 3, ey - px * 3);
+      ctx.strokeStyle = '#0b1020'; ctx.lineWidth = 1.6; ctx.stroke();
+    } else {
+      ctx.fillStyle = '#f4fbff'; circle(ex, ey, 3.3);
+      ctx.fillStyle = '#0b1020'; circle(ex + dx * 1, ey + dy * 1, 1.7);
+    }
+  }
+}
+
+function drawOrb(x, y, hue, scale) {
+  if (scale <= 0.01) return;
+  const r = CELL * 0.24 * scale * (1 + 0.1 * Math.sin(time * 3.2));
+  ctx.fillStyle = hsl(hue, 95, 70);
+  ctx.globalAlpha = 0.07; circle(x, y, r * 3.3);
+  ctx.globalAlpha = 0.15; circle(x, y, r * 2.0);
+  ctx.globalAlpha = 1; circle(x, y, r);
+  ctx.fillStyle = '#ffffff'; ctx.globalAlpha = 0.8; circle(x - r * 0.25, y - r * 0.25, r * 0.42);
+  // two tiny sparkles drifting round it
+  ctx.globalAlpha = 0.6 * scale; ctx.fillStyle = hsl(hue, 100, 85);
+  for (let i = 0; i < 2; i++) {
+    const a = time * 1.4 + i * Math.PI;
+    ctx.fillRect(x + Math.cos(a) * r * 2.2 - 1, y + Math.sin(a) * r * 2.2 - 1, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawFood() {
+  for (const f of run.fx) if (f.kind === 'eat') drawOrb(sx(f.x), sy(f.y), f.hue, 0.5 + 0.5 * (f.t / f.t0));
+  if (run.foodT > 0 && run.phase !== 'over') {
+    const u = Math.min(1, run.foodT / 0.4), s = 1 + 2.2 * Math.pow(u - 1, 3) + 1.2 * Math.pow(u - 1, 2); // ease-out with a soft overshoot
+    drawOrb(sx(run.food.x), sy(run.food.y), run.foodHue, s);
+  }
+}
+
+function drawGhosts() {
+  for (const g of ghosts) {
+    ctx.fillStyle = hsl(g.hue, 90, 70);
+    const cells = g.cells;
+    for (let k = 0; k < cells.length; k++) {
+      const u = clamp((g.t - Math.min(0.6, k * 0.025)) / 0.5, 0, 1);
+      if (u >= 1) continue;
+      ctx.globalAlpha = 0.5 * (1 - u);
+      circle(sx(cells[k].x), sy(cells[k].y), CELL * (0.26 + 0.16 * Math.sin(u * Math.PI)));
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawParticles() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    const k = p.life / p.max;
+    ctx.globalAlpha = k * 0.9;
+    ctx.fillStyle = p.color;
+    circle(p.x, p.y, p.size * (0.4 + 0.3 * k));
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawRings() {
+  for (const o of rings.items) {
+    if (!o.active) continue;
+    const k = 1 - o.life / o.max, e = 1 - (1 - k) * (1 - k);
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r0 + (o.r1 - o.r0) * e, 0, TAU);
+    ctx.globalAlpha = 0.75 * (o.life / o.max);
+    glowStroke(o.color, o.w);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawBorder() {
+  rrPath(BX - 2, BY - 2, BW + 4, BH + 4, 6);
+  if (run.mode === 'calm') { // soft dashed edge: the snake passes through it
+    ctx.setLineDash([10, 9]);
+    ctx.globalAlpha = 0.4; glowStroke(CFG.color.calm, 1.4);
+    ctx.setLineDash([]);
+  } else {                   // solid glowing wall
+    ctx.globalAlpha = 0.75; glowStroke(CFG.color.classic, 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawIconBtn(r, kind) {
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, r);
+  ctx.beginPath(); ctx.arc(cx, cy, 15, 0, TAU);
+  ctx.fillStyle = hover ? 'rgba(125,240,208,0.16)' : 'rgba(131,144,189,0.08)'; ctx.fill();
+  ctx.strokeStyle = hover ? CFG.color.title : 'rgba(131,144,189,0.45)'; ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  ctx.globalAlpha = hover ? 1 : 0.8;
+  if (kind === 'pause') {
+    ctx.fillRect(cx - 5, cy - 6, 3.5, 12); ctx.fillRect(cx + 1.5, cy - 6, 3.5, 12);
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, cy - 3); ctx.lineTo(cx - 4, cy - 3); ctx.lineTo(cx + 1, cy - 7);
+    ctx.lineTo(cx + 1, cy + 7); ctx.lineTo(cx - 4, cy + 3); ctx.lineTo(cx - 8, cy + 3); ctx.closePath(); ctx.fill();
+    ctx.lineWidth = 1.5; ctx.beginPath();
+    if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 4); ctx.lineTo(cx + 10, cy + 4); ctx.moveTo(cx + 10, cy - 4); ctx.lineTo(cx + 4, cy + 4); }
+    else { ctx.arc(cx + 1, cy, 5, -0.8, 0.8); ctx.moveTo(cx + 1 + Math.cos(-0.8) * 9, cy + Math.sin(-0.8) * 9); ctx.arc(cx + 1, cy, 9, -0.8, 0.8); }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  const y = 29, modeCol = run.mode === 'calm' ? CFG.color.calm : CFG.color.classic;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  const label = MODE_LABEL[run.mode].toUpperCase();
+  text(label, BX, y, `800 15px ${SANS}`, modeCol);
+  const lw = ctx.measureText(label).width;
+  text(`·  ${SPEED_LABEL[speed]}`, BX + lw + 10, y, `600 13px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  glowText(`Length ${run.body.length}`, W / 2, y, `800 22px ${SANS}`, CFG.color.text, 5);
+  ctx.textAlign = 'right';
+  text(`Best ${stats[bestKey(run.mode)]}`, HUD_SOUND.x - 12, y, `600 14px ${MONO}`, CFG.color.dim);
+  drawIconBtn(HUD_SOUND, 'sound');
+  drawIconBtn(HUD_PAUSE, 'pause');
+}
+
+function drawReady() {
+  const y = sy(ROWS >> 1) + 76, N = padNames();
+  const msg = usingPad() ? 'Press the D-pad or stick to start'
+    : Input.device === 'touch' ? 'Swipe to start'
+    : Input.device === 'mouse' ? 'Click beside the snake to start' : 'Press an arrow key to start';
+  const sub = run.mode === 'calm' ? 'Calm: the edges wrap around, and you can\'t lose' : 'Classic: steer clear of the walls and your own tail';
+  rrPath(W / 2 - 230, y - 34, 460, 66, 18);
+  ctx.fillStyle = 'rgba(5,7,15,0.72)'; ctx.fill();
+  ctx.globalAlpha = 0.5; glowStroke(run.mode === 'calm' ? CFG.color.calm : CFG.color.classic, 1); ctx.globalAlpha = 1;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.globalAlpha = 0.8 + 0.2 * Math.sin(time * 3);
+  glowText(msg, W / 2, y - 10, `700 19px ${SANS}`, CFG.color.text, 4);
+  ctx.globalAlpha = 1;
+  text(usingPad() ? `${sub}   ·   ${N.start}: pause` : sub, W / 2, y + 16, `500 13px ${SANS}`, CFG.color.dim);
+}
+
+function drawPlay() {
+  ctx.drawImage(boardCanvas, 0, 0, W, H);
+  drawFood();
+  drawGhosts();
+  drawSnake(run.phase === 'over' && run.reason !== 'full' ? Math.min(1, run.overT / 0.8) : 0);
+  drawBorder();
+  drawParticles();
+  drawRings();
+  drawHUD();
+  if (run.phase === 'ready' && state === 'play') drawReady();
+}
+
+// --- Menus and screens ----------------------------------------------------------
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 330, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(125,240,208,0.10)'; ctx.fill();
+      glowStroke(CFG.color.title, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 15px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+// A ribbon snake drifting behind the title
+const RIB_N = 56;
+const ribX = new Float32Array(RIB_N), ribY = new Float32Array(RIB_N);
+function drawTitleRibbon() {
+  for (let i = 0; i < RIB_N; i++) {
+    const s = time * 0.5 - i * 0.045;
+    ribX[i] = W / 2 + Math.sin(s * 0.9) * 360 + Math.sin(s * 2.3) * 50;
+    ribY[i] = H / 2 + Math.sin(s * 1.3 + 1) * 170 + Math.cos(s * 2.9) * 30;
+  }
+  const hue = 178 + Math.sin(time * 0.12) * 70, rgb = hslRgb(hue, 85, 64);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const bands = 7, per = (RIB_N - 1) / bands;
+  const band = k => {
+    const i0 = Math.floor(k * per), i1 = Math.min(RIB_N - 1, Math.ceil((k + 1) * per));
+    ctx.beginPath(); ctx.moveTo(ribX[i0], ribY[i0]);
+    for (let i = i0 + 1; i <= i1; i++) ctx.lineTo(ribX[i], ribY[i]);
+  };
+  for (let k = bands - 1; k >= 0; k--) { // glow (pre-mixed, so it never doubles up), then the core
+    const f = (k + 0.5) / bands;
+    band(k); ctx.strokeStyle = mixBg(rgb, 0.84 + f * 0.12); ctx.lineWidth = 36 - 12 * f; ctx.stroke();
+  }
+  for (let k = bands - 1; k >= 0; k--) {
+    const f = (k + 0.5) / bands;
+    band(k); ctx.strokeStyle = mixBg(rgb, 0.45 + f * 0.45); ctx.lineWidth = 16 - 7 * f; ctx.stroke();
+  }
+  ctx.fillStyle = mixBg(rgb, 0.4); circle(ribX[0], ribY[0], 10.5);
+  // a few orbs bobbing about
+  const orbs = [[150, 360, 44], [815, 165, 340], [800, 400, 205], [170, 160, 130]];
+  orbs.forEach((o, i) => { ctx.globalAlpha = 0.55; drawOrb(o[0], o[1] + Math.sin(time * 0.9 + i * 1.7) * 8, o[2], 1.1); });
+  ctx.globalAlpha = 1;
+}
+
+function drawTitle() {
+  ctx.drawImage(boardCanvas, 0, 0, W, H);
+  overlay(0.3);
+  drawTitleRibbon();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON SNAKE', W / 2, 96, `800 64px ${SANS}`, CFG.color.title);
+  text('glide, gather glowing orbs, and unwind', W / 2, 142, `500 15px ${SANS}`, CFG.color.dim);
+  const items = titleItems();
+  drawMenu(items, 200, true, 48);
+  const it = items[menuSel] || items[0], N = padNames();
+  text(it.hint, W / 2, 200 + items.length * 48 + 2, `500 14px ${SANS}`, CFG.color.dim);
+  const sideHint = it.value !== undefined ? '   ·   ← → change' : '';
+  const how = usingPad() || (Input.pad && !usingPointer()) ? `↑ ↓ choose   ·   ${N.a} select${sideHint}`
+    : Input.device === 'touch' ? 'Tap a choice' : Input.device === 'mouse' ? 'Click a choice'
+    : `↑ ↓ choose   ·   Enter select${sideHint}`;
+  text(how, W / 2, 200 + items.length * 48 + 28, `500 12px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 26, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`Best  Calm ${stats.bestCalm}  ·  Classic ${stats.bestClassic}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.ctx || Sfx.ctx.state !== 'running') text('click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
+  else drawIconBtn(TITLE_SOUND, 'sound');
+}
+
+function drawHowTo() {
+  ctx.drawImage(boardCanvas, 0, 0, W, H);
+  overlay(0.6);
+  const N = padNames();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 46, `800 32px ${SANS}`, CFG.color.title);
+  const C1 = 250, C2 = 430, C3 = 600;
+  const rows = [
+    ['Steer', 'D-pad / left stick', 'Arrows / W A S D', 'Swipe, or tap beside the head'],
+    ['Start moving', `Any direction or ${N.a}`, 'Any direction', 'Swipe or tap'],
+    ['Pause', N.start, 'Esc or P', 'Pause button, top right'],
+    ['Sound on/off', N.select, 'M', 'Speaker button, top right'],
+    ['Menus', `D-pad + ${N.a}, ${N.b} back`, 'Arrows + Enter', 'Tap a choice'],
+  ];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', C1, 90, `800 11px ${SANS}`, CFG.color.faint);
+  text('KEYBOARD', C2, 90, `800 11px ${SANS}`, CFG.color.faint);
+  text('TOUCH / MOUSE', C3, 90, `800 11px ${SANS}`, CFG.color.faint);
+  rows.forEach((r, i) => {
+    const y = 116 + i * 25;
+    ctx.textAlign = 'right'; text(r[0], C1 - 20, y, `600 14px ${SANS}`, CFG.color.dim);
+    ctx.textAlign = 'left';
+    text(r[1], C1, y, `600 14px ${SANS}`, CFG.color.text);
+    text(r[2], C2, y, `600 14px ${SANS}`, CFG.color.text);
+    text(r[3], C3, y, `600 14px ${SANS}`, CFG.color.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(90, 254, W - 180, 1);
+  const col = (title, color, x, lines) => {
+    text(title, x, 280, `800 12px ${SANS}`, color);
+    lines.forEach((s, i) => text(s, x, 308 + i * 25, `500 14px ${SANS}`, CFG.color.text));
+  };
+  col('CALM', CFG.color.calm, 110, [
+    'Leave one edge and you come back',
+    'on the other side.',
+    'Crossing your own body just trims the tail,',
+    'so there is no way to lose. Grow and relax.',
+    'The snake changes colour as it grows.',
+  ]);
+  col('CLASSIC', CFG.color.classic, 530, [
+    'The walls and your own body end the run.',
+    'It speeds up very slightly as you grow.',
+    'Try to beat your best length.',
+    'Eat orbs quickly one after another',
+    'and the chime climbs higher.',
+  ]);
+  ctx.textAlign = 'center';
+  text('Quick presses are remembered, so you can make tight U-turns. Speed is set on the main menu.',
+    W / 2, 452, `500 13px ${SANS}`, CFG.color.dim);
+  text(usingPad() ? `${N.b}: back` : Input.device === 'touch' ? 'Tap: back' : 'Esc or click: back', W / 2, H - 28, `600 13px ${SANS}`, CFG.color.dim);
+}
+
+function drawPause() {
+  overlay(0.62);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 168, `800 46px ${SANS}`, CFG.color.text);
+  text(`${MODE_LABEL[run.mode]}  ·  Length ${run.body.length}  ·  Orbs this run ${run.eaten}`, W / 2, 214, `600 15px ${SANS}`, CFG.color.dim);
+  drawMenu(PAUSE_ITEMS, 268);
+  const N = padNames(), key = usingPad() ? N.select : Input.device === 'touch' ? 'Tap here' : 'M';
+  const hover = Input.device === 'mouse' && inRect(Input.mouse, PAUSE_SOUND);
+  text(`${key}: sound ${Sfx.muted ? 'off' : 'on'}`, W / 2, PAUSE_SOUND.y + PAUSE_SOUND.h / 2, `500 13px ${SANS}`, hover ? CFG.color.text : CFG.color.faint);
+}
+
+function drawResult() {
+  overlay(Math.min(0.72, stateT * 1.5));
+  const r = resultInfo;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const title = r.reason === 'full' ? 'Board complete!' : r.newBest ? 'New best!' : 'Nice run';
+  glowText(title, W / 2, 120, `800 54px ${SANS}`, r.reason === 'full' || r.newBest ? CFG.color.good : CFG.color.title);
+  const why = r.reason === 'wall' ? 'The snake bumped into the wall.' : r.reason === 'self' ? 'The snake bumped into its own tail.' : 'There is no room left to grow!';
+  text(why, W / 2, 166, `500 15px ${SANS}`, CFG.color.dim);
+  text(`Length ${r.len}`, W / 2, 214, `800 32px ${MONO}`, CFG.color.text);
+  text(`Best ${r.best}   ·   Orbs this run ${r.eaten}`, W / 2, 254, `600 15px ${SANS}`, CFG.color.dim);
+  drawMenu(RESULT_ITEMS, 318, stateT > 0.6);
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text(toast.text, W / 2, H - 46, `600 14px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    drawPlay();
+    if (state === 'paused') drawPause();
+    if (state === 'result') drawResult();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>

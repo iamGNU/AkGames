@@ -1,0 +1,1509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Merge</title>
+<meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<style>
+  html, body { margin: 0; height: 100%; background: #05070f; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// 1. Settings (tweak these to change how the game feels)
+// ============================================================
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const W = 960, H = 540, TAU = Math.PI * 2;
+const JAR = { l: 310, r: 650, top: 140, bottom: 516, corner: 46 }; // inner edges of the jar
+const RIM_Y = JAR.top;                // orbs resting above this line fill the jar
+const RAIL_Y = 44;                    // the dropper slides along this line
+const QS = new URLSearchParams(location.search);
+const SHOW_FPS = QS.has('fps');
+const LOW_RES = QS.has('low');
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+
+const CFG = {
+  fullTime: 2,           // seconds orbs may rest above the rim before the jar is full
+  grace: 1.0,            // a new orb is ignored by the rim check for this long
+  dropCooldown: 0.4,     // seconds between drops
+  maxOrbs: 80,           // hard cap on bodies, so weak machines stay smooth
+  dropOdds: [30, 27, 20, 14, 9], // relative chance of dropping each of the 5 smallest orbs
+  aimSpeed: 470,         // dropper speed (px/s) with the stick, D-pad or keys
+  zenClear: 0.45,        // Zen: the top 45% of the jar clears when it gets full
+  starBonus: 150,        // points when two Stars meet
+  phys: {
+    gravity: 1150, tick: 1 / 60, substeps: 6, iterations: 3,
+    air: 0.35,           // air drag per second
+    bounce: 0.15,        // gentle restitution
+    bounceMin: 70,       // slower impacts than this don't bounce at all (keeps stacks calm)
+    friction: 0.015,     // fraction of sliding speed removed per contact per substep
+    wallFriction: 0.03,
+    maxSpeed: 1300, maxPush: 4,
+    grow: 0.24,          // seconds a merged orb takes to grow to full size
+  },
+  color: {
+    text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', good: '#8ff0c0', warn: '#ffd27a',
+    title: '#c7b6ff', accent: '#7fdfff', glass: '#8fb6ff',
+  },
+};
+
+// The orbs, smallest to largest. r is the radius in pixels. Each has its own colour and inner pattern.
+const TIERS = [
+  { name: 'Spark', r: 12, color: '#ffe7a3', pattern: 'twinkle' },
+  { name: 'Glint', r: 17, color: '#ffc396', pattern: 'trio' },
+  { name: 'Wisp',  r: 23, color: '#ff9fc0', pattern: 'ring' },
+  { name: 'Bloom', r: 29, color: '#ee9dff', pattern: 'petals' },
+  { name: 'Pearl', r: 36, color: '#b9a8ff', pattern: 'rings' },
+  { name: 'Tide',  r: 43, color: '#8fb6ff', pattern: 'facets' },
+  { name: 'Halo',  r: 50, color: '#7fdfff', pattern: 'beads' },
+  { name: 'Lumen', r: 57, color: '#79f2cf', pattern: 'hexstar' },
+  { name: 'Nova',  r: 63, color: '#c2f28c', pattern: 'rays' },
+  { name: 'Star',  r: 69, color: '#fff1cf', pattern: 'star' },
+];
+TIERS.forEach((T, i) => { T.points = i * (i + 1); }); // points for making this orb by a merge
+const TOP = TIERS.length - 1;
+// Merge chimes rise with the orb: a pentatonic scale, so any run of merges sounds pleasant.
+const NOTES = [392, 440, 523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51];
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+const ease = t => 1 - (1 - t) * (1 - t) * (1 - t);
+function radial(x, y, dz, out) {
+  const m = Math.hypot(x, y);
+  if (m < dz) { out.x = 0; out.y = 0; out.m = 0; return out; }
+  const n = Math.min(1, (m - dz) / (1 - dz));
+  out.x = (x / m) * n; out.y = (y / m) * n; out.m = n;
+  return out;
+}
+function load(key, def) { try { const v = localStorage.getItem(key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+function fmtNum(n) { return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function hexRgb(hex) { const n = parseInt(hex.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+function rgba(hex, a) { const c = hexRgb(hex); return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+function mix(a, b, f, alpha = 1) {
+  const p = hexRgb(a), q = hexRgb(b);
+  return `rgba(${Math.round(p[0] + (q[0] - p[0]) * f)},${Math.round(p[1] + (q[1] - p[1]) * f)},${Math.round(p[2] + (q[2] - p[2]) * f)},${alpha})`;
+}
+function seeded(seed) { let s = seed; return () => (s = (s * 16807) % 2147483647) / 2147483647; }
+
+class Pool {
+  constructor(n, make) {
+    this.items = [];
+    for (let i = 0; i < n; i++) { const o = make(); o.active = false; this.items.push(o); }
+    this.next = 0;
+  }
+  get() {
+    const a = this.items, n = a.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.next + k) % n;
+      if (!a[i].active) { this.next = (i + 1) % n; a[i].active = true; return a[i]; }
+    }
+    return null;
+  }
+  clear() { for (const o of this.items) o.active = false; }
+}
+
+// ============================================================
+// Canvas, backdrop and orb sprites (all glow is drawn once, here)
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;
+let titleBg = null, playBg = null, glossSprite = null;
+const haloSprites = [], bodySprites = [], dotSprites = [];
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  const dpr = window.devicePixelRatio || 1;
+  rs = LOW_RES ? 1 : clamp(s * dpr, 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  titleBg = makeLayer(g => drawBackdrop(g));
+  playBg = makeLayer(g => { drawBackdrop(g); drawJar(g); });
+  buildSprites();
+}
+
+function makeLayer(draw) {
+  const c = document.createElement('canvas');
+  c.width = canvas.width; c.height = canvas.height;
+  const g = c.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  draw(g);
+  return c;
+}
+
+function drawBackdrop(g) {
+  const bg = g.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0a0d1c'); bg.addColorStop(1, '#05070f');
+  g.fillStyle = bg; g.fillRect(-10, -10, W + 20, H + 20);
+  const rnd = seeded(7);
+  for (let i = 0; i < 16; i++) { // soft out-of-focus blobs
+    const x = rnd() * W, y = rnd() * H, r = 50 + rnd() * 110, col = TIERS[i % TIERS.length].color;
+    const gr = g.createRadialGradient(x, y, 0, x, y, r);
+    gr.addColorStop(0, rgba(col, 0.05 + rnd() * 0.03)); gr.addColorStop(1, rgba(col, 0));
+    g.fillStyle = gr; g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  }
+  for (let i = 0; i < 70; i++) { // faint specks
+    g.globalAlpha = 0.12 + rnd() * 0.28;
+    g.fillStyle = '#dfe8ff';
+    const s = 0.8 + rnd() * 1.1;
+    g.fillRect(rnd() * W, rnd() * H, s, s);
+  }
+  g.globalAlpha = 1;
+}
+
+function jarPath(g, o, lip) { // o: how far outside the inner edge; lip: rim flange length
+  const l = JAR.l - o, r = JAR.r + o, b = JAR.bottom + o, t = JAR.top, c = JAR.corner + o;
+  g.beginPath();
+  g.moveTo(l - lip, t); g.lineTo(l, t);
+  g.lineTo(l, b - c); g.arcTo(l, b, l + c, b, c);
+  g.lineTo(r - c, b); g.arcTo(r, b, r, b - c, c);
+  g.lineTo(r, t); g.lineTo(r + lip, t);
+}
+
+function drawJar(g) {
+  // glass body
+  jarPath(g, 0, 0); g.closePath();
+  const gl = g.createLinearGradient(0, JAR.top, 0, JAR.bottom);
+  gl.addColorStop(0, 'rgba(143,182,255,0.025)'); gl.addColorStop(1, 'rgba(143,182,255,0.075)');
+  g.fillStyle = gl; g.fill();
+  // soft pool of light under the jar
+  const fl = g.createRadialGradient(W / 2, JAR.bottom + 8, 10, W / 2, JAR.bottom + 8, 230);
+  fl.addColorStop(0, 'rgba(143,182,255,0.10)'); fl.addColorStop(1, 'rgba(143,182,255,0)');
+  g.fillStyle = fl; g.fillRect(JAR.l - 240, JAR.bottom - 120, JAR.r - JAR.l + 480, 160);
+  // neon outline: wide faint + medium + thin bright
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  jarPath(g, 3, 14);
+  g.strokeStyle = CFG.color.glass;
+  g.globalAlpha = 0.08; g.lineWidth = 16; g.stroke();
+  g.globalAlpha = 0.22; g.lineWidth = 6; g.stroke();
+  g.globalAlpha = 0.95; g.lineWidth = 2; g.strokeStyle = '#cfe0ff'; g.stroke();
+  // reflections on the glass
+  g.globalAlpha = 0.1; g.strokeStyle = '#ffffff'; g.lineWidth = 3;
+  g.beginPath(); g.moveTo(JAR.l + 12, JAR.top + 40); g.lineTo(JAR.l + 12, JAR.bottom - 110); g.stroke();
+  g.globalAlpha = 0.08; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(JAR.r - 12, JAR.top + 60); g.lineTo(JAR.r - 12, JAR.top + 150); g.stroke();
+  g.globalAlpha = 1; g.lineCap = 'butt';
+}
+
+function canvasFor(worldHalf) {
+  const c = document.createElement('canvas');
+  c.width = c.height = Math.max(2, Math.ceil(worldHalf * 2 * rs));
+  const g = c.getContext('2d');
+  const s = c.width / (worldHalf * 2);
+  g.setTransform(s, 0, 0, s, c.width / 2, c.height / 2); // origin at the centre, in world units
+  return { c, g };
+}
+
+function buildSprites() {
+  haloSprites.length = 0; bodySprites.length = 0; dotSprites.length = 0;
+  for (const T of TIERS) {
+    haloSprites.push(makeHalo(T)); bodySprites.push(makeBody(T)); dotSprites.push(makeDot(T.color));
+  }
+  const s = canvasFor(16);
+  const gr = s.g.createRadialGradient(0, 0, 0, 0, 0, 16);
+  gr.addColorStop(0, 'rgba(255,255,255,0.55)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+  s.g.fillStyle = gr; s.g.fillRect(-16, -16, 32, 32);
+  glossSprite = s.c;
+}
+
+function makeHalo(T) {
+  const r = T.r, half = Math.ceil(r * 1.5 + 6), s = canvasFor(half), g = s.g;
+  const gr = g.createRadialGradient(0, 0, r * 0.8, 0, 0, half);
+  gr.addColorStop(0, rgba(T.color, 0.3)); gr.addColorStop(0.35, rgba(T.color, 0.1)); gr.addColorStop(1, rgba(T.color, 0));
+  g.fillStyle = gr; g.beginPath(); g.arc(0, 0, half, 0, TAU); g.fill();
+  return { c: s.c, half };
+}
+
+function makeBody(T) {
+  const r = T.r, half = r + 3, s = canvasFor(half), g = s.g;
+  const gr = g.createRadialGradient(0, 0, 0, 0, 0, r);
+  gr.addColorStop(0, mix(T.color, '#ffffff', 0.3, 0.95));
+  gr.addColorStop(0.55, rgba(T.color, 0.6));
+  gr.addColorStop(1, mix(T.color, '#141a3a', 0.45, 0.92));
+  g.fillStyle = gr; g.beginPath(); g.arc(0, 0, r, 0, TAU); g.fill();
+  drawPattern(g, T, r);
+  g.beginPath(); g.arc(0, 0, r - 1.2, 0, TAU);
+  g.globalAlpha = 0.3; g.strokeStyle = T.color; g.lineWidth = 4; g.stroke();
+  g.globalAlpha = 1; g.strokeStyle = mix(T.color, '#ffffff', 0.45); g.lineWidth = 1.6; g.stroke();
+  return { c: s.c, half };
+}
+
+function makeDot(color) {
+  const s = canvasFor(8), g = s.g;
+  const gr = g.createRadialGradient(0, 0, 0, 0, 0, 8);
+  gr.addColorStop(0, mix(color, '#ffffff', 0.6, 1)); gr.addColorStop(0.4, rgba(color, 0.6)); gr.addColorStop(1, rgba(color, 0));
+  g.fillStyle = gr; g.fillRect(-8, -8, 16, 16);
+  return s.c;
+}
+
+// Simple procedural patterns inside each orb (rings, dots, facets...)
+function drawPattern(g, T, r) {
+  const pc = mix(T.color, '#ffffff', 0.65);
+  g.strokeStyle = pc; g.fillStyle = pc; g.lineWidth = Math.max(1.3, r * 0.05);
+  g.lineJoin = 'round'; g.lineCap = 'round';
+  g.globalAlpha = 0.6;
+  const ring = rad => { g.beginPath(); g.arc(0, 0, rad, 0, TAU); g.stroke(); };
+  const dot = (x, y, rad) => { g.beginPath(); g.arc(x, y, rad, 0, TAU); g.fill(); };
+  const around = (n, rad, fn) => { for (let i = 0; i < n; i++) { const a = -Math.PI / 2 + (i * TAU) / n; fn(Math.cos(a) * rad, Math.sin(a) * rad, a); } };
+  const star = (n, outer, inner) => {
+    g.beginPath();
+    for (let i = 0; i < n * 2; i++) {
+      const a = -Math.PI / 2 + (i * Math.PI) / n, rad = i % 2 ? inner : outer;
+      if (i) g.lineTo(Math.cos(a) * rad, Math.sin(a) * rad); else g.moveTo(Math.cos(a) * rad, Math.sin(a) * rad);
+    }
+    g.closePath();
+  };
+  const poly = (n, rad, off) => {
+    g.beginPath();
+    for (let i = 0; i < n; i++) { const a = off + (i * TAU) / n; if (i) g.lineTo(Math.cos(a) * rad, Math.sin(a) * rad); else g.moveTo(Math.cos(a) * rad, Math.sin(a) * rad); }
+    g.closePath();
+  };
+  switch (T.pattern) {
+    case 'twinkle': g.globalAlpha = 0.85; star(4, r * 0.66, r * 0.2); g.fill(); break;
+    case 'trio': around(3, r * 0.4, (x, y) => dot(x, y, r * 0.15)); break;
+    case 'ring': ring(r * 0.52); dot(0, 0, r * 0.14); break;
+    case 'petals': around(5, r * 0.5, (x, y) => dot(x, y, r * 0.14)); ring(r * 0.22); break;
+    case 'rings': ring(r * 0.32); ring(r * 0.62); around(3, r * 0.62, (x, y) => dot(x, y, r * 0.075)); break;
+    case 'facets':
+      poly(6, r * 0.62, -Math.PI / 2); g.stroke();
+      g.globalAlpha = 0.35; g.beginPath();
+      around(6, r * 0.62, (x, y) => { g.moveTo(0, 0); g.lineTo(x, y); }); g.stroke();
+      break;
+    case 'beads': around(8, r * 0.64, (x, y) => dot(x, y, r * 0.065)); ring(r * 0.38); dot(0, 0, r * 0.1); break;
+    case 'hexstar': poly(3, r * 0.66, -Math.PI / 2); g.stroke(); poly(3, r * 0.66, Math.PI / 2); g.stroke(); ring(r * 0.22); break;
+    case 'rays':
+      g.beginPath();
+      around(12, 1, (x, y) => { g.moveTo(x * r * 0.34, y * r * 0.34); g.lineTo(x * r * 0.64, y * r * 0.64); });
+      g.stroke(); ring(r * 0.2);
+      break;
+    case 'star':
+      star(5, r * 0.62, r * 0.26); g.globalAlpha = 0.32; g.fill(); g.globalAlpha = 0.7; g.stroke();
+      g.globalAlpha = 0.3; ring(r * 0.8);
+      break;
+  }
+  g.globalAlpha = 1; g.lineCap = 'butt';
+}
+
+// ============================================================
+// Sound: tiny WebAudio synth, no audio files. Everything is soft.
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, noiseBuf: null, muted: load('neonMerge.muted', '0') === '1', last: {},
+  init() {
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.32;
+        this.master.connect(this.ctx.destination);
+        const len = Math.floor(this.ctx.sampleRate * 0.6);
+        this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const d = this.noiseBuf.getChannelData(0);
+        for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: game still works */ }
+  },
+  ok(key, gap) {
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  // A soft bell: sine with a quiet overtone, quick (not clicky) attack, long gentle fade.
+  bell(f, vol, dur, delay = 0) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    g.connect(this.master);
+    const o1 = c.createOscillator(), o2 = c.createOscillator(), g2 = c.createGain();
+    o1.type = 'sine'; o1.frequency.setValueAtTime(f, t);
+    o2.type = 'sine'; o2.frequency.setValueAtTime(f * 2.005, t);
+    g2.gain.value = 0.16;
+    o1.connect(g); o2.connect(g2); g2.connect(g);
+    o1.start(t); o2.start(t); o1.stop(t + dur + 0.05); o2.stop(t + dur + 0.05);
+  },
+  tone(f1, f2, dur, type, vol, delay = 0) {
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  swell(dur, vol, freq, delay = 0) { // filtered noise that fades in and out, like a soft breath
+    const c = this.ctx, t = c.currentTime + delay;
+    const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = this.noiseBuf; s.loop = true;
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + dur * 0.35);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t); s.stop(t + dur + 0.02);
+  },
+  merge(t) {
+    if (!this.ok('merge', 0.045)) return;
+    this.bell(NOTES[t], 0.11 - t * 0.004, 0.7 + t * 0.09);
+    if (t >= 5) this.bell(NOTES[t] * 1.5, 0.03, 0.9, 0.07);
+  },
+  starburst() {
+    if (!this.ok()) return;
+    [0, 2, 4, 5, 7, 9].forEach((n, i) => this.bell(NOTES[n], 0.065, 1.5, i * 0.1));
+    this.swell(1.6, 0.03, 2400);
+  },
+  drop()   { if (this.ok('drop', 0.05)) this.tone(560, 400, 0.12, 'sine', 0.06); },
+  land(s)  { if (this.ok('land', 0.09)) this.tone(210, 150, 0.09, 'sine', Math.min(0.06, 0.012 + s / 14000)); },
+  bump()   { if (this.ok('bump', 0.25)) this.tone(200, 170, 0.12, 'triangle', 0.05); },
+  sparkle(){ if (this.ok('sparkle', 0.07)) this.bell(NOTES[5 + Math.floor(Math.random() * 5)], 0.025, 0.45); },
+  tidy()   { if (this.ok()) { this.swell(1.3, 0.05, 900); [7, 5, 4, 2].forEach((n, i) => this.bell(NOTES[n], 0.045, 1.0, 0.1 + i * 0.12)); } },
+  full()   { if (this.ok()) [4, 2, 0].forEach((n, i) => this.bell(NOTES[n], 0.07, 1.3, i * 0.24)); },
+  tick()   { if (this.ok('tick', 0.03)) this.tone(660, 660, 0.04, 'triangle', 0.035); },
+  select() { if (this.ok()) { this.bell(523.25, 0.06, 0.25); this.bell(783.99, 0.06, 0.35, 0.06); } },
+  blip()   { if (this.ok()) this.bell(587.33, 0.05, 0.2); },
+  toggle() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.32;
+  },
+};
+
+// ============================================================
+// Input: gamepad + keyboard + mouse/touch merged into one state
+// ============================================================
+const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const Input = {
+  keys: new Set(), pressed: new Set(), navKeys: new Set(),
+  mouse: { x: W / 2, y: H / 2, clicked: false, moved: false },
+  // pointer.armed: this press began in the current screen, so lifting it may drop an orb
+  pointer: { type: 'mouse', id: null, down: false, armed: false, released: false },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',            // 'kb' (keyboard + mouse), 'pad' or 'touch'
+  ls: { x: 0, y: 0, m: 0 },
+  aim: 0, drop: false,
+  pause: false, mute: false, select: false, back: false,
+  navUp: false, navDown: false, navLeft: false, navRight: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      if (NAV_CODES.has(e.code)) this.navKeys.add(e.code);
+      this.keys.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.keys.delete(e.code));
+    addEventListener('blur', () => { this.keys.clear(); this.pointer.down = false; this.pointer.armed = false; });
+    canvas.addEventListener('pointerdown', e => {
+      const type = e.pointerType || 'mouse';
+      if (type === 'mouse' && e.button !== 0) return;
+      this.toWorld(e);
+      const p = this.pointer;
+      p.type = type; p.id = e.pointerId; p.down = true; p.armed = true;
+      this.mouse.clicked = true; this.mouse.moved = true;
+      this.device = type === 'mouse' ? 'kb' : 'touch';
+      try { if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      if (e.cancelable && e.preventDefault) e.preventDefault();
+      Sfx.init();
+    });
+    addEventListener('pointermove', e => {
+      this.toWorld(e); this.mouse.moved = true;
+      if (!this.pointer.down) this.pointer.type = e.pointerType || 'mouse';
+    });
+    const up = (e, cancelled) => {
+      const p = this.pointer;
+      if (!p.down || (p.id != null && e.pointerId != null && e.pointerId !== p.id)) return;
+      this.toWorld(e);
+      if (!cancelled && p.armed && p.type !== 'mouse') p.released = true; // a finger lifted: drop
+      p.down = false;
+    };
+    addEventListener('pointerup', e => up(e, false));
+    addEventListener('pointercancel', e => up(e, true));
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => {
+      this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
+      showToast('Controller connected');
+    });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  toWorld(e) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    this.mouse.x = ((e.clientX - r.left) / r.width) * W;
+    this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  // Forget the press in progress (used when the screen changes under the finger).
+  disarm() { this.pointer.armed = false; this.pointer.released = false; },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const k = this.keys, P = this.pressed, N = this.navKeys;
+    let ax = (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0) - (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0);
+    let drop = P.has('Space') || P.has('Enter') || P.has('NumpadEnter') || P.has('ArrowDown') || P.has('KeyS');
+    let pause = P.has('Escape') || P.has('KeyP');
+    let mute = P.has('KeyM');
+    let select = P.has('Enter') || P.has('NumpadEnter') || P.has('Space');
+    let back = P.has('Escape') || P.has('Backspace');
+    let up = N.has('ArrowUp') || N.has('KeyW'), down = N.has('ArrowDown') || N.has('KeyS');
+    let left = N.has('ArrowLeft') || N.has('KeyA'), right = N.has('ArrowRight') || N.has('KeyD');
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // First frame with this pad: buttons already held (e.g. A from the game picker) are not new presses.
+      if (!prev.length) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      radial(pad.axes[0] || 0, pad.axes[1] || 0, 0.2, this.ls);
+      const dx = (on(15) ? 1 : 0) - (on(14) ? 1 : 0);
+      ax += this.ls.x + dx;
+      if (tap(0) || tap(2) || tap(13)) drop = true;
+      if (tap(9)) pause = true;
+      if (tap(8)) mute = true;
+      if (tap(0) || tap(9)) select = true;
+      if (tap(1)) back = true;
+      if (tap(12)) up = true;
+      if (tap(13)) down = true;
+      if (tap(14)) left = true;
+      if (tap(15)) right = true;
+      // Left stick as a menu cursor: one step per push, auto-repeat when held.
+      const sx = pad.axes[0] || 0, sy = pad.axes[1] || 0;
+      let dir = 0;
+      if (Math.abs(sy) > 0.6 && Math.abs(sy) >= Math.abs(sx)) dir = sy < 0 ? 1 : 2;
+      else if (Math.abs(sx) > 0.6) dir = sx < 0 ? 3 : 4;
+      let step = 0;
+      if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir) { this.stickHold += dt; if (this.stickHold > 0.35) { this.stickHold = 0.22; step = dir; } }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || this.ls.m > 0 || dx) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.aim = clamp(ax, -1, 1);
+    this.drop = drop;
+    this.pause = pause; this.mute = mute; this.select = select; this.back = back;
+    this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
+  },
+
+  endFrame() {
+    this.pressed.clear(); this.navKeys.clear();
+    this.mouse.clicked = false; this.mouse.moved = false; this.pointer.released = false;
+  },
+
+  rumble(strong, weak, ms) {
+    const a = this.pad && this.pad.vibrationActuator;
+    if (!a || !a.playEffect) return;
+    try {
+      const r = a.playEffect('dual-rumble', { duration: ms, strongMagnitude: strong, weakMagnitude: weak });
+      if (r && r.catch) r.catch(() => {});
+    } catch (e) { /* rumble not supported */ }
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() {
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps ? { a: '✕', b: '○', x: '□', start: 'Options', select: 'Create' } : { a: 'A', b: 'B', x: 'X', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+let state = 'title', stateT = 0, time = 0;
+let pausedFrom = 'play';
+const bests = { classic: +load('neonMerge.best.classic', 0) || 0, zen: +load('neonMerge.best.zen', 0) || 0 };
+let stats = { games: 0, merges: 0, stars: 0, top: 0 };
+try { stats = Object.assign(stats, JSON.parse(load('neonMerge.stats', '{}'))); } catch (e) { /* ignore */ }
+const toast = { text: '', t: 0 };
+let resultInfo = null;
+const parts = new Pool(LOW_RES ? 140 : 240, () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, tier: 0, size: 3 }));
+const rings = new Pool(24, () => ({ x: 0, y: 0, r0: 0, r1: 0, life: 0, max: 1, color: '#fff' }));
+const pops = new Pool(24, () => ({ x: 0, y: 0, text: '', life: 0, max: 1, color: '#fff', size: 16 }));
+const motes = [];
+for (let i = 0; i < (LOW_RES ? 0 : 14); i++) motes.push({ x: Math.random() * W, y: Math.random() * H, sp: 6 + Math.random() * 10, ph: Math.random() * TAU, tier: i % TIERS.length, s: 2 + Math.random() * 3 });
+
+const G = {
+  mode: 'classic', phase: 'play',   // phase: 'play' or 'full' (Classic only, just before the end card)
+  score: 0, shown: 0, pulse: 0,
+  cur: 0, next: 0, cool: 0, aimX: W / 2, aimV: 0,
+  acc: 0, danger: 0, clearT: 0, fullT: 0, impact: 0,
+  drops: 0, merges: 0, stars: 0, maxTier: 0, clears: 0, newBest: false,
+};
+const orbs = [];       // live physics bodies
+const ghosts = [];     // orbs fading away (Zen tidy-up, starbursts); visual only
+const born = [];
+let nextOrbId = 1;
+
+function showToast(text) { toast.text = text; toast.t = 2.2; }
+
+let menuSel = 0;
+const menuRects = [];
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { pausedFrom = state; commitScore(); setState('paused'); Sfx.blip(); }
+function resumeGame() { state = pausedFrom; Input.disarm(); Sfx.blip(); }
+function toTitle() { parts.clear(); rings.clear(); pops.clear(); setState('title'); }
+function toggleSound() { Sfx.toggle(); save('neonMerge.muted', Sfx.muted ? 1 : 0); showToast(Sfx.muted ? 'Sound off' : 'Sound on'); }
+
+// ============================================================
+// 2. Playing: dropping, physics, merging
+// ============================================================
+function rollTier() {
+  const odds = G.drops < 4 ? [45, 35, 20] : CFG.dropOdds; // a gentle start
+  let u = Math.random() * odds.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < odds.length; i++) { u -= odds[i]; if (u < 0) return i; }
+  return 0;
+}
+function hangY(t) { return RAIL_Y + 10 + TIERS[t].r; }
+
+function makeOrb(tier, x, y, r0) {
+  const full = TIERS[tier].r, start = r0 == null ? full : r0;
+  return {
+    id: nextOrbId++, tier, x, y, vx: 0, vy: 0, px: x, py: y, pvx: 0, pvy: 0, lx: x, ly: y, ix: x, iy: y,
+    r: start, r0: start, grow: start >= full ? 1 : 0, inv: 1 / (start * start),
+    angle: Math.random() * TAU, age: 0, flash: 0, dead: false, wall: false, wnx: 0, wny: 0,
+  };
+}
+
+function startGame(mode) {
+  Object.assign(G, {
+    mode, phase: 'play', score: 0, shown: 0, pulse: 0, cool: 0, aimX: (JAR.l + JAR.r) / 2, aimV: 0,
+    acc: 0, danger: 0, clearT: 0, fullT: 0, impact: 0, drops: 0, merges: 0, stars: 0, maxTier: 0, clears: 0, newBest: false,
+  });
+  orbs.length = 0; ghosts.length = 0; born.length = 0;
+  parts.clear(); rings.clear(); pops.clear();
+  G.cur = rollTier(); G.next = rollTier();
+  stats.games++;
+  save('neonMerge.stats', JSON.stringify(stats));
+  Input.disarm();
+  setState('play');
+}
+
+function tryDrop() {
+  if (G.phase !== 'play' || G.cool > 0 || G.clearT > 0) return false;
+  if (orbs.length >= CFG.maxOrbs) { Sfx.bump(); return false; }
+  const t = G.cur, r = TIERS[t].r, x = clamp(G.aimX, JAR.l + r, JAR.r - r), y = hangY(t);
+  for (const o of orbs) { // never spawn inside another orb (the pile has reached the dropper)
+    const dx = o.x - x, dy = o.y - y, R = o.r + r;
+    if (dx * dx + dy * dy < R * R) { Sfx.bump(); return false; }
+  }
+  const o = makeOrb(t, x, y);
+  o.vy = 40;
+  orbs.push(o);
+  G.drops++;
+  G.cur = G.next; G.next = rollTier();
+  G.cool = CFG.dropCooldown;
+  Sfx.drop();
+  return true;
+}
+
+// --- Physics: position-based, fixed 60 Hz ticks, several substeps each ---
+const MAXP = (CFG.maxOrbs * (CFG.maxOrbs - 1)) / 2;
+const pairA = new Int16Array(MAXP), pairB = new Int16Array(MAXP);
+const pairTouch = new Uint8Array(MAXP), pairEver = new Uint8Array(MAXP);
+const pairNX = new Float32Array(MAXP), pairNY = new Float32Array(MAXP);
+let pairCount = 0;
+
+// Candidate pairs: anything that could touch during this tick (built once, reused by every substep).
+function buildPairs(margin) {
+  pairCount = 0;
+  const n = orbs.length;
+  for (let i = 0; i < n; i++) {
+    const a = orbs[i], ra = TIERS[a.tier].r + margin;
+    for (let j = i + 1; j < n; j++) {
+      const b = orbs[j], rr = ra + TIERS[b.tier].r;
+      const dx = b.x - a.x; if (dx > rr || dx < -rr) continue;
+      const dy = b.y - a.y; if (dy > rr || dy < -rr) continue;
+      if (dx * dx + dy * dy > rr * rr) continue;
+      if (pairCount >= MAXP) return;
+      pairA[pairCount] = i; pairB[pairCount] = j; pairEver[pairCount] = 0;
+      pairCount++;
+    }
+  }
+}
+
+// Keep an orb inside the jar: straight walls (which continue invisibly upward), a flat floor
+// and rounded bottom corners. Returns with o.wall set and the inward normal when it touched.
+function confine(o) {
+  const r = o.r, L = JAR.l + r, R = JAR.r - r, B = JAR.bottom - r;
+  let x = o.x, y = o.y, nx = 0, ny = 0;
+  if (x < L) { x = L; nx = 1; } else if (x > R) { x = R; nx = -1; }
+  if (y > B) { y = B; ny = -1; }
+  const rc = JAR.corner - r, cy = JAR.bottom - JAR.corner;
+  if (rc > 0 && y > cy) {
+    const cx = x < JAR.l + JAR.corner ? JAR.l + JAR.corner : x > JAR.r - JAR.corner ? JAR.r - JAR.corner : 0;
+    if (cx) {
+      const dx = x - cx, dy = y - cy, d = Math.hypot(dx, dy);
+      if (d > rc) { x = cx + (dx / d) * rc; y = cy + (dy / d) * rc; nx = -dx / d; ny = -dy / d; }
+    }
+  }
+  if (nx || ny) {
+    const m = Math.hypot(nx, ny);
+    o.x = x; o.y = y; o.wall = true; o.wnx = nx / m; o.wny = ny / m;
+  }
+}
+
+function substep(h) {
+  const P = CFG.phys, n = orbs.length, air = 1 - P.air * h, gv = P.gravity * h, maxV = P.maxSpeed;
+  for (let i = 0; i < n; i++) {
+    const o = orbs[i];
+    if (o.grow < 1) {
+      o.grow = Math.min(1, o.grow + h / P.grow);
+      const e = o.grow * o.grow * (3 - 2 * o.grow);
+      o.r = o.r0 + (TIERS[o.tier].r - o.r0) * e;
+    }
+    o.inv = 1 / (o.r * o.r); // bigger orbs are heavier
+    o.pvx = o.vx; o.pvy = o.vy;
+    o.vy += gv; o.vx *= air; o.vy *= air;
+    const sp = o.vx * o.vx + o.vy * o.vy;
+    if (sp > maxV * maxV) { const k = maxV / Math.sqrt(sp); o.vx *= k; o.vy *= k; }
+    o.px = o.x; o.py = o.y;
+    o.x += o.vx * h; o.y += o.vy * h;
+    o.wall = false;
+  }
+  for (let p = 0; p < pairCount; p++) pairTouch[p] = 0;
+  // Push overlapping orbs apart (a few Gauss-Seidel passes), then keep them in the jar.
+  for (let it = 0; it < P.iterations; it++) {
+    for (let p = 0; p < pairCount; p++) {
+      const a = orbs[pairA[p]], b = orbs[pairB[p]];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      const rr = a.r + b.r, d2 = dx * dx + dy * dy;
+      if (d2 >= rr * rr) continue;
+      let d = Math.sqrt(d2);
+      if (d < 1e-6) { dx = 0.01; dy = -1; d = Math.hypot(dx, dy); }
+      const nx = dx / d, ny = dy / d, wa = a.inv, wb = b.inv;
+      const s = Math.min(rr - d, P.maxPush) / (wa + wb);
+      a.x -= nx * s * wa; a.y -= ny * s * wa;
+      b.x += nx * s * wb; b.y += ny * s * wb;
+      pairTouch[p] = 1; pairEver[p] = 1; pairNX[p] = nx; pairNY[p] = ny;
+    }
+    for (let i = 0; i < n; i++) confine(orbs[i]);
+  }
+  for (let i = 0; i < n; i++) {
+    const o = orbs[i];
+    o.vx = (o.x - o.px) / h; o.vy = (o.y - o.py) / h;
+  }
+  // Contact velocities: a gentle bounce for real impacts, and friction on sliding.
+  for (let p = 0; p < pairCount; p++) {
+    if (!pairTouch[p]) continue;
+    const a = orbs[pairA[p]], b = orbs[pairB[p]], nx = pairNX[p], ny = pairNY[p];
+    const wa = a.inv, wb = b.inv, ws = wa + wb;
+    const vn0 = (b.pvx - a.pvx) * nx + (b.pvy - a.pvy) * ny; // approach speed before this substep
+    if (vn0 < -P.bounceMin) {
+      const vn = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny, dv = -P.bounce * vn0 - vn;
+      if (dv > 0) { const j = dv / ws; a.vx -= nx * j * wa; a.vy -= ny * j * wa; b.vx += nx * j * wb; b.vy += ny * j * wb; }
+      if (-vn0 > G.impact) G.impact = -vn0;
+    }
+    const rvx = b.vx - a.vx, rvy = b.vy - a.vy, vn = rvx * nx + rvy * ny;
+    const tx = rvx - vn * nx, ty = rvy - vn * ny, jt = P.friction / ws;
+    a.vx += tx * jt * wa; a.vy += ty * jt * wa; b.vx -= tx * jt * wb; b.vy -= ty * jt * wb;
+  }
+  for (let i = 0; i < n; i++) {
+    const o = orbs[i];
+    if (o.wall) {
+      const nx = o.wnx, ny = o.wny, vn0 = o.pvx * nx + o.pvy * ny;
+      if (vn0 < -P.bounceMin) {
+        const dv = -P.bounce * vn0 - (o.vx * nx + o.vy * ny);
+        if (dv > 0) { o.vx += nx * dv; o.vy += ny * dv; }
+        if (-vn0 > G.impact) G.impact = -vn0;
+      }
+      const vn = o.vx * nx + o.vy * ny, tx = o.vx - vn * nx, ty = o.vy - vn * ny;
+      o.vx -= tx * P.wallFriction; o.vy -= ty * P.wallFriction;
+    }
+    o.angle += (o.vx * h) / o.r; // roll as it moves
+    if (o.angle > TAU) o.angle -= TAU; else if (o.angle < 0) o.angle += TAU;
+  }
+}
+
+function physicsTick() {
+  const P = CFG.phys, h = P.tick / P.substeps;
+  let vmax = 0;
+  for (const o of orbs) { const v = Math.hypot(o.vx, o.vy); if (v > vmax) vmax = v; o.lx = o.x; o.ly = o.y; }
+  buildPairs(6 + 2 * Math.min(vmax, P.maxSpeed) * P.tick);
+  for (let s = 0; s < P.substeps; s++) substep(h);
+  for (const o of orbs) o.age += P.tick;
+  findMerges();
+}
+
+// Two orbs of the same kind that touched this tick become one orb of the next kind.
+function findMerges() {
+  let any = false;
+  for (let p = 0; p < pairCount; p++) {
+    if (!pairEver[p]) continue;
+    const a = orbs[pairA[p]], b = orbs[pairB[p]];
+    if (a.dead || b.dead || a.tier !== b.tier) continue;
+    mergeOrbs(a, b);
+    any = true;
+  }
+  if (!any) return;
+  let w = 0;
+  for (let i = 0; i < orbs.length; i++) if (!orbs[i].dead) orbs[w++] = orbs[i];
+  orbs.length = w;
+  for (const o of born) orbs.push(o);
+  born.length = 0;
+}
+
+function mergeOrbs(a, b) {
+  a.dead = b.dead = true;
+  const x = (a.x + b.x) / 2, y = (a.y + b.y) / 2, t = a.tier;
+  G.merges++; stats.merges++;
+  if (t === TOP) { // two Stars: a starburst, and both float away
+    G.stars++; stats.stars++;
+    addScore(CFG.starBonus, x, y - 20, TIERS[TOP].color, 22);
+    for (const o of [a, b]) ghosts.push({ x: o.x, y: o.y, r: o.r, tier: o.tier, angle: o.angle, delay: 0, t: 0, dur: 0.7, kind: 'glow' });
+    for (let i = 0; i < TIERS.length; i++) burst(x, y, i, LOW_RES ? 3 : 6, 260, 1.2, 5);
+    ring(x, y, 40, 230, TIERS[TOP].color, 1.0);
+    ring(x, y, 20, 160, TIERS[7].color, 0.8);
+    showToast('Starburst!');
+    Sfx.starburst();
+    Input.rumble(0.2, 0.4, 260);
+    return;
+  }
+  const nt = t + 1, T = TIERS[nt];
+  const o = makeOrb(nt, x, y, TIERS[t].r * 0.45); // starts small and grows, so neighbours are eased aside
+  o.vx = (a.vx + b.vx) * 0.25; o.vy = (a.vy + b.vy) * 0.25;
+  o.angle = a.angle; o.flash = 1;
+  born.push(o);
+  if (nt > G.maxTier) G.maxTier = nt;
+  if (nt > stats.top) { stats.top = nt; if (nt >= 3) showToast(`New orb: ${T.name}!`); }
+  addScore(T.points, x, y - T.r * 0.6, T.color, 15 + nt);
+  burst(x, y, nt, (LOW_RES ? 5 : 10) + t * 2, 80 + t * 14, 0.8, 3.5 + t * 0.3);
+  ring(x, y, TIERS[t].r * 0.6, T.r + 16, T.color, 0.55);
+  Sfx.merge(nt);
+  if (nt >= 4) Input.rumble(0, Math.min(0.5, 0.1 + nt * 0.04), 70);
+}
+
+function addScore(n, x, y, color, size) {
+  G.score += n; G.pulse = 1;
+  const p = pops.get();
+  if (p) { p.x = x; p.y = y; p.text = `+${n}`; p.life = p.max = 1.1; p.color = color; p.size = size; }
+}
+
+function commitScore() {
+  const k = G.mode;
+  if (G.score > bests[k]) { bests[k] = G.score; G.newBest = true; save(`neonMerge.best.${k}`, G.score); }
+  save('neonMerge.stats', JSON.stringify(stats));
+}
+
+function overRim(o) { return o.age > CFG.grace && o.y - o.r < RIM_Y; }
+
+// Orbs resting above the rim for CFG.fullTime seconds fill the jar.
+function checkFull(dt) {
+  if (G.clearT > 0) { G.danger = 0; return; }
+  let over = orbs.length >= CFG.maxOrbs;
+  for (let i = 0; i < orbs.length && !over; i++) if (overRim(orbs[i])) over = true;
+  G.danger = over ? G.danger + dt : Math.max(0, G.danger - dt * 1.5);
+  if (G.danger >= CFG.fullTime) { if (G.mode === 'zen') zenTidy(); else jarFull(); }
+}
+
+function jarFull() {
+  G.phase = 'full'; G.fullT = 0; G.danger = 0;
+  commitScore();
+  Sfx.full();
+}
+
+// Zen: instead of ending, the top part of the jar gently clears.
+function zenTidy() {
+  const cut = RIM_Y + (JAR.bottom - RIM_Y) * CFG.zenClear;
+  const sorted = orbs.slice().sort((a, b) => a.y - b.y);
+  let left = orbs.length;
+  for (const o of sorted) {
+    if (o.y >= cut && left <= CFG.maxOrbs * 0.6) break;
+    o.dead = true; left--;
+    const delay = clamp((o.y - RIM_Y + 60) / (cut - RIM_Y + 60), 0, 1) * 0.6;
+    ghosts.push({ x: o.x, y: o.y, r: o.r, tier: o.tier, angle: o.angle, delay, t: 0, dur: 0.4, kind: 'pop' });
+  }
+  let w = 0;
+  for (let i = 0; i < orbs.length; i++) if (!orbs[i].dead) orbs[w++] = orbs[i];
+  orbs.length = w;
+  G.clearT = 1.3; G.danger = 0; G.clears++;
+  showToast('A gentle tidy-up');
+  Sfx.tidy();
+}
+
+function updateGhosts(dt) {
+  let w = 0;
+  for (let i = 0; i < ghosts.length; i++) {
+    const g = ghosts[i];
+    if (g.delay > 0) {
+      g.delay -= dt;
+      if (g.delay <= 0 && g.kind === 'pop') { burst(g.x, g.y, g.tier, 6 + g.tier, 60 + g.r, 0.7, 3); Sfx.sparkle(); }
+    } else g.t += dt;
+    if (g.t < g.dur) ghosts[w++] = g;
+  }
+  ghosts.length = w;
+}
+
+const HUD_BTNS = [{ id: 'sound', x: W - 74, y: 28, r: 17 }, { id: 'pause', x: W - 30, y: 28, r: 17 }];
+function hudButtonAt(x, y) {
+  for (const b of HUD_BTNS) if (Math.hypot(x - b.x, y - b.y) < b.r + 7) return b.id;
+  return null;
+}
+
+function updatePlay(dt) {
+  const I = Input;
+  let wantDrop = I.drop, pointerDrop = false;
+  if (I.mouse.clicked) {
+    const b = hudButtonAt(I.mouse.x, I.mouse.y);
+    if (b) {
+      I.disarm(); I.mouse.clicked = false;
+      if (b === 'pause') { pauseGame(); return; }
+      toggleSound();
+    } else if (I.pointer.type === 'mouse') { wantDrop = true; pointerDrop = true; }
+  }
+  if (I.pause) { pauseGame(); return; }
+  if (I.pointer.released) { wantDrop = true; pointerDrop = true; }
+  G.cool = Math.max(0, G.cool - dt);
+
+  // Aim: the mouse or finger moves the dropper directly; the stick, D-pad and keys glide it.
+  const r = TIERS[G.cur].r;
+  if (pointerDrop || (I.mouse.moved && I.pointer.type === 'mouse') || (I.pointer.down && I.pointer.type !== 'mouse')) {
+    G.aimX = I.mouse.x; G.aimV = 0;
+  } else {
+    G.aimV += (I.aim * CFG.aimSpeed - G.aimV) * Math.min(1, dt * (I.aim ? 10 : 18));
+    G.aimX += G.aimV * dt;
+  }
+  G.aimX = clamp(G.aimX, JAR.l + r, JAR.r - r);
+  if (G.aimX <= JAR.l + r || G.aimX >= JAR.r - r) G.aimV = 0;
+  if (wantDrop) tryDrop();
+
+  // Physics at a fixed rate (at most 3 ticks per frame so a slow frame can't snowball).
+  const tick = CFG.phys.tick;
+  G.acc += dt;
+  let n = 0;
+  while (G.acc >= tick - 1e-6 && n < 3) { physicsTick(); G.acc -= tick; n++; }
+  if (G.acc > tick) G.acc = 0;
+  if (G.impact > 220) Sfx.land(G.impact);
+  G.impact = 0;
+  for (const o of orbs) if (o.flash > 0) o.flash = Math.max(0, o.flash - dt * 2.5);
+
+  if (G.phase === 'play') checkFull(dt);
+  else if (G.phase === 'full') { G.fullT += dt; if (G.fullT > 1.7) showResult(); }
+  if (G.clearT > 0) G.clearT = Math.max(0, G.clearT - dt);
+  updateGhosts(dt);
+  G.shown += (G.score - G.shown) * Math.min(1, dt * 10);
+  if (Math.abs(G.score - G.shown) < 0.5) G.shown = G.score;
+  G.pulse = Math.max(0, G.pulse - dt * 3);
+}
+
+function showResult() {
+  commitScore();
+  resultInfo = { score: G.score, best: bests.classic, newBest: G.newBest, merges: G.merges, maxTier: G.maxTier, stars: G.stars };
+  setState('result');
+}
+
+// ============================================================
+// Effects
+// ============================================================
+function burst(x, y, tier, n, speed, life = 0.8, size = 3.5) {
+  for (let i = 0; i < n; i++) {
+    const p = parts.get();
+    if (!p) return;
+    const a = Math.random() * TAU, s = speed * (0.3 + Math.random() * 0.7);
+    p.x = x; p.y = y; p.vx = Math.cos(a) * s; p.vy = Math.sin(a) * s;
+    p.max = p.life = life * (0.5 + Math.random() * 0.5);
+    p.tier = tier; p.size = size * (0.6 + Math.random() * 0.8);
+  }
+}
+function ring(x, y, r0, r1, color, life) {
+  const g = rings.get();
+  if (!g) return;
+  g.x = x; g.y = y; g.r0 = r0; g.r1 = r1; g.color = color; g.life = g.max = life;
+}
+function updateFx(dt) {
+  const drag = Math.pow(0.08, dt);
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.active = false; continue; }
+    p.vx *= drag; p.vy = p.vy * drag - 30 * dt; // drift gently upward
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (const g of rings.items) if (g.active && (g.life -= dt) <= 0) g.active = false;
+  for (const p of pops.items) {
+    if (!p.active) continue;
+    p.life -= dt; p.y -= 26 * dt;
+    if (p.life <= 0) p.active = false;
+  }
+  for (const m of motes) {
+    m.y -= m.sp * dt; m.x += Math.sin(time * 0.3 + m.ph) * 4 * dt;
+    if (m.y < -10) { m.y = H + 10; m.x = Math.random() * W; }
+  }
+}
+
+// ============================================================
+// Menus
+// ============================================================
+function titleItems() {
+  return [
+    { id: 'classic', label: 'Classic', hint: 'Merge orbs and keep the jar from overflowing.' },
+    { id: 'zen', label: 'Zen', hint: 'No ending: a full jar gently tidies itself up.' },
+    { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', cycle: () => toggleSound(), hint: 'Soft chimes when orbs merge.' },
+    { id: 'howto', label: 'How to Play', hint: 'Controls and the ten orbs.' },
+    { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
+  ];
+}
+const PAUSE_ITEMS = [{ id: 'resume', label: 'Resume' }, { id: 'restart', label: 'Restart' }, { id: 'quit', label: 'Quit to menu' }];
+const RESULT_ITEMS = [{ id: 'again', label: 'Play again' }, { id: 'menu', label: 'Main menu' }];
+
+function menuInput(items) {
+  const I = Input, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.navUp) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.navDown) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if (I.mouse.moved || I.mouse.clicked) {
+    for (let i = 0; i < n; i++) {
+      const r = menuRects[i];
+      if (r && inRect(I.mouse, r) && menuSel !== i) { menuSel = i; Sfx.tick(); }
+    }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clickedItem = I.mouse.clicked && r && inRect(I.mouse, r);
+  if (it.value !== undefined) {
+    const d = (I.navRight ? 1 : 0) - (I.navLeft ? 1 : 0) || (I.select || clickedItem ? 1 : 0);
+    if (d) { it.cycle(d); Sfx.tick(); return null; }
+  }
+  if (I.select || clickedItem) { Sfx.select(); Input.disarm(); return it.id; }
+  return null;
+}
+
+// ============================================================
+// Main update
+// ============================================================
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  updateFx(dt);
+
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'classic') startGame('classic');
+      else if (id === 'zen') startGame('zen');
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.mouse.clicked) { setState('title'); menuSel = 3; Input.disarm(); Sfx.blip(); }
+      break;
+    case 'play':
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(PAUSE_ITEMS);
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') { commitScore(); startGame(G.mode); }
+      else if (id === 'quit') { commitScore(); toTitle(); }
+      break;
+    }
+    case 'result':
+      if (stateT > 0.8) {
+        const id = menuInput(RESULT_ITEMS);
+        if (id === 'again') startGame(G.mode);
+        else if (id === 'menu' || Input.back) toTitle();
+      }
+      break;
+  }
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+function rrPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function glowStroke(color, w) {
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = 10; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,12,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawHalo(t, x, y, r) {
+  const S = haloSprites[t], h = (S.half * r) / TIERS[t].r;
+  ctx.drawImage(S.c, x - h, y - h, h * 2, h * 2);
+}
+function drawBody(t, x, y, r, angle) {
+  const S = bodySprites[t], h = (S.half * r) / TIERS[t].r;
+  const c = Math.cos(angle) * rs, s = Math.sin(angle) * rs;
+  ctx.setTransform(c, s, -s, c, x * rs, y * rs);
+  ctx.drawImage(S.c, -h, -h, h * 2, h * 2);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  ctx.drawImage(glossSprite, x - r * 0.72, y - r * 0.74, r * 0.8, r * 0.52); // highlight stays on top-left
+}
+function drawOrbAt(t, x, y, r, angle, alpha = 1) {
+  if (r <= 0.5) return;
+  ctx.globalAlpha = alpha;
+  drawHalo(t, x, y, r);
+  drawBody(t, x, y, r, angle);
+  ctx.globalAlpha = 1;
+}
+
+function drawMotes() {
+  if (!motes.length) return;
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    ctx.globalAlpha = 0.16 + 0.1 * Math.sin(time * 0.8 + m.ph);
+    ctx.drawImage(dotSprites[m.tier], m.x - m.s, m.y - m.s, m.s * 2, m.s * 2);
+  }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of parts.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = p.life / p.max;
+    ctx.drawImage(dotSprites[p.tier], p.x - p.size, p.y - p.size, p.size * 2, p.size * 2);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  for (const g of rings.items) {
+    if (!g.active) continue;
+    const k = 1 - g.life / g.max;
+    ctx.globalAlpha = (1 - k) * 0.8;
+    ctx.beginPath(); ctx.arc(g.x, g.y, g.r0 + (g.r1 - g.r0) * ease(k), 0, TAU);
+    glowStroke(g.color, 2);
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const p of pops.items) {
+    if (!p.active) continue;
+    ctx.globalAlpha = Math.min(1, (p.life / p.max) * 2);
+    glowText(p.text, p.x, p.y, `800 ${p.size}px ${SANS}`, p.color);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function landingY(x, r) {
+  let y = JAR.bottom - r;
+  const rc = JAR.corner - r;
+  if (rc > 0) {
+    const cxL = JAR.l + JAR.corner, cxR = JAR.r - JAR.corner, dx = x < cxL ? x - cxL : x > cxR ? x - cxR : 0;
+    if (dx) y = JAR.bottom - JAR.corner + Math.sqrt(Math.max(0, rc * rc - dx * dx));
+  }
+  for (const o of orbs) {
+    const R = o.r + r, dx = o.x - x;
+    if (dx > -R && dx < R) { const yy = o.y - Math.sqrt(R * R - dx * dx); if (yy < y) y = yy; }
+  }
+  return y;
+}
+
+function drawRimLine() {
+  const d = clamp(G.danger / CFG.fullTime, 0, 1);
+  ctx.beginPath(); ctx.moveTo(JAR.l + 4, RIM_Y); ctx.lineTo(JAR.r - 4, RIM_Y);
+  ctx.setLineDash([6, 7]);
+  if (d > 0) {
+    ctx.globalAlpha = 0.35 + 0.55 * d * (0.75 + 0.25 * Math.sin(time * 5));
+    glowStroke(CFG.color.warn, 1.5);
+  } else {
+    ctx.globalAlpha = 0.3; ctx.strokeStyle = CFG.color.glass; ctx.lineWidth = 1.2; ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+}
+
+function drawDropper() {
+  ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(JAR.l - 10, RAIL_Y); ctx.lineTo(JAR.r + 10, RAIL_Y);
+  ctx.globalAlpha = 0.45; glowStroke(CFG.color.glass, 1.5); ctx.globalAlpha = 1;
+  ctx.lineCap = 'butt';
+  const x = G.aimX, T = TIERS[G.cur];
+  rrPath(x - 15, RAIL_Y - 5, 30, 10, 5); ctx.fillStyle = '#0d1430'; ctx.fill();
+  glowStroke(CFG.color.glass, 1.5);
+  if (G.phase !== 'play' || G.clearT > 0) return;
+  const k = G.cool > 0 ? ease(1 - G.cool / CFG.dropCooldown) : 1, y = hangY(G.cur);
+  ctx.beginPath(); ctx.moveTo(x, RAIL_Y + 5); ctx.lineTo(x, y - T.r * k);
+  ctx.strokeStyle = rgba(T.color, 0.4); ctx.lineWidth = 1; ctx.stroke();
+  if (k >= 1 && state === 'play') { // aim guide: where the orb will first touch something
+    const ly = landingY(x, T.r);
+    if (ly > y + T.r * 2) {
+      ctx.setLineDash([3, 7]);
+      ctx.beginPath(); ctx.moveTo(x, y + T.r + 4); ctx.lineTo(x, ly - T.r - 2);
+      ctx.globalAlpha = 0.3; ctx.strokeStyle = T.color; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(x, ly, T.r, 0, TAU);
+      ctx.globalAlpha = 0.16; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+  drawOrbAt(G.cur, x, y, T.r * k, time * 0.5, Math.max(0.2, k));
+}
+
+function renderPlay() {
+  ctx.drawImage(playBg, 0, 0, W, H);
+  drawMotes();
+  drawRimLine();
+  // Physics runs at a fixed 60 Hz; draw between the last two ticks so high-refresh screens stay smooth.
+  const k = state === 'play' ? clamp(G.acc / CFG.phys.tick, 0, 1) : 1;
+  for (const o of orbs) { o.ix = o.lx + (o.x - o.lx) * k; o.iy = o.ly + (o.y - o.ly) * k; }
+  for (const o of orbs) drawHalo(o.tier, o.ix, o.iy, o.r);
+  for (const o of orbs) drawBody(o.tier, o.ix, o.iy, o.r, o.angle);
+  // newborn flash + soft warm rings on orbs that are over the rim
+  ctx.globalCompositeOperation = 'lighter';
+  for (const o of orbs) {
+    if (o.flash <= 0) continue;
+    ctx.globalAlpha = o.flash * 0.45;
+    ctx.beginPath(); ctx.arc(o.ix, o.iy, o.r, 0, TAU); ctx.fillStyle = TIERS[o.tier].color; ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  if (G.danger > 0 || G.phase === 'full') {
+    const a = G.phase === 'full' ? 0.7 : 0.25 + 0.25 * Math.sin(time * 4);
+    for (const o of orbs) {
+      if (!overRim(o)) continue;
+      ctx.globalAlpha = a;
+      ctx.beginPath(); ctx.arc(o.ix, o.iy, o.r + 3, 0, TAU);
+      glowStroke(CFG.color.warn, 1.5);
+    }
+    ctx.globalAlpha = 1;
+  }
+  for (const g of ghosts) {
+    const k = g.delay > 0 ? 0 : g.t / g.dur;
+    if (g.kind === 'glow') drawOrbAt(g.tier, g.x, g.y - k * 30, g.r * (1 + k * 0.5), g.angle, 1 - k);
+    else drawOrbAt(g.tier, g.x, g.y, g.r * (1 - k * 0.6), g.angle, 1 - k);
+  }
+  drawDropper();
+  drawFx();
+}
+
+function drawLabel(s, x, y, color = CFG.color.faint) { text(s, x, y, `800 11px ${SANS}`, color); }
+
+function drawHUD() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const lx = 155, rx = 805;
+  // Left: mode, score, best, largest orb
+  drawLabel(G.mode === 'zen' ? 'Z E N' : 'C L A S S I C', lx, 56, CFG.color.title);
+  drawLabel('SCORE', lx, 100);
+  const sc = 1 + G.pulse * 0.12;
+  glowText(fmtNum(G.shown), lx, 134, `800 ${Math.round(40 * sc)}px ${MONO}`, CFG.color.text);
+  drawLabel('BEST', lx, 182);
+  text(fmtNum(Math.max(bests[G.mode], G.shown)), lx, 206, `700 20px ${MONO}`, CFG.color.dim);
+  drawLabel('LARGEST', lx, 258);
+  const T = TIERS[G.maxTier], dr = Math.min(T.r, 34);
+  drawOrbAt(G.maxTier, lx, 308, dr, time * 0.3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text(T.name, lx, 360, `700 15px ${SANS}`, T.color);
+  if (G.danger > 0.15 && G.phase === 'play') {
+    ctx.globalAlpha = clamp(G.danger * 2, 0, 1);
+    text(G.mode === 'zen' ? 'A tidy-up is coming…' : 'The jar is nearly full', lx, 404, `600 14px ${SANS}`, CFG.color.warn);
+    ctx.globalAlpha = 1;
+  }
+  const N = padNames();
+  const hints = usingPad() ? [`Stick or D-pad: aim   ·   ${N.a}: drop`, `${N.start}: pause   ·   ${N.select}: sound`]
+    : Input.device === 'touch' ? ['Drag to aim, lift to drop', 'Buttons at the top right']
+      : ['Mouse or ← →: aim', 'Click or Space: drop   ·   Esc: pause'];
+  text(hints[0], lx, 482, `500 12px ${SANS}`, CFG.color.faint);
+  text(hints[1], lx, 502, `500 12px ${SANS}`, CFG.color.faint);
+
+  // Right: next orb and the growth ring
+  drawLabel('NEXT', rx, 66);
+  ctx.beginPath(); ctx.arc(rx, 122, 40, 0, TAU);
+  ctx.fillStyle = 'rgba(12,16,36,0.6)'; ctx.fill();
+  ctx.globalAlpha = 0.6; glowStroke(CFG.color.faint, 1.2); ctx.globalAlpha = 1;
+  drawOrbAt(G.next, rx, 122, Math.min(TIERS[G.next].r, 30), time * 0.4);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  drawLabel('GROWTH', rx, 214);
+  const cy = 330, R = 88;
+  for (let i = 0; i < TIERS.length; i++) {
+    const a = -Math.PI / 2 + (i * TAU) / TIERS.length, x = rx + Math.cos(a) * R, y = cy + Math.sin(a) * R;
+    const reached = i <= G.maxTier, r = 7 + i * 1.3;
+    if (reached) drawOrbAt(i, x, y, r, 0);
+    else { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.globalAlpha = 0.35; ctx.strokeStyle = TIERS[i].color; ctx.lineWidth = 1.2; ctx.stroke(); ctx.globalAlpha = 1; }
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text(TIERS[Math.min(TOP, G.maxTier)].name, rx, cy - 8, `700 14px ${SANS}`, CFG.color.dim);
+  text(G.stars ? `★ ${G.stars}` : `${G.merges} merges`, rx, cy + 14, `600 12px ${SANS}`, CFG.color.faint);
+  if (state === 'play') drawHudButtons();
+}
+
+function drawHudButtons() {
+  const I = Input;
+  for (const b of HUD_BTNS) {
+    const hover = I.pointer.type === 'mouse' && Math.hypot(I.mouse.x - b.x, I.mouse.y - b.y) < b.r + 7;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU);
+    ctx.fillStyle = 'rgba(12,16,36,0.85)'; ctx.fill();
+    ctx.globalAlpha = hover ? 1 : 0.6; glowStroke(hover ? CFG.color.accent : CFG.color.dim, 1.3);
+    ctx.fillStyle = hover ? CFG.color.text : CFG.color.dim; ctx.strokeStyle = ctx.fillStyle;
+    if (b.id === 'pause') {
+      ctx.fillRect(b.x - 5, b.y - 6, 3.5, 12); ctx.fillRect(b.x + 1.5, b.y - 6, 3.5, 12);
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(b.x - 8, b.y - 3); ctx.lineTo(b.x - 4, b.y - 3); ctx.lineTo(b.x + 1, b.y - 7);
+      ctx.lineTo(b.x + 1, b.y + 7); ctx.lineTo(b.x - 4, b.y + 3); ctx.lineTo(b.x - 8, b.y + 3); ctx.closePath(); ctx.fill();
+      ctx.lineWidth = 1.5; ctx.beginPath();
+      if (Sfx.muted) { ctx.moveTo(b.x + 4, b.y - 4); ctx.lineTo(b.x + 10, b.y + 4); ctx.moveTo(b.x + 10, b.y - 4); ctx.lineTo(b.x + 4, b.y + 4); }
+      else { ctx.arc(b.x + 2, b.y, 5, -0.9, 0.9); ctx.moveTo(b.x + 2 + 8.5 * Math.cos(-0.9), b.y + 8.5 * Math.sin(-0.9)); ctx.arc(b.x + 2, b.y, 8.5, -0.9, 0.9); }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawMenu(items, y0, enabled = true, gap = 52) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 330, h = 40;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = enabled && i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(127,223,255,0.10)'; ctx.fill();
+      glowStroke(CFG.color.accent, 1.5);
+    }
+    ctx.globalAlpha = enabled ? 1 : 0.4;
+    const col = sel ? CFG.color.text : CFG.color.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 15px ${SANS}`, sel ? CFG.color.warn : CFG.color.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+// Orbs floating around the title screen
+const TITLE_ORBS = [
+  [9, 150, 300, 56], [0, 252, 178, 12], [3, 70, 165, 24], [1, 258, 420, 16], [6, 96, 440, 34],
+  [8, 812, 300, 52], [2, 706, 176, 20], [4, 892, 170, 28], [5, 884, 440, 32], [7, 716, 432, 36],
+];
+function drawTitle() {
+  ctx.drawImage(titleBg, 0, 0, W, H);
+  drawMotes();
+  TITLE_ORBS.forEach(([t, x, y, r], i) => {
+    drawOrbAt(t, x + Math.sin(time * 0.35 + i * 1.7) * 7, y + Math.cos(time * 0.45 + i * 1.3) * 9, r, time * 0.15 * (i % 2 ? 1 : -1) + i);
+  });
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('NEON MERGE', W / 2, 92, `800 64px ${SANS}`, CFG.color.title);
+  text('drop  ·  merge  ·  unwind', W / 2, 140, `500 15px ${SANS}`, CFG.color.dim);
+  const items = titleItems();
+  drawMenu(items, 196, true, 46);
+  const it = items[menuSel] || items[0], N = padNames();
+  text(it.hint, W / 2, 196 + items.length * 46 + 2, `500 14px ${SANS}`, CFG.color.dim);
+  const sideHint = it.value !== undefined ? '   ·   ← → change' : '';
+  text(usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select${sideHint}`
+    : Input.device === 'touch' ? 'Tap to choose' : `↑ ↓ choose   ·   Enter or click to select${sideHint}`,
+  W / 2, 196 + items.length * 46 + 28, `500 12px ${SANS}`, CFG.color.faint);
+
+  const yb = H - 26, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'center';
+  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  ctx.textAlign = 'right';
+  text(`Best ${fmtNum(bests.classic)}  ·  Zen ${fmtNum(bests.zen)}${stats.stars ? `  ·  ★ ${stats.stars}` : ''}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
+  if (!Sfx.ctx || Sfx.ctx.state !== 'running') text('click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
+}
+
+function drawHowTo() {
+  ctx.drawImage(titleBg, 0, 0, W, H);
+  overlay(0.5);
+  const N = padNames();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 42, `800 32px ${SANS}`, CFG.color.title);
+  const cols = [300, 490, 680];
+  const rows = [
+    ['Aim', 'Left stick / D-pad', '← → or A D', 'Move the mouse / drag'],
+    ['Drop', `${N.a}`, 'Space, Enter or ↓', 'Click / lift your finger'],
+    ['Pause', N.start, 'Esc or P', 'Pause button, top right'],
+    ['Sound on / off', N.select, 'M', 'Speaker button'],
+  ];
+  ctx.textAlign = 'left';
+  ['CONTROLLER', 'KEYBOARD', 'MOUSE / TOUCH'].forEach((s, i) => drawLabel(s, cols[i], 82));
+  rows.forEach((r, i) => {
+    const y = 106 + i * 24;
+    ctx.textAlign = 'right'; text(r[0], cols[0] - 20, y, `600 14px ${SANS}`, CFG.color.dim);
+    ctx.textAlign = 'left';
+    for (let c = 0; c < 3; c++) text(r[c + 1], cols[c], y, `600 14px ${SANS}`, CFG.color.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(90, 200, W - 180, 1);
+  // The growth chain
+  ctx.textAlign = 'center';
+  drawLabel('THE TEN ORBS: TWO THE SAME MAKE THE NEXT ONE', W / 2, 222);
+  for (let i = 0; i < TIERS.length; i++) {
+    const x = 120 + i * 80, r = 8 + i * 1.9;
+    drawOrbAt(i, x, 266, r, 0);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    text(TIERS[i].name, x, 306, `600 12px ${SANS}`, TIERS[i].color);
+    if (i < TOP) text('›', x + 40, 266, `700 16px ${SANS}`, CFG.color.faint);
+  }
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(90, 328, W - 180, 1);
+  const col = (title, x, lines) => {
+    ctx.textAlign = 'left';
+    drawLabel(title, x, 350);
+    lines.forEach((s, i) => text(s, x, 376 + i * 23, `500 14px ${SANS}`, CFG.color.text));
+  };
+  col('CLASSIC', 110, [
+    'Drop orbs into the jar. Two matching orbs',
+    'merge into the next, bigger one.',
+    'If orbs rest above the rim for 2 seconds,',
+    'the jar is full and the round ends.',
+  ]);
+  col('ZEN', 520, [
+    'There is no ending. When the jar gets full,',
+    'its top part gently clears and you carry on.',
+    'Two Stars meet in a starburst',
+    'and make room for more.',
+  ]);
+  ctx.textAlign = 'center';
+  text(usingPad() ? `${N.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 26, `600 13px ${SANS}`, CFG.color.dim);
+}
+
+function drawPause() {
+  overlay(0.62);
+  rrPath(W / 2 - 210, 112, 420, 316, 24); ctx.fillStyle = 'rgba(10,13,28,0.92)'; ctx.fill();
+  ctx.globalAlpha = 0.7; glowStroke(CFG.color.faint, 1.2); ctx.globalAlpha = 1;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 166, `800 46px ${SANS}`, CFG.color.text);
+  drawMenu(PAUSE_ITEMS, 240);
+  const N = padNames();
+  text(`${usingPad() ? N.select : 'M'}: sound ${Sfx.muted ? 'off' : 'on'}`, W / 2, 398, `500 12px ${SANS}`, CFG.color.faint);
+}
+
+function drawResult() {
+  overlay(Math.min(0.7, stateT * 1.4));
+  const r = resultInfo, x = W / 2 - 220, y = 84, w = 440, h = 380;
+  ctx.globalAlpha = Math.min(1, stateT * 3);
+  rrPath(x, y, w, h, 24); ctx.fillStyle = 'rgba(10,13,28,0.92)'; ctx.fill();
+  glowStroke(CFG.color.title, 1.5);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('THE JAR IS FULL', W / 2, 126, `800 34px ${SANS}`, CFG.color.title);
+  text('Nicely done. Take a breath.', W / 2, 160, `500 15px ${SANS}`, CFG.color.dim);
+  drawLabel('SCORE', W / 2, 196);
+  glowText(fmtNum(r.score), W / 2, 234, `800 50px ${MONO}`, CFG.color.text);
+  if (r.newBest) glowText('New best!', W / 2, 276, `800 18px ${SANS}`, CFG.color.good);
+  else text(`Best ${fmtNum(r.best)}`, W / 2, 276, `700 16px ${MONO}`, CFG.color.dim);
+  text(`Merges ${r.merges}   ·   Largest: ${TIERS[r.maxTier].name}${r.stars ? `   ·   Starbursts ${r.stars}` : ''}`,
+    W / 2, 306, `600 14px ${SANS}`, CFG.color.dim);
+  ctx.globalAlpha = 1;
+  drawMenu(RESULT_ITEMS, 360, stateT > 0.8, 50);
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const y = state === 'title' || state === 'howto' ? H - 56 : 18;
+  text(toast.text, W / 2, y, `600 14px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#05070f'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    renderPlay();
+    if (state !== 'result') drawHUD();
+    if (state === 'paused') drawPause();
+    if (state === 'result') drawResult();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05;
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && state === 'play') pauseGame();
+});
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+</script>
+</body>
+</html>
