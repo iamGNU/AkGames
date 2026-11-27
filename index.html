@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AK Games</title>
 <meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<meta name="description" content="Small, calm browser games for every age. Controller, keyboard, mouse or touch.">
 <style>
   :root {
     --bg: #05070f; --panel: rgba(12, 18, 40, 0.82); --text: #e8f0ff; --dim: #8390bd; --faint: #56608a;
@@ -13,100 +14,373 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; min-height: 100%; }
   body {
-    min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    padding: 32px 16px 72px; background: radial-gradient(ellipse at 50% 30%, #101a3a 0%, var(--bg) 70%);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    padding: 40px 16px 28px; background: radial-gradient(ellipse at 50% 20%, #101a3a 0%, var(--bg) 70%) fixed;
     color: var(--text); font-family: var(--font);
   }
   h1 {
-    margin: 0 0 6px; font-size: clamp(40px, 8vw, 68px); font-weight: 800; letter-spacing: 0.03em;
+    margin: 0 0 6px; font-size: clamp(40px, 8vw, 64px); font-weight: 800; letter-spacing: 0.03em;
     text-shadow: 0 0 22px rgba(59, 232, 255, 0.45);
   }
-  .sub { margin: 0 0 40px; color: var(--dim); font-size: 16px; }
-  .grid { display: flex; flex-wrap: wrap; gap: 28px; justify-content: center; width: 100%; max-width: 760px; }
+  .sub { margin: 0 0 28px; color: var(--dim); font-size: 16px; text-align: center; }
+  section { width: 100%; max-width: 1180px; margin-bottom: 26px; }
+  section h3 {
+    margin: 0 0 12px 4px; font-size: 13px; font-weight: 800; letter-spacing: 0.12em; color: var(--faint);
+  }
+  section h3 span { font-weight: 500; letter-spacing: 0; margin-left: 8px; }
+  .grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 18px; }
   .card {
     --c: #3be8ff;
-    flex: 1 1 300px; max-width: 340px; padding: 22px; border-radius: 18px; background: var(--panel);
+    flex: 1 1 200px; max-width: 226px;
+    display: block; padding: 14px; border-radius: 16px; background: var(--panel);
     border: 2px solid rgba(131, 144, 189, 0.22); color: inherit; text-decoration: none;
     transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
   }
-  .card.kick { --c: #7dff8a; }
   .card.sel, .card:hover, .card:focus-visible {
-    outline: none; border-color: var(--c); transform: translateY(-4px);
-    box-shadow: 0 0 0 1px var(--c), 0 0 32px -6px var(--c);
+    outline: none; border-color: var(--c); transform: translateY(-3px);
+    box-shadow: 0 0 0 1px var(--c), 0 0 28px -6px var(--c);
   }
-  .card svg { display: block; width: 100%; height: auto; border-radius: 12px; background: #070914; }
-  .card h2 { margin: 16px 0 6px; font-size: 24px; color: var(--c); }
-  .card p { margin: 0; color: var(--dim); line-height: 1.5; font-size: 15px; }
-  .hint { margin-top: 34px; color: var(--faint); font-size: 13px; text-align: center; }
+  .card svg { display: block; width: 100%; height: auto; border-radius: 10px; background: #070914; }
+  .card h2 { margin: 12px 0 4px; font-size: 20px; color: var(--c); }
+  .card p { margin: 0; color: var(--dim); line-height: 1.45; font-size: 14px; }
+  .pop { --c: #ff7ad9; } .match { --c: #c38bff; } .merge { --c: #ffd166; } .snake { --c: #2dffc4; } .blocks { --c: #5aa9ff; }
+  .burst { --c: #b98cff; } .jigsaw { --c: #7fd8ff; } .memory { --c: #ffab91; }
+  .solitaire { --c: #ff6b81; } .mahjong { --c: #ffb38a; } .sudoku { --c: #9aa5ff; } .sort { --c: #e78bff; } .pipes { --c: #c6f86b; } .slide { --c: #ffe66d; } .trace { --c: #dfe8ff; }
+  .swarm { --c: #3be8ff; } .kick { --c: #7dff8a; } .breach { --c: #ff8a3d; }
+  .hint { margin-top: 6px; color: var(--faint); font-size: 13px; text-align: center; line-height: 1.7; }
   .pad { display: inline-flex; align-items: center; gap: 8px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #ffcc4d; }
   .dot.on { background: #5dff9e; }
-  footer { position: fixed; bottom: 16px; left: 0; right: 0; text-align: center; color: var(--faint); font-size: 12px; }
+  footer { margin-top: 18px; color: var(--faint); font-size: 12px; text-align: center; }
+  @media (max-width: 520px) { .card { max-width: none; } }
+  @media (prefers-reduced-motion: reduce) { .card { transition: none; } }
 </style>
 </head>
 <body>
   <h1>AK GAMES</h1>
-  <p class="sub">Pick a game. Controller, keyboard or mouse.</p>
+  <p class="sub">18 small games to unwind with. Controller, keyboard, mouse or touch.</p>
 
-  <div class="grid">
-    <a class="card swarm sel" href="neon-swarm/index.html">
-      <svg viewBox="0 0 300 150" aria-hidden="true">
-        <g fill="none" stroke-width="3" stroke-linejoin="round">
-          <path d="M130 75 l30 0 -46 -20 10 20 -10 20 z" stroke="#3be8ff" transform="rotate(-20 140 75)"/>
-          <path d="M215 40 l14 8 -14 8 z" stroke="#ff3b6b"/>
-          <path d="M240 95 l14 8 -14 8 z" stroke="#ff3b6b"/>
-          <rect x="55" y="30" width="22" height="22" stroke="#ffae1f" transform="rotate(20 66 41)"/>
-          <path d="M60 110 l10 -14 10 14 -10 14 z" stroke="#b26bff"/>
-          <circle cx="250" cy="55" r="10" stroke="#2dffa8"/>
-        </g>
-        <g stroke="#eaffff" stroke-width="3" stroke-linecap="round">
-          <line x1="168" y1="62" x2="180" y2="57"/><line x1="192" y1="52" x2="204" y2="47"/>
-        </g>
-      </svg>
-      <h2>Neon Swarm</h2>
-      <p>Twin-stick arena shooter. Survive the waves, dodge with a dash, and take down the Hive every fifth wave.</p>
-    </a>
+  <section>
+    <h3>RELAX <span>gentle toys, no pressure, nothing to lose</span></h3>
+    <div class="grid">
+      <a class="card pop" href="neon-pop/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <g fill="rgba(255,122,217,0.18)" stroke="#ff7ad9" stroke-width="2.5">
+            <circle cx="60" cy="45" r="17"/><circle cx="105" cy="45" r="17"/><circle cx="195" cy="45" r="17"/><circle cx="240" cy="45" r="17"/>
+            <circle cx="60" cy="105" r="17"/><circle cx="150" cy="105" r="17"/><circle cx="195" cy="105" r="17"/>
+          </g>
+          <g fill="none" stroke="rgba(255,122,217,0.35)" stroke-width="2" stroke-dasharray="4 4">
+            <circle cx="150" cy="45" r="12"/><circle cx="105" cy="105" r="12"/><circle cx="240" cy="105" r="12"/>
+          </g>
+          <g fill="#fff"><circle cx="54" cy="39" r="3.5"/><circle cx="99" cy="39" r="3.5"/><circle cx="189" cy="39" r="3.5"/><circle cx="234" cy="39" r="3.5"/><circle cx="54" cy="99" r="3.5"/><circle cx="144" cy="99" r="3.5"/><circle cx="189" cy="99" r="3.5"/></g>
+        </svg>
+        <h2>Neon Pop</h2>
+        <p>Endless bubble wrap. Pop, sweep and relax: nothing to win, nothing to lose.</p>
+      </a>
 
-    <a class="card kick" href="neon-kick/index.html">
-      <svg viewBox="0 0 300 150" aria-hidden="true">
-        <rect x="18" y="18" width="264" height="114" fill="#0b2117" stroke="rgba(220,255,235,0.75)" stroke-width="2"/>
-        <line x1="150" y1="18" x2="150" y2="132" stroke="rgba(220,255,235,0.75)" stroke-width="2"/>
-        <circle cx="150" cy="75" r="18" fill="none" stroke="rgba(220,255,235,0.75)" stroke-width="2"/>
-        <rect x="8" y="58" width="10" height="34" fill="none" stroke="#e8f0ff" stroke-width="2"/>
-        <rect x="282" y="58" width="10" height="34" fill="none" stroke="#e8f0ff" stroke-width="2"/>
-        <g fill="rgba(59,232,255,0.2)" stroke="#3be8ff" stroke-width="2.5">
-          <circle cx="95" cy="55" r="8"/><circle cx="120" cy="95" r="8"/>
-        </g>
-        <g fill="rgba(255,95,122,0.2)" stroke="#ff5f7a" stroke-width="2.5">
-          <circle cx="190" cy="60" r="8"/><circle cx="215" cy="100" r="8"/>
-        </g>
-        <circle cx="134" cy="88" r="4.5" fill="#fff"/>
-      </svg>
-      <h2>Neon Kick</h2>
-      <p>Arcade 5-a-side football against the CPU, plus a penalty shootout mode. Three difficulty levels.</p>
-    </a>
-  </div>
+      <a class="card snake" href="neon-snake/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <path d="M40 110 H120 Q140 110 140 90 V60 Q140 40 160 40 H215" fill="none" stroke="rgba(45,255,196,0.25)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M40 110 H120 Q140 110 140 90 V60 Q140 40 160 40 H215" fill="none" stroke="#2dffc4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="255" cy="40" r="8" fill="rgba(255,209,102,0.3)" stroke="#ffd166" stroke-width="2.5"/>
+        </svg>
+        <h2>Neon Snake</h2>
+        <p>The classic, with a Calm mode where you can't lose. Pick your speed.</p>
+      </a>
+
+      <a class="card merge" href="neon-merge/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <path d="M90 30 L90 128 Q90 138 100 138 L200 138 Q210 138 210 128 L210 30" fill="none" stroke="rgba(232,240,255,0.6)" stroke-width="2.5"/>
+          <circle cx="150" cy="18" r="7" fill="rgba(93,255,158,0.25)" stroke="#5dff9e" stroke-width="2"/>
+          <g stroke-width="2.5">
+            <circle cx="125" cy="112" r="24" fill="rgba(255,209,102,0.18)" stroke="#ffd166"/>
+            <circle cx="178" cy="118" r="18" fill="rgba(255,122,217,0.18)" stroke="#ff7ad9"/>
+            <circle cx="160" cy="82" r="13" fill="rgba(59,232,255,0.18)" stroke="#3be8ff"/>
+            <circle cx="112" cy="76" r="9" fill="rgba(93,255,158,0.2)" stroke="#5dff9e"/>
+          </g>
+        </svg>
+        <h2>Neon Merge</h2>
+        <p>Drop glowing orbs into a jar. Two of a kind merge into a bigger one.</p>
+      </a>
+
+      <a class="card burst" href="neon-burst/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <g stroke-width="2.2">
+            <circle cx="105" cy="22" r="13" fill="rgba(255,122,217,0.2)" stroke="#ff7ad9"/><circle cx="133" cy="22" r="13" fill="rgba(255,122,217,0.2)" stroke="#ff7ad9"/>
+            <circle cx="161" cy="22" r="13" fill="rgba(93,255,158,0.2)" stroke="#5dff9e"/><circle cx="189" cy="22" r="13" fill="rgba(90,169,255,0.2)" stroke="#5aa9ff"/>
+            <circle cx="119" cy="46" r="13" fill="rgba(255,209,102,0.2)" stroke="#ffd166"/><circle cx="147" cy="46" r="13" fill="rgba(93,255,158,0.2)" stroke="#5dff9e"/>
+            <circle cx="175" cy="46" r="13" fill="rgba(185,140,255,0.2)" stroke="#b98cff"/>
+            <circle cx="150" cy="132" r="13" fill="rgba(93,255,158,0.25)" stroke="#5dff9e"/>
+          </g>
+          <path d="M150 117 L196 86 L160 62" fill="none" stroke="rgba(255,255,255,0.5)" stroke-width="2" stroke-dasharray="3 5"/>
+        </svg>
+        <h2>Neon Burst</h2>
+        <p>Aim and pop matching bubbles. Relax mode never pushes the ceiling down.</p>
+      </a>
+
+      <a class="card jigsaw" href="neon-jigsaw/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <rect x="60" y="20" width="180" height="110" rx="6" fill="rgba(127,216,255,0.06)" stroke="rgba(127,216,255,0.35)" stroke-width="1.5" stroke-dasharray="4 4"/>
+          <path d="M70 30 h40 q-6 -12 8 -12 q14 0 8 12 h24 v24 q12 -6 12 8 q0 14 -12 8 v28 h-80 z" fill="rgba(127,216,255,0.2)" stroke="#7fd8ff" stroke-width="2.5"/>
+          <path d="M190 62 h34 v24 q-12 -6 -12 8 q0 14 12 8 v18 h-34 v-20 q-12 6 -12 -8 q0 -14 12 -8 z" fill="rgba(255,122,217,0.2)" stroke="#ff7ad9" stroke-width="2.5" transform="rotate(8 207 92)"/>
+        </svg>
+        <h2>Neon Jigsaw</h2>
+        <p>Jigsaws of glowing generated art, from 12 to 70 pieces. Snap, sigh, repeat.</p>
+      </a>
+
+      <a class="card memory" href="neon-memory/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <g stroke-width="2" fill="rgba(255,171,145,0.08)" stroke="rgba(255,171,145,0.45)">
+            <rect x="52" y="20" width="40" height="52" rx="6"/><rect x="102" y="20" width="40" height="52" rx="6"/><rect x="208" y="20" width="40" height="52" rx="6"/>
+            <rect x="52" y="80" width="40" height="52" rx="6"/><rect x="155" y="80" width="40" height="52" rx="6"/><rect x="208" y="80" width="40" height="52" rx="6"/>
+          </g>
+          <g stroke="#ffab91" stroke-width="2.5" fill="rgba(255,171,145,0.18)">
+            <rect x="155" y="20" width="40" height="52" rx="6"/><rect x="102" y="80" width="40" height="52" rx="6"/>
+          </g>
+          <g fill="#ffd166"><path d="M175 34 l4 8 9 1 -7 6 2 9 -8 -5 -8 5 2 -9 -7 -6 9 -1 z"/><path d="M122 94 l4 8 9 1 -7 6 2 9 -8 -5 -8 5 2 -9 -7 -6 9 -1 z"/></g>
+        </svg>
+        <h2>Neon Memory</h2>
+        <p>Flip cards to find the pairs. Tiny boards for kids, big ones for a challenge.</p>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <h3>BRAIN TEASERS <span>calm puzzles at your own pace, no timers</span></h3>
+    <div class="grid">
+      <a class="card match" href="neon-match/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <g stroke-width="2.5">
+            <circle cx="85" cy="45" r="15" fill="rgba(255,95,122,0.2)" stroke="#ff5f7a"/>
+            <path d="M150 28 l17 17 -17 17 -17 -17 z" fill="rgba(59,232,255,0.2)" stroke="#3be8ff"/>
+            <rect x="200" y="31" width="28" height="28" fill="rgba(255,209,102,0.2)" stroke="#ffd166"/>
+            <path d="M85 88 l16 28 h-32 z" fill="rgba(93,255,158,0.2)" stroke="#5dff9e"/>
+            <path d="M150 86 l14 8 v16 l-14 8 -14 -8 v-16 z" fill="rgba(195,139,255,0.2)" stroke="#c38bff"/>
+            <path d="M214 86 l5 10 11 2 -8 8 2 11 -10 -5 -10 5 2 -11 -8 -8 11 -2 z" fill="rgba(255,138,61,0.2)" stroke="#ff8a3d"/>
+          </g>
+        </svg>
+        <h2>Neon Match</h2>
+        <p>Swap glowing gems to line up three or more. Endless Zen mode, or a 30-move challenge.</p>
+      </a>
+
+      <a class="card blocks" href="neon-blocks/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <g fill="none" stroke="rgba(131,144,189,0.25)" stroke-width="1">
+            <rect x="40" y="15" width="120" height="120"/>
+            <path d="M55 15v120M70 15v120M85 15v120M100 15v120M115 15v120M130 15v120M145 15v120M40 30h120M40 45h120M40 60h120M40 75h120M40 90h120M40 105h120M40 120h120"/>
+          </g>
+          <g stroke-width="1.5">
+            <rect x="40" y="120" width="105" height="15" fill="rgba(90,169,255,0.35)" stroke="#5aa9ff"/>
+            <rect x="40" y="90" width="30" height="30" fill="rgba(255,122,217,0.3)" stroke="#ff7ad9"/>
+            <rect x="115" y="75" width="15" height="45" fill="rgba(255,209,102,0.3)" stroke="#ffd166"/>
+            <rect x="200" y="40" width="45" height="15" fill="rgba(93,255,158,0.3)" stroke="#5dff9e"/>
+            <path d="M200 80h15v30h15v15h-30z" fill="rgba(195,139,255,0.3)" stroke="#c38bff"/>
+          </g>
+        </svg>
+        <h2>Neon Blocks</h2>
+        <p>Fit pieces onto the grid and clear rows and columns. No falling, no rush.</p>
+      </a>
+
+      <a class="card solitaire" href="neon-solitaire/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <g stroke-width="2.2">
+            <rect x="78" y="26" width="62" height="88" rx="7" fill="#0b1230" stroke="rgba(232,240,255,0.7)" transform="rotate(-12 109 70)"/>
+            <rect x="119" y="22" width="62" height="88" rx="7" fill="#0b1230" stroke="#ff6b81"/>
+            <rect x="160" y="26" width="62" height="88" rx="7" fill="#0b1230" stroke="rgba(232,240,255,0.7)" transform="rotate(12 191 70)"/>
+          </g>
+          <path d="M150 54 c-8 -10 -22 -2 -14 10 l14 14 14 -14 c8 -12 -6 -20 -14 -10z" fill="#ff6b81"/>
+          <text x="127" y="42" font-family="system-ui,sans-serif" font-size="14" font-weight="800" fill="#ff6b81">A</text>
+        </svg>
+        <h2>Neon Solitaire</h2>
+        <p>The classic patience card game. Unlimited undo, hints and auto-finish.</p>
+      </a>
+
+      <a class="card mahjong" href="neon-mahjong/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <g stroke-width="2">
+            <rect x="96" y="56" width="38" height="48" rx="5" fill="#141c3c" stroke="rgba(255,179,138,0.5)"/><rect x="138" y="56" width="38" height="48" rx="5" fill="#141c3c" stroke="rgba(255,179,138,0.5)"/>
+            <rect x="180" y="56" width="38" height="48" rx="5" fill="#141c3c" stroke="rgba(255,179,138,0.5)"/>
+            <rect x="113" y="40" width="38" height="48" rx="5" fill="#18214a" stroke="#ffb38a"/><rect x="155" y="40" width="38" height="48" rx="5" fill="#18214a" stroke="#ffb38a"/>
+          </g>
+          <circle cx="132" cy="64" r="9" fill="none" stroke="#7fd8ff" stroke-width="2.5"/>
+          <path d="M174 54 l6 10 -6 10 -6 -10 z" fill="none" stroke="#5dff9e" stroke-width="2.5"/>
+        </svg>
+        <h2>Neon Mahjong</h2>
+        <p>Match pairs of free tiles from layered stacks. Every deal can be solved.</p>
+      </a>
+
+      <a class="card sudoku" href="neon-sudoku/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <g fill="none" stroke="rgba(154,165,255,0.25)" stroke-width="1"><path d="M105 40 v90 M120 40 v90 M150 40 v90 M165 40 v90 M195 40 v90 M210 40 v90 M90 55 h135 M90 70 h135 M90 100 h135 M90 115 h135"/></g>
+          <rect x="90" y="25" width="135" height="105" fill="none" stroke="#9aa5ff" stroke-width="2.5" transform="translate(0 -0)"/>
+          <path d="M135 25 v105 M180 25 v105 M90 60 h135 M90 95 h135" stroke="#9aa5ff" stroke-width="2"/>
+          <g font-family="system-ui,sans-serif" font-size="16" font-weight="800" fill="#e8f0ff" text-anchor="middle">
+            <text x="105" y="48">5</text><text x="158" y="48">3</text><text x="203" y="83">7</text><text x="120" y="83">9</text><text x="165" y="118">1</text><text x="218" y="118" fill="#9aa5ff">4</text>
+          </g>
+        </svg>
+        <h2>Neon Sudoku</h2>
+        <p>Calm number logic from Gentle to Hard, with notes, hints and no timer.</p>
+      </a>
+
+      <a class="card sort" href="neon-sort/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <g fill="none" stroke="rgba(232,240,255,0.55)" stroke-width="2.2">
+            <path d="M80 30 v90 q0 12 14 12 q14 0 14 -12 v-90"/><path d="M128 30 v90 q0 12 14 12 q14 0 14 -12 v-90"/>
+            <path d="M176 30 v90 q0 12 14 12 q14 0 14 -12 v-90"/><path d="M224 30 v90 q0 12 14 12 q14 0 14 -12 v-90" stroke="#e78bff"/>
+          </g>
+          <g stroke-width="2">
+            <circle cx="94" cy="120" r="10" fill="rgba(231,139,255,0.35)" stroke="#e78bff"/><circle cx="94" cy="98" r="10" fill="rgba(93,255,158,0.3)" stroke="#5dff9e"/><circle cx="94" cy="76" r="10" fill="rgba(231,139,255,0.35)" stroke="#e78bff"/>
+            <circle cx="142" cy="120" r="10" fill="rgba(93,255,158,0.3)" stroke="#5dff9e"/><circle cx="142" cy="98" r="10" fill="rgba(255,209,102,0.3)" stroke="#ffd166"/>
+            <circle cx="190" cy="120" r="10" fill="rgba(255,209,102,0.3)" stroke="#ffd166"/>
+            <circle cx="238" cy="120" r="10" fill="rgba(231,139,255,0.35)" stroke="#e78bff"/><circle cx="238" cy="98" r="10" fill="rgba(231,139,255,0.35)" stroke="#e78bff"/>
+          </g>
+        </svg>
+        <h2>Neon Sort</h2>
+        <p>Sort coloured balls into tubes until every tube holds one colour.</p>
+      </a>
+
+      <a class="card pipes" href="neon-pipes/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <g fill="none" stroke="rgba(131,144,189,0.2)" stroke-width="1"><rect x="90" y="15" width="120" height="120"/><path d="M130 15 v120 M170 15 v120 M90 55 h120 M90 95 h120"/></g>
+          <path d="M150 75 H110 V35 M150 75 V115 H190 M150 75 H190 V35" fill="none" stroke="rgba(198,248,107,0.3)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M150 75 H110 V35 M150 75 V115 H190 M150 75 H190 V35" fill="none" stroke="#c6f86b" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M110 115 h-10" stroke="rgba(198,248,107,0.35)" stroke-width="4" stroke-linecap="round"/>
+          <circle cx="150" cy="75" r="11" fill="#0b1230" stroke="#ffffff" stroke-width="3"/>
+        </svg>
+        <h2>Neon Pipes</h2>
+        <p>Rotate tiles until every pipe connects and the whole network lights up.</p>
+      </a>
+
+      <a class="card slide" href="neon-slide/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <rect x="90" y="15" width="120" height="120" rx="10" fill="rgba(255,230,109,0.05)" stroke="rgba(255,230,109,0.45)" stroke-width="2"/>
+          <g stroke-width="2"><rect x="98" y="23" width="48" height="48" rx="7" fill="rgba(255,230,109,0.15)" stroke="#ffe66d"/><rect x="154" y="23" width="48" height="48" rx="7" fill="rgba(255,138,61,0.18)" stroke="#ff8a3d"/>
+            <rect x="98" y="79" width="48" height="48" rx="7" fill="rgba(255,230,109,0.08)" stroke="rgba(255,230,109,0.4)"/><rect x="154" y="79" width="48" height="48" rx="7" fill="rgba(255,122,217,0.18)" stroke="#ff7ad9"/></g>
+          <g font-family="system-ui,sans-serif" font-size="20" font-weight="800" fill="#e8f0ff" text-anchor="middle"><text x="122" y="54">2</text><text x="178" y="54">8</text><text x="122" y="110">4</text><text x="178" y="110">32</text></g>
+          <path d="M224 75 h30 m-9 -9 l9 9 -9 9" fill="none" stroke="rgba(255,230,109,0.7)" stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+        <h2>Neon Slide</h2>
+        <p>Slide the tiles and merge equal numbers. One calm move at a time.</p>
+      </a>
+
+      <a class="card trace" href="neon-trace/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+
+          <path d="M110 125 V65 L150 25 L190 65 V125 Z M110 65 H190 L110 125 H190 L110 65" fill="none" stroke="rgba(223,232,255,0.25)" stroke-width="3" stroke-linejoin="round"/>
+          <path d="M110 125 V65 L150 25 L190 65 H110 L190 125" fill="none" stroke="#dfe8ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+          <g fill="#0b1230" stroke="#dfe8ff" stroke-width="2.5"><circle cx="110" cy="125" r="6"/><circle cx="110" cy="65" r="6"/><circle cx="150" cy="25" r="6"/><circle cx="190" cy="65" r="6"/><circle cx="190" cy="125" r="6"/></g>
+          <circle cx="190" cy="125" r="11" fill="none" stroke="#dfe8ff" stroke-opacity="0.5" stroke-width="2"/>
+        </svg>
+        <h2>Neon Trace</h2>
+        <p>Draw the whole shape in one line without going over any line twice.</p>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <h3>ACTION <span>for when you want to blow off steam</span></h3>
+    <div class="grid">
+      <a class="card swarm" href="neon-swarm/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <g fill="none" stroke-width="3" stroke-linejoin="round">
+            <path d="M130 75 l30 0 -46 -20 10 20 -10 20 z" stroke="#3be8ff" transform="rotate(-20 140 75)"/>
+            <path d="M215 40 l14 8 -14 8 z" stroke="#ff3b6b"/>
+            <path d="M240 95 l14 8 -14 8 z" stroke="#ff3b6b"/>
+            <rect x="55" y="30" width="22" height="22" stroke="#ffae1f" transform="rotate(20 66 41)"/>
+            <path d="M60 110 l10 -14 10 14 -10 14 z" stroke="#b26bff"/>
+            <circle cx="250" cy="55" r="10" stroke="#2dffa8"/>
+          </g>
+          <g stroke="#eaffff" stroke-width="3" stroke-linecap="round">
+            <line x1="168" y1="62" x2="180" y2="57"/><line x1="192" y1="52" x2="204" y2="47"/>
+          </g>
+        </svg>
+        <h2>Neon Swarm</h2>
+        <p>Twin-stick arena shooter. Survive the waves and take down the Hive every fifth wave.</p>
+      </a>
+
+      <a class="card kick" href="neon-kick/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <rect x="18" y="18" width="264" height="114" fill="#0b2117" stroke="rgba(220,255,235,0.75)" stroke-width="2"/>
+          <line x1="150" y1="18" x2="150" y2="132" stroke="rgba(220,255,235,0.75)" stroke-width="2"/>
+          <circle cx="150" cy="75" r="18" fill="none" stroke="rgba(220,255,235,0.75)" stroke-width="2"/>
+          <rect x="8" y="58" width="10" height="34" fill="none" stroke="#e8f0ff" stroke-width="2"/>
+          <rect x="282" y="58" width="10" height="34" fill="none" stroke="#e8f0ff" stroke-width="2"/>
+          <g fill="rgba(59,232,255,0.2)" stroke="#3be8ff" stroke-width="2.5"><circle cx="95" cy="55" r="8"/><circle cx="120" cy="95" r="8"/></g>
+          <g fill="rgba(255,95,122,0.2)" stroke="#ff5f7a" stroke-width="2.5"><circle cx="190" cy="60" r="8"/><circle cx="215" cy="100" r="8"/></g>
+          <circle cx="134" cy="88" r="4.5" fill="#fff"/>
+        </svg>
+        <h2>Neon Kick</h2>
+        <p>Arcade 5-a-side football against the CPU, plus a penalty shootout.</p>
+      </a>
+
+      <a class="card breach" href="neon-breach/index.html">
+        <svg viewBox="0 0 300 150" aria-hidden="true">
+          <g fill="none" stroke-width="2.5">
+            <path d="M20 10 L105 52 L105 98 L20 140" stroke="#3be8ff"/>
+            <path d="M280 10 L195 52 L195 98 L280 140" stroke="#b26bff"/>
+            <path d="M105 52 L195 52 M105 98 L195 98" stroke="rgba(59,232,255,0.5)"/>
+            <path d="M60 30 L60 120 M240 30 L240 120" stroke="rgba(255,255,255,0.18)"/>
+            <circle cx="150" cy="70" r="12" stroke="#ff3b6b" fill="rgba(255,59,107,0.2)"/>
+            <circle cx="150" cy="70" r="3.5" fill="#ffffff" stroke="none"/>
+          </g>
+          <g stroke="#ffffff" stroke-width="2" stroke-linecap="round">
+            <line x1="132" y1="75" x2="140" y2="75"/><line x1="160" y1="75" x2="168" y2="75"/>
+            <line x1="150" y1="57" x2="150" y2="63"/><line x1="150" y1="87" x2="150" y2="93"/>
+          </g>
+          <path d="M205 150 L222 96 L240 96 L252 150 Z" fill="#0b1230" stroke="#3be8ff" stroke-width="2.5"/>
+        </svg>
+        <h2>Neon Breach</h2>
+        <p>First-person shooter. Clear five neon levels, then take down the Core.</p>
+      </a>
+    </div>
+  </section>
 
   <p class="hint">
     <span class="pad"><span class="dot" id="dot"></span><span id="padText">Connect a controller and press any button</span></span><br>
-    ← → choose · A / Enter to play
+    Arrows / D-pad to choose · A / Enter to play · or just click or tap a game
   </p>
   <footer>Developer: Akash · Co-developer: Claude Code</footer>
 
 <script>
 'use strict';
-// Controller + keyboard navigation between the game cards.
+// Controller + keyboard navigation across the card grid (moves to the nearest card in that direction).
 const cards = [...document.querySelectorAll('.card')];
-let sel = 0, prev = [], stickDir = 0, stickHold = 0, last = performance.now();
-function select(i) {
+let sel = 0, prev = [], stickDir = '', stickHold = 0, last = performance.now();
+function select(i, scroll = true) {
   sel = (i + cards.length) % cards.length;
   cards.forEach((c, k) => c.classList.toggle('sel', k === sel));
+  if (scroll) cards[sel].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+function move(dir) {
+  const r0 = cards[sel].getBoundingClientRect(), x0 = r0.left + r0.width / 2, y0 = r0.top + r0.height / 2;
+  let best = -1, bestScore = Infinity;
+  cards.forEach((c, i) => {
+    if (i === sel) return;
+    const r = c.getBoundingClientRect(), dx = r.left + r.width / 2 - x0, dy = r.top + r.height / 2 - y0;
+    const along = dir === 'left' ? -dx : dir === 'right' ? dx : dir === 'up' ? -dy : dy;
+    const across = dir === 'left' || dir === 'right' ? Math.abs(dy) : Math.abs(dx);
+    if (along <= 10) return;
+    const score = along + across * 2;
+    if (score < bestScore) { bestScore = score; best = i; }
+  });
+  if (best >= 0) select(best);
+  else if (dir === 'right') select(sel + 1); // wrap to the next row
+  else if (dir === 'left') select(sel - 1);
 }
 function open() { location.href = cards[sel].getAttribute('href'); }
-cards.forEach((c, i) => c.addEventListener('mouseenter', () => select(i)));
+cards.forEach((c, i) => c.addEventListener('mouseenter', () => select(i, false)));
 addEventListener('keydown', e => {
-  if (e.code === 'ArrowRight' || e.code === 'ArrowDown' || e.code === 'KeyD' || e.code === 'KeyS') { select(sel + 1); e.preventDefault(); }
-  else if (e.code === 'ArrowLeft' || e.code === 'ArrowUp' || e.code === 'KeyA' || e.code === 'KeyW') { select(sel - 1); e.preventDefault(); }
+  const map = { ArrowRight: 'right', KeyD: 'right', ArrowLeft: 'left', KeyA: 'left', ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down' };
+  if (map[e.code]) { move(map[e.code]); e.preventDefault(); }
   else if (e.code === 'Enter' || e.code === 'Space') { open(); e.preventDefault(); }
 });
 function shortId(id) {
@@ -122,21 +396,25 @@ function poll(now) {
   document.getElementById('padText').textContent = pad ? shortId(pad.id) : 'Connect a controller and press any button';
   if (pad) {
     const on = i => !!pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.5);
-    // First frame with this pad: buttons already held (e.g. A from the game's menu) are not new presses.
+    // First frame with this pad: buttons already held (e.g. A from a game's menu) are not new presses.
     if (!prev.length) for (let i = 0; i < pad.buttons.length; i++) prev[i] = on(i);
     const tap = i => on(i) && !prev[i];
-    if (tap(15) || tap(13)) select(sel + 1);
-    if (tap(14) || tap(12)) select(sel - 1);
+    if (tap(12)) move('up');
+    if (tap(13)) move('down');
+    if (tap(14)) move('left');
+    if (tap(15)) move('right');
     const ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
-    const dir = Math.abs(ax) > 0.6 ? Math.sign(ax) : Math.abs(ay) > 0.6 ? Math.sign(ay) : 0;
-    if (dir !== stickDir) { stickDir = dir; stickHold = 0; if (dir) select(sel + dir); }
-    else if (dir && (stickHold += dt) > 0.4) { stickHold = 0.25; select(sel + dir); }
+    const dir = Math.abs(ax) > 0.6 && Math.abs(ax) >= Math.abs(ay) ? (ax > 0 ? 'right' : 'left')
+      : Math.abs(ay) > 0.6 ? (ay > 0 ? 'down' : 'up') : '';
+    if (dir !== stickDir) { stickDir = dir; stickHold = 0; if (dir) move(dir); }
+    else if (dir && (stickHold += dt) > 0.4) { stickHold = 0.25; move(dir); }
     const go = tap(0) || tap(9);
     for (let i = 0; i < pad.buttons.length; i++) prev[i] = on(i);
     if (go) { open(); return; }
   }
   requestAnimationFrame(poll);
 }
+select(0, false);
 requestAnimationFrame(poll);
 </script>
 </body>
