@@ -2,11 +2,13 @@
 
 **Developer:** Akash · **Co-developer:** Claude Code
 
-Arcade 5-a-side football (soccer) for a game controller. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops.
+Arcade 5-a-side football (soccer) for a game controller, keyboard or touch screen. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops.
 
 ## Play
 
 Open `../index.html` (the game picker) or this folder's `index.html` in **Chrome** or Firefox. Press any button on your controller so the browser detects it.
+
+On a phone or tablet, hold it sideways and tap. On-screen controls appear once you touch the screen, and they hide again when you use a keyboard or controller.
 
 ## Modes
 
@@ -16,16 +18,18 @@ Open `../index.html` (the game picker) or this folder's `index.html` in **Chrome
 
 ## Controls
 
-| Action | Controller | Keyboard |
-|---|---|---|
-| Move | Left stick / D-pad | W A S D / arrows |
-| Pass (with the ball) | A / ✕ | J |
-| Shoot: hold for power | B / ○ (or X / □) | K or Space |
-| Slide tackle (without the ball) | B / ○ (or X / □) | K or Space |
-| Switch player (without the ball) | A / ✕ or LB / L1 | J or Q |
-| Sprint (uses stamina) | RB / R1 or RT / R2 | Shift or L |
-| Pause | Start / Options | Esc |
-| Sound on/off | Back / Create | M |
+| Action | Controller | Keyboard | Touch |
+|---|---|---|---|
+| Move | Left stick / D-pad | W A S D / arrows | Stick: put your thumb anywhere on the left side |
+| Pass (with the ball) | A / ✕ | J | **PASS** |
+| Shoot: hold for power | B / ○ (or X / □) | K or Space | Hold **SHOOT**, let go to shoot |
+| Slide tackle (without the ball) | B / ○ (or X / □) | K or Space | **TACKLE** (the SHOOT button) |
+| Switch player (without the ball) | A / ✕ or LB / L1 | J or Q | **SWITCH** (the PASS button) |
+| Sprint (uses stamina) | RB / R1 or RT / R2 | Shift or L | Push the stick right to its edge |
+| Pause | Start / Options | Esc | Pause button (top right) |
+| Sound on/off | Back / Create | M | Speaker button (top right) |
+
+On a touch screen the two right-hand buttons change their label with the situation: PASS and SHOOT when you have the ball, SWITCH and TACKLE when you don't. Menus work by tapping an option.
 
 ## Tips
 
@@ -33,13 +37,14 @@ Open `../index.html` (the game picker) or this folder's `index.html` in **Chrome
 - The ball sits in front of the dribbler. Face away from a defender to shield it, because anyone who runs into the ball can win it.
 - When shooting, hold the stick up or down to aim for a corner. A full-power shot is hard to catch, but it's less accurate.
 - **Taking a penalty:**
-  - Aim with ↑ ↓, hold the shoot button, and release.
+  - Aim with ↑ ↓ (touch: the stick), hold the shoot button, and release.
   - Release in the green part of the power bar.
   - The red part is over-hit and can sail over the bar.
   - Taking too long makes your aim wobble.
 - **Keeping goal:**
   - Pick a side with ↑ ↓ and press A or B to dive.
   - With no direction, you stay big in the middle.
+  - On a touch screen, tap **DIVE ▲**, **STAY** or **DIVE ▼** on the right. The stick shuffles the keeper along the line.
   - Watch the kicker's run-up: they often approach from the side opposite their shot.
 
 ## Options

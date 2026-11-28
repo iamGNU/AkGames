@@ -5,13 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Neon Breach</title>
 <meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<meta name="theme-color" content="#05070f">
+<link rel="manifest" href="../manifest.webmanifest">
+<link rel="icon" type="image/png" href="../icons/icon-192.png">
+<link rel="apple-touch-icon" href="../icons/apple-touch-icon.png">
 <style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  body { display: flex; align-items: center; justify-content: center; }
-  canvas { display: block; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; touch-action: none; }
+  #turn { display: none; position: fixed; top: 0; left: 0; right: 0; padding: 14px 16px; text-align: center;
+    font: 600 15px system-ui, sans-serif; color: #e8f0ff; background: rgba(10, 14, 32, 0.88); pointer-events: none; }
+  @media (orientation: portrait) and (pointer: coarse) { #turn { display: block; } }
 </style>
 </head>
 <body>
+<div id="turn">↻ Turn your phone sideways for a bigger view</div>
 <canvas id="game" width="960" height="540"></canvas>
 <script>
 'use strict';
@@ -34,6 +42,7 @@ const NCOLS = Math.ceil(W / COLW);
 
 const CFG = {
   player: { radius: 0.2, speed: 3.0, sprint: 1.55, hp: 100, turnPad: 3.0, turnKeys: 2.6, mouse: 0.0024 },
+  touch: { look: 0.0065, stick: 60, knob: 26, deadzone: 0.12, sprintAt: 0.9, slop: 10 }, // look: radians per screen pixel dragged; stick sizes in game pixels
   gun: { interval: 0.15, assistPad: 1.6, assistMouse: 1.1 },
   pickup: { health: 40 },
   maxDist: 18,
@@ -351,7 +360,7 @@ const Sfx = {
 };
 
 // ============================================================
-// Input: gamepad + keyboard/mouse merged into one state
+// Input: gamepad + keyboard/mouse + touch merged into one state
 // ============================================================
 const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
 const Input = {
@@ -360,8 +369,8 @@ const Input = {
   locked: false, wasLocked: false,
   pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
   device: 'kb',
-  ls: { x: 0, y: 0, m: 0 }, rsk: { x: 0, y: 0, m: 0 },
-  moveX: 0, moveY: 0, lookX: 0, turnKeys: 0, mouseDX: 0,
+  ls: { x: 0, y: 0, m: 0 }, rsk: { x: 0, y: 0, m: 0 }, ts: { x: 0, y: 0, m: 0 },
+  moveX: 0, moveY: 0, lookX: 0, turnKeys: 0, mouseDX: 0, touchDX: 0,
   fire: false, sprint: false, mapToggle: false,
   pause: false, mute: false, select: false, back: false,
   navUp: false, navDown: false, navLeft: false, navRight: false,
@@ -376,13 +385,14 @@ const Input = {
       Sfx.init();
     });
     addEventListener('keyup', e => this.keys.delete(e.code));
-    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; });
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; Touch.reset(); });
     addEventListener('mousemove', e => {
+      if (fromTouch(e)) return;
       if (this.locked) { this.mouse.dx += e.movementX || 0; this.device = 'kb'; return; }
       this.toWorld(e); this.mouse.moved = true;
     });
     canvas.addEventListener('mousedown', e => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || fromTouch(e)) return; // a finger never captures the mouse
       this.device = 'kb';
       Sfx.init();
       if (state === 'play' && !this.locked && canvas.requestPointerLock) { requestLock(); return; } // first click captures the mouse
@@ -391,6 +401,13 @@ const Input = {
     });
     addEventListener('mouseup', e => { if (e.button === 0) this.mouse.down = false; });
     canvas.addEventListener('contextmenu', e => e.preventDefault());
+    // Touch and pen: every finger is followed by its pointerId. These listen on the whole page, so the
+    // black bars beside the game (where thumbs rest on a wide phone) work too. The mouse is left alone.
+    addEventListener('pointerdown', e => { if (e.pointerType !== 'mouse') { e.preventDefault(); touchDown(e); } }, { passive: false });
+    addEventListener('pointermove', e => { if (e.pointerType !== 'mouse') touchMove(e); });
+    for (const t of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      addEventListener(t, e => { if (e.pointerType !== 'mouse') touchUp(e); });
+    }
     document.addEventListener('pointerlockchange', () => {
       this.locked = document.pointerLockElement === canvas;
       if (this.locked) this.wasLocked = true;
@@ -482,6 +499,21 @@ const Input = {
       if (any || this.ls.m > 0 || this.rsk.m > 0) this.device = 'pad';
       if (any) Sfx.init();
     }
+    // Touch: floating stick (pushed all the way up = sprint), FIRE button, on-screen buttons
+    const T = Touch;
+    T.sprint = false;
+    if (T.move) {
+      const sx = (T.kx - T.ox) / CFG.touch.stick, sy = (T.ky - T.oy) / CFG.touch.stick, sm = Math.hypot(sx, sy);
+      radial(sx, sy, CFG.touch.deadzone, this.ts);
+      mx += this.ts.x; my -= this.ts.y;
+      if (sm >= CFG.touch.sprintAt && -sy > sm * 0.8) { sprint = true; T.sprint = true; }
+    }
+    if (T.fire) fire = true;
+    if (T.tap.map) mapT = true;
+    if (T.tap.pause) pause = true;
+    if (T.tap.mute) mute = true;
+    T.tap.map = T.tap.pause = T.tap.mute = false;
+    this.touchDX = T.turn; T.turn = 0;
     const m = Math.hypot(mx, my);
     if (m > 1) { mx /= m; my /= m; }
     this.moveX = mx; this.moveY = my; this.lookX = lookX; this.turnKeys = turn;
@@ -503,11 +535,98 @@ const Input = {
   },
 };
 
+// ============================================================
+// Touch controls: a floating move stick on the left half, drag to look on the right half,
+// a FIRE button under the right thumb (drag it to aim while firing), and small buttons top right
+// ============================================================
+const MAP_BTN = { x: W - 164, y: 14, w: 44, h: 44 };
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const FIRE_BTN = { x: W - 98, y: H - 124, r: 56 };
+const STICK_HOME = { x: 130, y: 360 };     // where the resting move stick is drawn
+const TOUCH_BTNS = {
+  title: [{ r: PAUSE_BTN, icon: 'sound', act: 'mute' }],
+  play: [{ r: MAP_BTN, icon: 'map', act: 'map' }, { r: SOUND_BTN, icon: 'sound', act: 'mute' }, { r: PAUSE_BTN, icon: 'pause', act: 'pause' }],
+  paused: [{ r: SOUND_BTN, icon: 'sound', act: 'mute' }, { r: PAUSE_BTN, icon: 'resume', act: 'pause' }],
+};
+const NO_BTNS = [];
+function touchButtons() { return Input.device === 'touch' ? TOUCH_BTNS[state] || NO_BTNS : NO_BTNS; }
+
+const Touch = {
+  fingers: new Map(),                 // pointerId -> finger
+  move: null, look: null, fire: null, // the finger working each control
+  ox: 0, oy: 0, kx: 0, ky: 0,         // move stick centre and thumb (game pixels)
+  sprint: false,
+  turn: 0,                            // sideways look drag since the last frame (screen pixels)
+  tap: { map: false, mute: false, pause: false },
+  lastT: -1e9,                        // time of the last touch, to ignore the mouse events browsers copy from it
+  reset() { this.fingers.clear(); this.move = this.look = this.fire = null; this.turn = 0; this.sprint = false; },
+};
+function fromTouch(e) {
+  return !!(e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) || Date.now() - Touch.lastT < 800;
+}
+function touchPoint(e) {
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height) return { x: W / 2, y: H / 2 };
+  return { x: ((e.clientX - r.left) / r.width) * W, y: ((e.clientY - r.top) / r.height) * H };
+}
+function nearRect(p, r) { const m = 4; return p.x >= r.x - m && p.x <= r.x + r.w + m && p.y >= r.y - m && p.y <= r.y + r.h + m; }
+
+function touchDown(e) {
+  const I = Input, wasTouch = I.device === 'touch'; // buttons only work once they are on screen
+  I.device = 'touch'; Touch.lastT = Date.now();
+  Sfx.init();
+  if (Touch.fingers.has(e.pointerId)) touchUp(e); // a finger we never saw lift
+  const p = touchPoint(e);
+  const f = { id: e.pointerId, role: 'none', sx: p.x, sy: p.y, cx: e.clientX, drag: false };
+  const btn = wasTouch ? touchButtons().find(b => nearRect(p, b.r)) : null;
+  if (btn) { f.role = 'btn'; Touch.tap[btn.act] = true; }
+  else if (state === 'play') {
+    if (!Touch.fire && Math.hypot(p.x - FIRE_BTN.x, p.y - FIRE_BTN.y) <= FIRE_BTN.r + 12) { f.role = 'fire'; Touch.fire = f; }
+    else if (p.x < W / 2) {
+      if (!Touch.move) { f.role = 'move'; Touch.move = f; Touch.ox = Touch.kx = p.x; Touch.oy = Touch.ky = p.y; }
+    } else if (!Touch.look) { f.role = 'look'; f.drag = true; Touch.look = f; }
+    // any other finger is ignored until it lifts
+  } else { // menus: a tap is a click
+    f.role = 'tap';
+    I.mouse.x = p.x; I.mouse.y = p.y; I.mouse.clicked = true; I.mouse.moved = true;
+  }
+  Touch.fingers.set(e.pointerId, f);
+}
+function touchMove(e) {
+  const f = Touch.fingers.get(e.pointerId);
+  if (!f) return;
+  Touch.lastT = Date.now();
+  const p = touchPoint(e), dx = e.clientX - f.cx;
+  f.cx = e.clientX;
+  if (f.role === 'move') {
+    Touch.kx = p.x; Touch.ky = p.y;
+    // Past the rim the stick's centre follows the thumb, so pulling back answers at once.
+    const R = CFG.touch.stick * 1.25, ddx = p.x - Touch.ox, ddy = p.y - Touch.oy, d = Math.hypot(ddx, ddy);
+    if (d > R) { Touch.ox = p.x - (ddx / d) * R; Touch.oy = p.y - (ddy / d) * R; }
+  } else if (f.role === 'look' || f.role === 'fire') {
+    // A thumb resting on FIRE wobbles a little: it only turns the view once it really slides.
+    if (!f.drag && Math.hypot(p.x - f.sx, p.y - f.sy) > CFG.touch.slop) f.drag = true;
+    if (f.drag) Touch.turn += dx;
+  }
+}
+function touchUp(e) {
+  if (e.type !== 'lostpointercapture') { Touch.lastT = Date.now(); Sfx.init(); } // Android starts audio on a tap's release
+  const f = Touch.fingers.get(e.pointerId);
+  if (!f) return;
+  Touch.fingers.delete(e.pointerId);
+  if (Touch.move === f) { Touch.move = null; Touch.sprint = false; }
+  if (Touch.look === f) Touch.look = null;
+  if (Touch.fire === f) Touch.fire = null;
+}
+
 function requestLock() {
   try { const r = canvas.requestPointerLock && canvas.requestPointerLock(); if (r && r.catch) r.catch(() => {}); } catch (e) { /* not allowed here */ }
 }
 function releaseLock() { try { if (document.exitPointerLock && document.pointerLockElement) document.exitPointerLock(); } catch (e) { /* ignore */ } }
 function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+// Thumbs get the same gentle aim help as a controller; the mouse gets a little less.
+function aimAssist() { return usingPad() || Input.device === 'touch' ? CFG.gun.assistPad : CFG.gun.assistMouse; }
 function padNames() {
   const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
   const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
@@ -833,7 +952,7 @@ function targetAhead(wallD, assist) {
 function fire() {
   P.fireCd = CFG.gun.interval; P.recoil = 1; P.flash = 0.06; tracer.t = 0.07; P.shots++;
   const wd = castDist(P.x, P.y, cdx, cdy);
-  const t = targetAhead(wd, usingPad() ? CFG.gun.assistPad : CFG.gun.assistMouse);
+  const t = targetAhead(wd, aimAssist());
   if (t) damageEnemy(t);
   else burst(P.x + cdx * (wd - 0.04), P.y + cdy * (wd - 0.04), 0.5, '#bff6ff', 5, 1.2, 0.25);
   Sfx.shoot();
@@ -843,10 +962,11 @@ function fire() {
 function updatePlayer(dt) {
   const I = Input, C = CFG.player, sm = SENS_MULT[sens];
   const wd = castDist(P.x, P.y, cdx, cdy);
-  P.aimTarget = targetAhead(wd, usingPad() ? CFG.gun.assistPad : CFG.gun.assistMouse);
-  // Turning (aim friction slows the right stick a little while the crosshair is on an enemy)
+  P.aimTarget = targetAhead(wd, aimAssist());
+  // Turning (aim friction slows the right stick and touch drags a little while the crosshair is on an enemy)
   const friction = P.aimTarget && usingPad() ? 0.55 : 1;
   P.ang += (I.lookX * C.turnPad * sm * friction + I.turnKeys * C.turnKeys) * dt + I.mouseDX * C.mouse * sm;
+  if (I.touchDX) P.ang += I.touchDX * CFG.touch.look * sm * (P.aimTarget ? 0.6 : 1);
   cdx = Math.cos(P.ang); cdy = Math.sin(P.ang);
   // Moving: forward/back plus strafe; sliding along walls
   const sp = C.speed * (I.sprint ? C.sprint : 1);
@@ -926,7 +1046,7 @@ function titleItems() {
   return [
     { id: 'play', label: 'Play', hint: `Start level ${selLevel + 1}: ${LEVELS[selLevel].name}.` },
     { id: 'level', label: 'Level', value: `${selLevel + 1} / ${LEVELS.length}`, hint: unlocked < LEVELS.length - 1 ? `Clear a level to unlock the next one. (${LEVELS[selLevel].name})` : `Every level is unlocked. (${LEVELS[selLevel].name})` },
-    { id: 'sens', label: 'Look speed', value: SENS_LABEL[sens], hint: 'How fast the right stick and the mouse turn you.' },
+    { id: 'sens', label: 'Look speed', value: SENS_LABEL[sens], hint: Input.device === 'touch' ? 'How fast dragging on the screen turns you.' : 'How fast the right stick and the mouse turn you.' },
     { id: 'howto', label: 'How to Play', hint: 'Controls and tips.' },
     { id: 'games', label: 'All Games', hint: 'Back to the game picker.' },
   ];
@@ -1269,7 +1389,8 @@ function buildMinimap() {
   }
 }
 function drawMinimap() {
-  const s = Math.min(150 / world.w, 110 / world.h), mw = world.w * s, mh = world.h * s, x0 = W - mw - 16, y0 = 16;
+  const s = Math.min(150 / world.w, 110 / world.h), mw = world.w * s, mh = world.h * s, x0 = W - mw - 16;
+  const y0 = touchButtons().length ? 68 : 16; // below the touch buttons when they are showing
   ctx.imageSmoothingEnabled = false;
   ctx.globalAlpha = 0.9; ctx.drawImage(miniCanvas, x0, y0, mw, mh); ctx.globalAlpha = 1;
   ctx.imageSmoothingEnabled = true;
@@ -1320,6 +1441,74 @@ function drawHUD() {
   }
 }
 
+// ---------------- Touch controls (drawn last, only for touch players) ----------------
+function drawButton(r, icon) {
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = 'rgba(10,12,30,0.6)'; ctx.fill();
+  ctx.globalAlpha = 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  if (icon === 'resume') { poly2([[cx - 6, cy - 10], [cx + 10, cy], [cx - 6, cy + 10]]); ctx.fill(); return; }
+  if (icon === 'map') {
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    text('MAP', cx, cy + 1, `800 12px ${SANS}`, showMap ? CFG.color.text : CFG.color.faint);
+    return;
+  }
+  ctx.beginPath(); // speaker
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+function drawTouchUI() {
+  if (Input.device !== 'touch') return;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (state === 'play') {
+    const T = Touch, R = CFG.touch.stick, held = !!T.move, C = CFG.color;
+    // Move stick: under the left thumb while it is down, otherwise a faint one showing where it goes
+    const bx = clamp(held ? T.ox : STICK_HOME.x, R * 0.75, W - R * 0.75), by = clamp(held ? T.oy : STICK_HOME.y, R * 0.75, H - R * 0.75);
+    let kx = 0, ky = 0;
+    if (held) { kx = T.kx - T.ox; ky = T.ky - T.oy; const d = Math.hypot(kx, ky); if (d > R) { kx *= R / d; ky *= R / d; } }
+    const col = T.sprint ? C.title : '#3be8ff';
+    ctx.globalAlpha = held ? 0.85 : 0.4;
+    ctx.beginPath(); ctx.arc(bx, by, R, 0, TAU); ctx.fillStyle = 'rgba(8,12,30,0.4)'; ctx.fill();
+    glowStroke(col, 2);
+    ctx.beginPath(); ctx.moveTo(bx - 9, by - R + 15); ctx.lineTo(bx, by - R + 7); ctx.lineTo(bx + 9, by - R + 15); // push up to sprint
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(bx + kx, by + ky, CFG.touch.knob, 0, TAU);
+    ctx.fillStyle = held ? (T.sprint ? 'rgba(255,138,61,0.35)' : 'rgba(59,232,255,0.3)') : 'rgba(59,232,255,0.12)'; ctx.fill();
+    glowStroke(col, 2);
+    if (!held) text('MOVE', bx, by + 1, `800 13px ${SANS}`, C.text);
+    if (T.sprint) { ctx.globalAlpha = 1; text('SPRINT', bx, by + R * 0.45, `800 13px ${SANS}`, C.title); } // the knob is at the top
+    // FIRE: hold it; slide the same thumb to turn while firing
+    const fh = !!T.fire;
+    ctx.globalAlpha = fh ? 0.95 : 0.6;
+    ctx.beginPath(); ctx.arc(FIRE_BTN.x, FIRE_BTN.y, FIRE_BTN.r, 0, TAU);
+    ctx.fillStyle = fh ? 'rgba(255,95,210,0.32)' : 'rgba(255,95,210,0.1)'; ctx.fill();
+    glowStroke(C.shot, fh ? 3 : 2);
+    ctx.beginPath(); ctx.arc(FIRE_BTN.x, FIRE_BTN.y, FIRE_BTN.r - 12, 0, TAU);
+    ctx.strokeStyle = 'rgba(255,95,210,0.35)'; ctx.lineWidth = 1.5; ctx.stroke();
+    text('FIRE', FIRE_BTN.x, FIRE_BTN.y + 1, `800 18px ${SANS}`, C.text);
+    // For the first seconds of a level, say what the empty right side does
+    if (levelTime < 8 && !T.look) {
+      ctx.globalAlpha = 0.8 * clamp(8 - levelTime, 0, 1);
+      const s = '‹   drag here to look   ›';
+      ctx.font = `700 15px ${SANS}`;
+      const w = ctx.measureText(s).width + 32;
+      rrPath(724 - w / 2, 196, w, 32, 16); ctx.fillStyle = 'rgba(6,9,24,0.6)'; ctx.fill();
+      text(s, 724, 213, `700 15px ${SANS}`, C.text);
+      if (!held) text('push all the way up to sprint', STICK_HOME.x + 14, STICK_HOME.y + R + 22, `600 13px ${SANS}`, C.dim);
+    }
+    ctx.globalAlpha = 1;
+  }
+  for (const b of touchButtons()) drawButton(b.r, b.icon);
+}
+
 function drawMenu(items, y0, enabled = true, gap = 50) {
   menuRects.length = 0;
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -1354,7 +1543,8 @@ function drawTitle() {
   const it = items[menuSel] || items[0], N = padNames(), hy = 196 + items.length * 48 + 2;
   text(it.hint, W / 2, hy, `500 14px ${SANS}`, CFG.color.dim);
   const side = it.value !== undefined ? '   ·   ← → change' : '';
-  text(usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`,
+  text(Input.device === 'touch' ? (it.value !== undefined ? 'Tap to choose   ·   tap again to change' : 'Tap to choose')
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select${side}` : `↑ ↓ choose   ·   Enter select${side}`,
     W / 2, hy + 26, `500 12px ${SANS}`, CFG.color.faint);
   const yb = H - 26, pad = Input.pad;
   ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
@@ -1365,7 +1555,7 @@ function drawTitle() {
   ctx.textAlign = 'right';
   const cleared = bestTimes.filter(t => t != null).length;
   text(`CLEARED ${cleared} / ${LEVELS.length}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
-  if (!Sfx.ctx || Sfx.ctx.state !== 'running') text('click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
+  if ((!Sfx.ctx || Sfx.ctx.state !== 'running') && Input.device !== 'touch') text('click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
 }
 
 function drawHowTo() {
@@ -1374,22 +1564,23 @@ function drawHowTo() {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   glowText('HOW TO PLAY', W / 2, 46, `800 32px ${SANS}`, CFG.color.title);
   const rows = [
-    ['Move / strafe', 'Left stick', 'W A S D (↑ ↓ also move)'],
-    ['Look / turn', 'Right stick', 'Mouse (click to capture), or ← → / Q E'],
-    ['Shoot (hold)', `${N.rt} or ${N.rb}`, 'Left click, Space or J'],
-    ['Sprint', `${N.lb} or click the left stick`, 'Shift'],
-    ['Map on/off', N.y, 'Tab or F'],
-    ['Pause', N.start, 'Esc or P'],
+    ['Move / strafe', 'Left stick', 'W A S D (↑ ↓ also move)', 'Left side: drag the stick'],
+    ['Look / turn', 'Right stick', 'Mouse (click to capture), or ← → / Q E', 'Drag on the right side'],
+    ['Shoot (hold)', `${N.rt} or ${N.rb}`, 'Left click, Space or J', 'Hold FIRE (slide it to aim)'],
+    ['Sprint', `${N.lb} or click the left stick`, 'Shift', 'Push the stick all the way up'],
+    ['Map on/off', N.y, 'Tab or F', 'MAP button, top right'],
+    ['Pause', N.start, 'Esc or P', '‖ button, top right'],
   ];
+  const cx = [146, 160, 352, 640];
   ctx.textAlign = 'left';
-  text('CONTROLLER', 300, 90, `800 11px ${SANS}`, CFG.color.faint);
-  text('KEYBOARD + MOUSE', 560, 90, `800 11px ${SANS}`, CFG.color.faint);
+  text('CONTROLLER', cx[1], 90, `800 11px ${SANS}`, CFG.color.faint);
+  text('KEYBOARD + MOUSE', cx[2], 90, `800 11px ${SANS}`, CFG.color.faint);
+  text('TOUCH', cx[3], 90, `800 11px ${SANS}`, CFG.color.faint);
   rows.forEach((r, i) => {
     const y = 114 + i * 24;
-    ctx.textAlign = 'right'; text(r[0], 280, y, `600 14px ${SANS}`, CFG.color.dim);
+    ctx.textAlign = 'right'; text(r[0], cx[0], y, `600 14px ${SANS}`, CFG.color.dim);
     ctx.textAlign = 'left';
-    text(r[1], 300, y, `600 14px ${SANS}`, CFG.color.text);
-    text(r[2], 560, y, `600 14px ${SANS}`, CFG.color.text);
+    for (let j = 1; j < 4; j++) text(r[j], cx[j], y, `600 14px ${SANS}`, CFG.color.text);
   });
   ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(90, 270, W - 180, 1);
   text('ENEMIES', 90, 296, `800 11px ${SANS}`, CFG.color.faint);
@@ -1413,7 +1604,7 @@ function drawHowTo() {
     'The red arcs show where damage came from.',
   ].forEach((s, i) => text(s, 560, 326 + i * 25, `500 14px ${SANS}`, CFG.color.text));
   ctx.textAlign = 'center';
-  text(usingPad() ? `${N.b}: back` : 'Esc or click: back', W / 2, H - 26, `600 13px ${SANS}`, CFG.color.dim);
+  text(usingPad() ? `${N.b}: back` : Input.device === 'touch' ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 26, `600 13px ${SANS}`, CFG.color.dim);
 }
 
 function drawPause() {
@@ -1422,7 +1613,8 @@ function drawPause() {
   glowText('PAUSED', W / 2, 150, `800 46px ${SANS}`, CFG.color.text);
   drawMenu(PAUSE_ITEMS, 236);
   const N = padNames();
-  text(`${usingPad() ? N.select : 'M'}: sound ${Sfx.muted ? 'off' : 'on'}   ·   ${usingPad() ? N.y : 'Tab'}: map ${showMap ? 'on' : 'off'}`, W / 2, 400, `500 12px ${SANS}`, CFG.color.faint);
+  if (Input.device === 'touch') text('Tap an option', W / 2, 400, `500 12px ${SANS}`, CFG.color.faint);
+  else text(`${usingPad() ? N.select : 'M'}: sound ${Sfx.muted ? 'off' : 'on'}   ·   ${usingPad() ? N.y : 'Tab'}: map ${showMap ? 'on' : 'off'}`, W / 2, 400, `500 12px ${SANS}`, CFG.color.faint);
 }
 
 function drawDead() {
@@ -1478,6 +1670,7 @@ function render() {
     else if (state === 'victory') drawClear(true);
   }
   drawToast();
+  drawTouchUI(); // touch controls go on top of everything
   if (SHOW_FPS) {
     ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
     text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
@@ -1556,6 +1749,12 @@ requestAnimationFrame(t => { last = t; frame(t); });
   }, 250);
   active();
 })();
+
+// Offline play: the AK Games service worker saves every game. It needs http(s), so it is skipped
+// when the file is opened straight from disk.
+if (typeof navigator !== 'undefined' && navigator.serviceWorker && location.protocol.indexOf('http') === 0) {
+  navigator.serviceWorker.register('../sw.js', { scope: '../' }).catch(function () {});
+}
 </script>
 </body>
 </html>

@@ -5,13 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Neon Match</title>
 <meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<meta name="theme-color" content="#05070f">
+<link rel="manifest" href="../manifest.webmanifest">
+<link rel="icon" type="image/png" href="../icons/icon-192.png">
+<link rel="apple-touch-icon" href="../icons/apple-touch-icon.png">
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
   body { display: flex; align-items: center; justify-content: center; }
   canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+  #turn { display: none; position: fixed; top: 0; left: 0; right: 0; padding: 14px 16px; text-align: center;
+    font: 600 15px system-ui, sans-serif; color: #e8f0ff; background: rgba(10, 14, 32, 0.88); pointer-events: none; }
+  @media (orientation: portrait) and (pointer: coarse) { #turn { display: block; } }
 </style>
 </head>
 <body>
+<div id="turn">↻ Turn your phone sideways for a bigger view</div>
 <canvas id="game" width="960" height="540"></canvas>
 <script>
 'use strict';
@@ -1774,6 +1782,12 @@ requestAnimationFrame(t => { last = t; frame(t); });
   }, 250);
   active();
 })();
+
+// Offline play: the AK Games service worker saves every game. It needs http(s), so it is skipped
+// when the file is opened straight from disk.
+if (typeof navigator !== 'undefined' && navigator.serviceWorker && location.protocol.indexOf('http') === 0) {
+  navigator.serviceWorker.register('../sw.js', { scope: '../' }).catch(function () {});
+}
 </script>
 </body>
 </html>

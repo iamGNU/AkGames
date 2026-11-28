@@ -5,13 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Neon Kick</title>
 <meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<meta name="theme-color" content="#05070f">
+<link rel="manifest" href="../manifest.webmanifest">
+<link rel="icon" type="image/png" href="../icons/icon-192.png">
+<link rel="apple-touch-icon" href="../icons/apple-touch-icon.png">
 <style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  body { display: flex; align-items: center; justify-content: center; }
-  canvas { display: block; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  body { display: flex; align-items: center; justify-content: center; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+  #turn { display: none; position: fixed; top: 0; left: 0; right: 0; padding: 14px 16px; text-align: center;
+    font: 600 15px system-ui, sans-serif; color: #e8f0ff; background: rgba(10, 14, 32, 0.88); pointer-events: none; }
+  @media (orientation: portrait) and (pointer: coarse) { #turn { display: block; } }
 </style>
 </head>
 <body>
+<div id="turn">↻ Turn your phone sideways for a bigger view</div>
 <canvas id="game" width="960" height="540"></canvas>
 <script>
 'use strict';
@@ -263,19 +271,35 @@ const Sfx = {
 };
 
 // ============================================================
-// Input: gamepad + keyboard/mouse merged into one state
+// Input: gamepad + keyboard/mouse + touch merged into one state
 // ============================================================
 const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+// Touch layout (960x540 world units). The move stick floats: it appears where the left thumb lands.
+const TOUCH = { baseR: 62, knobR: 26, travel: 50, dead: 0.15, full: 0.7, sprintAt: 0.92, idleX: 136, idleY: 418, slack: 34 };
+const TB = { // round on-screen buttons; `dive` is the keeper's dive direction in the shootout
+  shoot: { id: 'shoot', x: 872, y: 438, r: 50 },
+  pass:  { id: 'pass',  x: 768, y: 486, r: 40 },
+  up:    { id: 'up',    x: 878, y: 190, r: 44, dive: -1 },
+  stay:  { id: 'stay',  x: 878, y: 298, r: 44, dive: 0 },
+  down:  { id: 'down',  x: 878, y: 406, r: 44, dive: 1 },
+};
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
 const Input = {
   keys: new Set(), pressed: new Set(), navKeys: new Set(),
   mouse: { x: W / 2, y: H / 2, clicked: false, moved: false },
   pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
-  device: 'kb',
+  device: 'kb',     // 'kb' (keyboard or mouse), 'pad' or 'touch': whatever was used last
   move: { x: 0, y: 0 }, ls: { x: 0, y: 0, m: 0 },
   sprint: false, pass: false, passHeld: false, switchP: false,
   shootHeld: false, shootTap: false, shootRelease: false, prevShoot: false,
   pause: false, mute: false, select: false, back: false,
   navUp: false, navDown: false, navLeft: false, navRight: false,
+  dive: null,       // touch only: -1 up, 0 stay, 1 down when a dive button was tapped this frame
+  // Touch: every finger is tracked by pointerId, so the stick and a button work at the same time.
+  fingers: new Map(), // pointerId -> { role: 'stick' | 'shoot' | 'pass' | 'up' | 'stay' | 'down' | 'ui' | 'none' }
+  stick: { id: null, ox: 0, oy: 0, x: 0, y: 0, vx: 0, vy: 0, mag: 0, sprint: false },
+  tShoot: false, tPass: false, tDive: null, tPause: false, tMute: false, touchAt: 0,
 
   init() {
     addEventListener('keydown', e => {
@@ -287,14 +311,38 @@ const Input = {
       Sfx.init();
     });
     addEventListener('keyup', e => this.keys.delete(e.code));
-    addEventListener('blur', () => this.keys.clear());
-    addEventListener('mousemove', e => { this.toWorld(e); this.mouse.moved = true; });
+    addEventListener('blur', () => { this.keys.clear(); this.clearTouches(); });
+    addEventListener('mousemove', e => {
+      if (Date.now() - this.touchAt < 800) return; // a mouse event made up from a touch
+      this.toWorld(e); this.mouse.moved = true;
+    });
     canvas.addEventListener('mousedown', e => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || Date.now() - this.touchAt < 800) return;
       this.toWorld(e); this.mouse.clicked = true; this.device = 'kb';
       Sfx.init();
     });
     canvas.addEventListener('contextmenu', e => e.preventDefault());
+    // Touch and pen. Listening on the window also catches thumbs resting on the black bars beside the canvas.
+    addEventListener('pointerdown', e => {
+      if (e.pointerType === 'mouse') return;
+      e.preventDefault(); // no made-up mouse events after this
+      this.touchAt = Date.now();
+      this.device = 'touch';
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* capture not supported */ }
+      this.touchDown(e);
+      Sfx.init(); // Android Chrome unlocks audio on a touch gesture
+    }, { passive: false });
+    addEventListener('pointermove', e => { if (e.pointerType !== 'mouse') this.touchMove(e); });
+    addEventListener('pointerup', e => {
+      if (e.pointerType === 'mouse') return;
+      this.touchAt = Date.now();
+      this.touchUp(e.pointerId);
+      Sfx.init(); // some browsers only unlock audio when the finger lifts
+    });
+    addEventListener('pointercancel', e => { if (e.pointerType !== 'mouse') this.touchUp(e.pointerId); });
+    canvas.addEventListener('lostpointercapture', e => { if (e.pointerType !== 'mouse') this.touchUp(e.pointerId); });
+    addEventListener('contextmenu', e => { if (this.device === 'touch') e.preventDefault(); }); // long-press on the bars
+    document.addEventListener('visibilitychange', () => { if (document.hidden) this.clearTouches(); });
     addEventListener('gamepadconnected', e => {
       this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
       showToast('Controller connected');
@@ -311,6 +359,81 @@ const Input = {
     if (!r.width || !r.height) return;
     this.mouse.x = ((e.clientX - r.left) / r.width) * W;
     this.mouse.y = ((e.clientY - r.top) / r.height) * H;
+  },
+
+  // A finger in world units; it can be off the canvas (on the black bars).
+  touchPoint(e, out) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    out.x = ((e.clientX - r.left) / r.width) * W;
+    out.y = ((e.clientY - r.top) / r.height) * H;
+    return Number.isFinite(out.x) && Number.isFinite(out.y);
+  },
+
+  touchDown(e) {
+    // A primary touch means no other finger is down: anything still tracked lost its pointerup.
+    if (e.isPrimary && e.pointerType === 'touch' && this.fingers.size) { this.fingers.clear(); this.resetStick(); }
+    if (this.fingers.has(e.pointerId) || this.fingers.size >= 6) return; // ignore a pile of fingers
+    const f = { role: 'none', x: 0, y: 0 };
+    if (!this.touchPoint(e, f)) return;
+    this.fingers.set(e.pointerId, f);
+    const p = { x: clamp(f.x, 0, W), y: clamp(f.y, 0, H) };
+    const playing = state === 'match' || state === 'pens';
+    if (playing || state === 'paused') {
+      if (inRect(p, padRect(PAUSE_BTN, 6))) { f.role = 'ui'; this.tPause = true; return; }
+      if (inRect(p, padRect(SOUND_BTN, 6))) { f.role = 'ui'; this.tMute = true; return; }
+    }
+    if (!playing) { // menus: a tap is a click
+      f.role = 'ui';
+      this.mouse.x = f.x; this.mouse.y = f.y; this.mouse.clicked = true;
+      return;
+    }
+    const b = touchButtonAt(p.x, p.y, f.x > W || f.x < 0 ? 30 : 0); // more slack for a thumb on the black bars
+    if (b) {
+      f.role = b.id;
+      if (b.id === 'shoot') this.tShoot = true;   // counts as held for at least one frame
+      else if (b.id === 'pass') this.tPass = true;
+      else this.tDive = b.dive;
+      return;
+    }
+    if (p.x < W * 0.6 && this.stick.id === null) {
+      f.role = 'stick';
+      Object.assign(this.stick, { id: e.pointerId, ox: f.x, oy: f.y, x: f.x, y: f.y });
+      this.updateStick();
+    }
+  },
+
+  touchMove(e) {
+    const f = this.fingers.get(e.pointerId);
+    if (!f || !this.touchPoint(e, f)) return;
+    if (f.role === 'stick' && this.stick.id === e.pointerId) {
+      this.stick.x = f.x; this.stick.y = f.y;
+      this.updateStick();
+    }
+  },
+
+  touchUp(id) {
+    const f = this.fingers.get(id);
+    if (!f) return;
+    this.fingers.delete(id);
+    if (this.stick.id === id) this.resetStick();
+  },
+
+  clearTouches() {
+    this.fingers.clear(); this.resetStick();
+    this.tShoot = this.tPass = this.tPause = this.tMute = false; this.tDive = null;
+  },
+
+  resetStick() { Object.assign(this.stick, { id: null, vx: 0, vy: 0, mag: 0, sprint: false }); },
+
+  // The knob travels up to TOUCH.travel from the base; drag further and the base follows the thumb.
+  updateStick() {
+    const S = this.stick, R = TOUCH.travel;
+    let dx = S.x - S.ox, dy = S.y - S.oy, d = Math.hypot(dx, dy);
+    if (d > R) { S.ox = S.x - (dx / d) * R; S.oy = S.y - (dy / d) * R; dx = S.x - S.ox; dy = S.y - S.oy; d = R; }
+    const m = d / R, n = clamp((m - TOUCH.dead) / (TOUCH.full - TOUCH.dead), 0, 1);
+    S.vx = d > 0 ? (dx / d) * n : 0; S.vy = d > 0 ? (dy / d) * n : 0;
+    S.mag = m; S.sprint = m >= TOUCH.sprintAt; // pushed right to the rim: sprint
   },
 
   getPad() {
@@ -383,6 +506,18 @@ const Input = {
       if (any || this.ls.m > 0 || dx || dy) this.device = 'pad';
       if (any) Sfx.init();
     }
+    // Touch: the stick adds to the movement (sprint at the rim); buttons work like the shoot/pass keys.
+    const S = this.stick;
+    if (S.id !== null) { mx += S.vx; my += S.vy; if (S.sprint) sprint = true; }
+    if (this.tShoot) { shootHeld = true; this.tShoot = false; }
+    if (this.tPass) { pass = true; this.tPass = false; }
+    if (this.tPause) { pause = true; this.tPause = false; }
+    if (this.tMute) { mute = true; this.tMute = false; }
+    for (const f of this.fingers.values()) {
+      if (f.role === 'shoot') shootHeld = true;
+      else if (f.role === 'pass') passHeld = true;
+    }
+    this.dive = this.tDive; this.tDive = null;
     const m = Math.hypot(mx, my);
     if (m > 1) { mx /= m; my /= m; }
     this.move.x = mx; this.move.y = my;
@@ -407,6 +542,29 @@ const Input = {
 };
 
 function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function usingTouch() { return Input.device === 'touch'; }
+function padRect(r, m) { return { x: r.x - m, y: r.y - m, w: r.w + m * 2, h: r.h + m * 2 }; }
+// The touch buttons on screen right now: PASS + SHOOT in a match, SHOOT when taking a penalty,
+// three dive buttons (lined up with the goal) when keeping.
+const TB_MATCH = [TB.shoot, TB.pass], TB_KICK = [TB.shoot], TB_KEEP = [TB.up, TB.stay, TB.down], TB_NONE = [];
+function touchButtons() {
+  if (state === 'match') return TB_MATCH;
+  if (state === 'pens') return P.turn === 0 ? TB_KICK : TB_KEEP;
+  return TB_NONE;
+}
+// Nearest button to a finger, with a generous margin for thumbs.
+function touchButtonAt(x, y, extra = 0) {
+  let best = null, bd = 1e9;
+  for (const b of touchButtons()) {
+    const d = dist(x, y, b.x, b.y);
+    if (d <= b.r + TOUCH.slack + extra && d - b.r < bd) { bd = d - b.r; best = b; }
+  }
+  return best;
+}
+function touchHeld(id) {
+  for (const f of Input.fingers.values()) if (f.role === id) return true;
+  return false;
+}
 function padNames() {
   const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
   const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
@@ -1143,7 +1301,8 @@ function humanKeeper(dt) {
   const k = P.keeper, I = Input;
   if (k.dived) return;
   k.y = clamp(k.y + I.move.y * 70 * dt, CY - GOAL.half + 10, CY + GOAL.half - 10);
-  if (I.shootTap || I.pass) penDive(I.move.y > 0.35 ? 1 : I.move.y < -0.35 ? -1 : 0);
+  if (I.dive !== null) penDive(I.dive); // touch: DIVE ▲ / STAY / DIVE ▼ buttons
+  else if (I.shootTap || I.pass) penDive(I.move.y > 0.35 ? 1 : I.move.y < -0.35 ? -1 : 0);
 }
 
 function resolvePen() {
@@ -1492,10 +1651,11 @@ function renderMatchHUD() {
   const half = M.half === 1 ? '1ST HALF' : '2ND HALF';
   drawScoreboard(M.score[0], M.score[1], `${fmtClock(M.clock)}   ·   ${half}`);
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
-  text(DIFF_LABEL[difficulty].toUpperCase(), W - 24, 26, `700 11px ${SANS}`, CFG.color.faint);
+  text(DIFF_LABEL[difficulty].toUpperCase(), usingTouch() ? SOUND_BTN.x - 14 : W - 24, 26, `700 11px ${SANS}`, CFG.color.faint);
   const N = padNames();
   ctx.textAlign = 'center';
-  text(usingPad()
+  if (usingTouch()) text('Stick to the edge: sprint   ·   hold SHOOT, let go to shoot', W / 2, H - 18, `600 14px ${SANS}`, CFG.color.dim); // bigger: phones are small
+  else text(usingPad()
     ? `${N.a} pass / switch   ·   hold ${N.b} shoot   ·   ${N.b} (no ball) tackle   ·   ${N.rb} sprint`
     : 'J pass / switch   ·   hold K shoot   ·   K (no ball) tackle   ·   Shift sprint',
   W / 2, H - 18, `500 12px ${SANS}`, CFG.color.faint);
@@ -1565,8 +1725,10 @@ function renderPensHUD() {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   if (P.phase === 'ready') glowText(P.turn === 0 ? 'YOUR KICK' : 'YOU\'RE IN GOAL', W / 2, H / 2 + 150, `800 30px ${SANS}`, CFG.color.text);
   if (P.turn === 0 && P.phase === 'aim') {
-    text(usingPad() ? `Aim with ↑ ↓   ·   hold ${N.b} for power, release to shoot` : 'Aim with W / S   ·   hold K or Space for power, release to shoot',
-      W / 2, H - 22, `600 13px ${SANS}`, CFG.color.dim);
+    text(usingPad() ? `Aim with ↑ ↓   ·   hold ${N.b} for power, release to shoot`
+      : usingTouch() ? 'Aim with the stick   ·   hold SHOOT for power, let go to shoot'
+      : 'Aim with W / S   ·   hold K or Space for power, release to shoot',
+    W / 2, H - 22, `600 ${usingTouch() ? 14 : 13}px ${SANS}`, CFG.color.dim);
     // Power bar: green sweet spot, red = over-hit
     const bw = 320, bx = W / 2 - bw / 2, by = H - 58, max = 1.2;
     ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fillRect(bx, by, bw, 10);
@@ -1579,8 +1741,10 @@ function renderPensHUD() {
     ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.lineWidth = 1; ctx.strokeRect(bx, by, bw, 10);
   }
   if (P.turn === 1 && (P.phase === 'runup' || P.phase === 'ready')) {
-    text(usingPad() ? `Pick a side with ↑ ↓ and press ${N.a} to dive (neutral = stay in the middle)` : 'Pick a side with W / S and press K to dive (no direction = stay in the middle)',
-      W / 2, H - 22, `600 13px ${SANS}`, CFG.color.dim);
+    text(usingPad() ? `Pick a side with ↑ ↓ and press ${N.a} to dive (neutral = stay in the middle)`
+      : usingTouch() ? 'Watch the run-up, then tap DIVE ▲, STAY or DIVE ▼'
+      : 'Pick a side with W / S and press K to dive (no direction = stay in the middle)',
+    W / 2, H - 22, `600 ${usingTouch() ? 14 : 13}px ${SANS}`, CFG.color.dim);
   }
   if (P.phase === 'result') {
     ctx.globalAlpha = Math.min(1, P.t * 4);
@@ -1627,8 +1791,9 @@ function drawTitle() {
   const it = items[menuSel] || items[0], N = padNames();
   text(it.hint, W / 2, 200 + items.length * 48 + 2, `500 14px ${SANS}`, CFG.color.dim);
   const sideHint = it.value !== undefined ? '   ·   ← → change' : '';
-  text(usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select${sideHint}` : `↑ ↓ choose   ·   Enter select${sideHint}`,
-    W / 2, 200 + items.length * 48 + 28, `500 12px ${SANS}`, CFG.color.faint);
+  text(usingTouch() ? (it.value !== undefined ? 'Tap again to change' : 'Tap to choose')
+    : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select${sideHint}` : `↑ ↓ choose   ·   Enter select${sideHint}`,
+  W / 2, 200 + items.length * 48 + 28, `500 12px ${SANS}`, CFG.color.faint);
 
   const yb = H - 26, pad = Input.pad;
   ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
@@ -1639,7 +1804,7 @@ function drawTitle() {
   text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
   ctx.textAlign = 'right';
   text(`W ${record.w}  ·  D ${record.d}  ·  L ${record.l}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
-  if (!Sfx.ctx || Sfx.ctx.state !== 'running') text('click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
+  if (!Sfx.ctx || Sfx.ctx.state !== 'running') text(usingTouch() ? 'tap for sound' : 'click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
 }
 
 function drawHowTo() {
@@ -1649,23 +1814,24 @@ function drawHowTo() {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   glowText('HOW TO PLAY', W / 2, 46, `800 32px ${SANS}`, CFG.color.title);
   const rows = [
-    ['Move', 'Left stick / D-pad', 'W A S D / arrows'],
-    ['Pass (with the ball)', N.a, 'J'],
-    ['Shoot: hold for power', `${N.b} or ${N.x}`, 'K or Space'],
-    ['Slide tackle (no ball)', `${N.b} or ${N.x}`, 'K or Space'],
-    ['Switch player (no ball)', `${N.a} or ${N.lb}`, 'J or Q'],
-    ['Sprint', `${N.rb} or ${N.rt}`, 'Shift or L'],
-    ['Pause', N.start, 'Esc'],
+    ['Move', 'Left stick / D-pad', 'W A S D / arrows', 'Stick (left side)'],
+    ['Pass (with the ball)', N.a, 'J', 'PASS'],
+    ['Shoot: hold for power', `${N.b} or ${N.x}`, 'K or Space', 'Hold SHOOT'],
+    ['Slide tackle (no ball)', `${N.b} or ${N.x}`, 'K or Space', 'TACKLE'],
+    ['Switch player (no ball)', `${N.a} or ${N.lb}`, 'J or Q', 'SWITCH'],
+    ['Sprint', `${N.rb} or ${N.rt}`, 'Shift or L', 'Stick to the edge'],
+    ['Pause', N.start, 'Esc', 'Pause button'],
   ];
+  const cols = [300, 470, 640]; // controller, keyboard, touch
   ctx.textAlign = 'left';
-  text('CONTROLLER', 330, 88, `800 11px ${SANS}`, CFG.color.faint);
-  text('KEYBOARD', 590, 88, `800 11px ${SANS}`, CFG.color.faint);
+  text('CONTROLLER', cols[0], 88, `800 11px ${SANS}`, CFG.color.faint);
+  text('KEYBOARD', cols[1], 88, `800 11px ${SANS}`, CFG.color.faint);
+  text('TOUCH', cols[2], 88, `800 11px ${SANS}`, CFG.color.faint);
   rows.forEach((r, i) => {
     const y = 112 + i * 23;
-    ctx.textAlign = 'right'; text(r[0], 310, y, `600 14px ${SANS}`, CFG.color.dim);
+    ctx.textAlign = 'right'; text(r[0], cols[0] - 20, y, `600 14px ${SANS}`, CFG.color.dim);
     ctx.textAlign = 'left';
-    text(r[1], 330, y, `600 14px ${SANS}`, CFG.color.text);
-    text(r[2], 590, y, `600 14px ${SANS}`, CFG.color.text);
+    for (let c = 0; c < 3; c++) text(r[c + 1], cols[c], y, `600 14px ${SANS}`, CFG.color.text);
   });
   ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(90, 286, W - 180, 1);
   const col = (title, x, lines) => {
@@ -1679,7 +1845,13 @@ function drawHowTo() {
     'to aim for a corner.',
     'A draw can be settled on penalties.',
   ]);
-  col('PENALTIES', 520, [
+  col('PENALTIES', 520, usingTouch() ? [
+    'Kicking: aim with the stick, hold SHOOT',
+    'to power up, let go to shoot. Too much',
+    'power (red) can sail over the bar.',
+    'Keeping: tap DIVE ▲ or DIVE ▼ to dive,',
+    'or STAY in the middle.',
+  ] : [
     'Kicking: aim with ↑ ↓, hold to power up,',
     'release to shoot. Too much power (red)',
     'can sail over the bar.',
@@ -1687,7 +1859,7 @@ function drawHowTo() {
     'or stay in the middle.',
   ]);
   ctx.textAlign = 'center';
-  text(usingPad() ? `${N.b}: back` : 'Esc or click: back', W / 2, H - 28, `600 13px ${SANS}`, CFG.color.dim);
+  text(usingPad() ? `${N.b}: back` : usingTouch() ? 'Tap to go back' : 'Esc or click: back', W / 2, H - 28, `600 13px ${SANS}`, CFG.color.dim);
 }
 
 function drawPause() {
@@ -1696,7 +1868,8 @@ function drawPause() {
   glowText('PAUSED', W / 2, 180, `800 46px ${SANS}`, CFG.color.text);
   drawMenu(PAUSE_ITEMS, 262);
   const N = padNames();
-  text(`${usingPad() ? N.select : 'M'}: sound ${Sfx.muted ? 'off' : 'on'}`, W / 2, 380, `500 12px ${SANS}`, CFG.color.faint);
+  text(usingTouch() ? `Tap an option   ·   sound ${Sfx.muted ? 'off' : 'on'} (button at the top right)`
+    : `${usingPad() ? N.select : 'M'}: sound ${Sfx.muted ? 'off' : 'on'}`, W / 2, 380, `500 12px ${SANS}`, CFG.color.faint);
 }
 
 function drawResult() {
@@ -1723,6 +1896,91 @@ function drawToast() {
   ctx.globalAlpha = 1;
 }
 
+// ------------------------------------------------------------
+// Touch controls: drawn last, and only when the last input was a touch
+// ------------------------------------------------------------
+function drawButton(r, icon) { // the small square pause / sound buttons
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = 'rgba(8,12,28,0.6)'; ctx.fill();
+  ctx.globalAlpha = 0.6; glowStroke(CFG.color.title, 1.2); ctx.globalAlpha = 1;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); return; }
+  ctx.beginPath();
+  ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+  ctx.closePath(); ctx.fill();
+  ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+  if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+  else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+  ctx.lineCap = 'butt';
+}
+
+// A round action button. `charge` (0..1) draws a power ring around it, since the thumb hides the button.
+function drawTouchButton(b, label, color, live, charge, chargeColor) {
+  const held = touchHeld(b.id), a = live ? (held ? 0.95 : 0.7) : 0.3;
+  ctx.globalAlpha = a * (held ? 0.32 : 0.14);
+  ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU); ctx.fillStyle = color; ctx.fill();
+  ctx.globalAlpha = a;
+  glowStroke(color, held ? 2.6 : 1.8);
+  if (charge > 0) {
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r + 8, -Math.PI / 2, -Math.PI / 2 + TAU * Math.min(1, charge));
+    ctx.strokeStyle = chargeColor; ctx.lineWidth = 5; ctx.stroke();
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (b.dive) { // DIVE with an arrow on the side it points to
+    const s = b.dive, ay = b.y + s * 12;
+    ctx.beginPath(); ctx.moveTo(b.x - 10, ay - s * 6); ctx.lineTo(b.x + 10, ay - s * 6); ctx.lineTo(b.x, ay + s * 8); ctx.closePath();
+    ctx.fillStyle = CFG.color.text; ctx.fill();
+    text(label, b.x, b.y - s * 13, `800 14px ${SANS}`, CFG.color.text);
+  } else {
+    text(label, b.x, b.y + 1, `800 ${b.r >= 48 ? 17 : 15}px ${SANS}`, CFG.color.text);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawTouchControls() {
+  if (!usingTouch()) return;
+  const playing = state === 'match' || state === 'pens';
+  if (!playing && state !== 'paused') return;
+  drawButton(SOUND_BTN, 'sound');
+  drawButton(PAUSE_BTN, 'pause');
+  if (!playing) return;
+  const C = CFG.color;
+  // Move stick: a faint resting spot until the left thumb lands, then it sits under the thumb.
+  const S = Input.stick, on = S.id !== null, R = TOUCH.baseR;
+  const bx = on ? clamp(S.ox, R + 4, W - R - 4) : TOUCH.idleX, by = on ? clamp(S.oy, R + 4, H - R - 4) : TOUCH.idleY;
+  const kx = on ? bx + S.x - S.ox : bx, ky = on ? by + S.y - S.oy : by;
+  const ring = S.sprint ? C.good : C.you;
+  ctx.globalAlpha = on ? 0.16 : 0.08;
+  ctx.beginPath(); ctx.arc(bx, by, R, 0, TAU); ctx.fillStyle = ring; ctx.fill();
+  ctx.globalAlpha = on ? 0.8 : 0.35;
+  glowStroke(ring, S.sprint ? 2.6 : 1.6);
+  ctx.globalAlpha = on ? 0.35 : 0.15;
+  ctx.beginPath(); ctx.arc(kx, ky, TOUCH.knobR, 0, TAU); ctx.fillStyle = C.you; ctx.fill();
+  ctx.globalAlpha = on ? 0.95 : 0.4;
+  glowStroke(C.you, 2);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (!on) text('MOVE', bx, by + 1, `800 12px ${SANS}`, C.text);
+  else if (S.sprint) text('SPRINT', bx, by - R - 13, `800 12px ${SANS}`, C.good);
+  ctx.globalAlpha = 1;
+  // Action buttons
+  if (state === 'match') {
+    const live = M.phase === 'play', mine = !!controlled && ball.owner === controlled;
+    const charge = live && mine && M.charging ? M.charge / CFG.shot.charge : 0;
+    drawTouchButton(TB.shoot, mine ? 'SHOOT' : 'TACKLE', mine ? C.warn : C.bad, live, charge, charge > 0.85 ? C.warn : C.good);
+    drawTouchButton(TB.pass, mine ? 'PASS' : 'SWITCH', C.you, live, 0, '');
+  } else if (P.turn === 0) {
+    const charge = P.phase === 'aim' && P.charging ? P.power / 1.2 : 0;
+    drawTouchButton(TB.shoot, 'SHOOT', C.warn, P.phase === 'aim', charge, P.power > 1 ? C.bad : P.power > 0.7 ? C.good : C.warn);
+  } else {
+    const live = (P.phase === 'runup' || P.phase === 'flight') && !P.keeper.dived;
+    drawTouchButton(TB.up, 'DIVE', C.you, live, 0, '');
+    drawTouchButton(TB.stay, 'STAY', C.you, live, 0, '');
+    drawTouchButton(TB.down, 'DIVE', C.you, live, 0, '');
+  }
+}
+
 let fps = 60;
 function render() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1746,6 +2004,7 @@ function render() {
     if (state === 'result') drawResult();
   }
   drawToast();
+  drawTouchControls();
   if (SHOW_FPS) {
     ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
     text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, CFG.color.good);
@@ -1823,6 +2082,12 @@ requestAnimationFrame(t => { last = t; frame(t); });
   }, 250);
   active();
 })();
+
+// Offline play: the AK Games service worker saves every game. It needs http(s), so it is skipped
+// when the file is opened straight from disk.
+if (typeof navigator !== 'undefined' && navigator.serviceWorker && location.protocol.indexOf('http') === 0) {
+  navigator.serviceWorker.register('../sw.js', { scope: '../' }).catch(function () {});
+}
 </script>
 </body>
 </html>

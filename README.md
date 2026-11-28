@@ -40,6 +40,17 @@
 | [Neon Breach](neon-breach/) | Simple first-person shooter: five neon levels and a boss |
 | [Neon Drive](neon-drive/) | Road racing on three neon tracks: race five rivals, or cruise with no timer |
 
+## On Android phones and tablets
+
+Every game plays by touch. For the best experience, install AK Games as an app:
+
+1. Open https://iamgnu.github.io/AkGames/ in **Chrome**.
+2. Tap **Install AK Games as an app** at the top of the page. If the button isn't there, use Chrome's **⋮** menu → **Install app** (or **Add to Home screen**).
+
+The app gets its own icon on the home screen, opens full screen and sideways, and keeps working offline, because every game is saved on the phone. You can also just play in the browser; turn the phone sideways for a bigger view. Bluetooth controllers work too: pair the controller with the phone, then press any button in a game.
+
+## Playing from your computer's files
+
 If a browser won't detect the controller when you open the files directly, serve the folder instead:
 
 ```bash

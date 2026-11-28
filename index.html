@@ -6,6 +6,10 @@
 <title>AK Games</title>
 <meta name="author" content="Akash (developer), Claude Code (co-developer)">
 <meta name="description" content="Small, calm browser games for every age. Controller, keyboard, mouse or touch.">
+<meta name="theme-color" content="#05070f">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <style>
   :root {
     --bg: #05070f; --panel: rgba(12, 18, 40, 0.82); --text: #e8f0ff; --dim: #8390bd; --faint: #56608a;
@@ -52,13 +56,27 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #ffcc4d; }
   .dot.on { background: #5dff9e; }
   footer { margin-top: 18px; color: var(--faint); font-size: 12px; text-align: center; }
+  .install {
+    display: none; margin: -12px 0 24px; padding: 10px 20px; border-radius: 999px; cursor: pointer;
+    font: 700 15px var(--font); color: var(--text); background: rgba(59, 232, 255, 0.12);
+    border: 2px solid #3be8ff; box-shadow: 0 0 24px -6px #3be8ff;
+  }
+  .install.show { display: inline-block; }
+  .install small { display: block; font-weight: 500; font-size: 12px; color: var(--dim); }
   @media (max-width: 520px) { .card { max-width: none; } }
+  @media (max-height: 520px) { /* a phone held sideways: keep the header short so games show straight away */
+    body { padding-top: 14px; }
+    h1 { font-size: 34px; margin-bottom: 2px; }
+    .sub { margin-bottom: 12px; font-size: 14px; }
+    .install { margin: -4px 0 14px; padding: 6px 16px; font-size: 14px; }
+  }
   @media (prefers-reduced-motion: reduce) { .card { transition: none; } }
 </style>
 </head>
 <body>
   <h1>AK GAMES</h1>
   <p class="sub">19 small games to unwind with. Controller, keyboard, mouse or touch.</p>
+  <button class="install" id="install" type="button">Install AK Games as an app<small>full screen, on your home screen, works offline</small></button>
 
   <section>
     <h3>RELAX <span>gentle toys, no pressure, nothing to lose</span></h3>
@@ -433,6 +451,20 @@ function poll(now) {
 }
 select(0, false);
 requestAnimationFrame(poll);
+
+// Install as an app (Android Chrome and desktop Chrome/Edge offer this) and keep the games available offline.
+let installEvent = null;
+const installBtn = document.getElementById('install');
+addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvent = e; installBtn.classList.add('show'); });
+addEventListener('appinstalled', () => { installEvent = null; installBtn.classList.remove('show'); });
+installBtn.addEventListener('click', () => {
+  if (!installEvent) return;
+  installEvent.prompt();
+  installEvent.userChoice.finally(() => { installEvent = null; installBtn.classList.remove('show'); });
+});
+if (navigator.serviceWorker && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 </script>
 </body>
 </html>

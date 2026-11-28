@@ -2,7 +2,7 @@
 
 **Developer:** Akash · **Co-developer:** Claude Code
 
-A small twin-stick arena shooter for a game controller. The whole game is one HTML file. It needs no install, no build step, no downloads and no internet connection, and it runs smoothly on old laptops.
+A small twin-stick arena shooter for a game controller, keyboard and mouse, or a touch screen. The whole game is one HTML file. It needs no install, no build step, no downloads and no internet connection, and it runs smoothly on old laptops.
 
 ## Play
 
@@ -10,6 +10,8 @@ A small twin-stick arena shooter for a game controller. The whole game is one HT
 2. Open `index.html` in **Chrome** (or Firefox).
 3. Press any button on the controller so the browser detects it.
 4. Pick **Play** with the D-pad or left stick, then press **A** / **✕**.
+
+On an Android phone or tablet, open `index.html` in Chrome with the device in landscape and tap **Play**. Your left thumb moves the ship and your right thumb aims and fires (see the Touch column below).
 
 If the bottom-left of the menu keeps saying "Connect a controller", serve the folder from localhost instead:
 
@@ -21,17 +23,17 @@ python3 -m http.server 8000
 
 ## Controls
 
-| Action | Controller | Keyboard + mouse |
-|---|---|---|
-| Move / menu cursor | Left stick / D-pad | W A S D / arrow keys |
-| Aim + shoot | Right stick (fires while held), or hold RT/R2 | Mouse + hold left click, or arrow keys |
-| Dash (dodges through anything) | A / ✕ or RB / R1 | Space / Shift |
-| Select (menus) | A / ✕ | Enter / Space / click |
-| Back | B / ○ | Esc |
-| Pause | Start / Options | Esc / P |
-| Sound on/off | Back / Create | M |
+| Action | Controller | Keyboard + mouse | Touch |
+|---|---|---|---|
+| Move / menu cursor | Left stick / D-pad | W A S D / arrow keys | Drag anywhere on the left half (the stick appears under your thumb) |
+| Aim + shoot | Right stick (fires while held), or hold RT/R2 | Mouse + hold left click, or arrow keys | Drag anywhere on the right half (fires while held) |
+| Dash (dodges through anything) | A / ✕ or RB / R1 | Space / Shift | **DASH** button (right side, above the right thumb) |
+| Select (menus) | A / ✕ | Enter / Space / click | Tap the option |
+| Back | B / ○ | Esc | Tap (How to Play) |
+| Pause | Start / Options | Esc / P | ‖ button, top right (▶ resumes) |
+| Sound on/off | Back / Create | M | Speaker button, top right |
 
-Browsers only allow sound after a click or key press on the page, so click once on the page if you want sound while playing with the controller.
+The on-screen sticks and buttons show on phones and tablets, or as soon as you touch the screen; once you use a keyboard, mouse or controller they hide and the screen looks as usual. Browsers only allow sound after a click, tap or key press on the page, so click or tap once on the page if you want sound while playing with the controller.
 
 ## Enemies
 

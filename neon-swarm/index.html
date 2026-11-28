@@ -5,13 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Neon Swarm</title>
 <meta name="author" content="Akash (developer), Claude Code (co-developer)">
+<meta name="theme-color" content="#05070f">
+<link rel="manifest" href="../manifest.webmanifest">
+<link rel="icon" type="image/png" href="../icons/icon-192.png">
+<link rel="apple-touch-icon" href="../icons/apple-touch-icon.png">
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  /* Touch: no scrolling, zooming, text selection or tap flash anywhere on the page (thumbs may land on the black bars) */
+  html, body, canvas { touch-action: none; overscroll-behavior: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
   body { display: flex; align-items: center; justify-content: center; }
   canvas { display: block; cursor: crosshair; }
+  #turn { display: none; position: fixed; top: 0; left: 0; right: 0; padding: 14px 16px; text-align: center;
+    font: 600 15px system-ui, sans-serif; color: #e8f0ff; background: rgba(10, 14, 32, 0.88); pointer-events: none; }
+  @media (orientation: portrait) and (pointer: coarse) { #turn { display: block; } }
 </style>
 </head>
 <body>
+<div id="turn">↻ Turn your phone sideways for a bigger view</div>
 <canvas id="game" width="960" height="540"></canvas>
 <script>
 'use strict';
@@ -35,6 +45,8 @@ const CFG = {
   combo: { window: 2, killsPerStep: 4, max: 5 },
   powerup: { drop: 0.08, tankDrop: 0.25, life: 8, duration: 10, magnet: 90 },
   waves: { base: 6, perWave: 2, warn: 0.7, breakTime: 2.2, bossEvery: 5 },
+  // On-screen sticks: radius in world px, dead zones and how far (as a share of the radius) gives full speed
+  touch: { stickR: 60, knobR: 26, moveDz: 0.12, aimDz: 0.2, fullAt: 0.85, midBand: 130 },
   color: {
     bg: '#070914', grid: '#111a35', border: '#2b3d85', player: '#3be8ff', text: '#e8f0ff',
     dim: '#8390bd', faint: '#56608a', enemyBullet: '#ff5fd2', good: '#5dff9e', warn: '#ffcc4d', bad: '#ff5f7a',
@@ -216,17 +228,25 @@ const Sfx = {
 };
 
 // ============================================================
-// Input: gamepad + keyboard/mouse merged into one state
+// Input: gamepad + keyboard/mouse + touch merged into one state
 // ============================================================
 const NAV_CODES = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']);
+const isTouch = e => e.pointerType === 'touch' || e.pointerType === 'pen';
+// Mouse events the browser makes up after a finger tap (Chrome marks them) must not count as a real mouse.
+const fakeMouse = e => !!(e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents);
+// A floating stick: it appears where the thumb lands and its centre follows a thumb that strays too far.
+const newStick = () => ({ id: null, ox: 0, oy: 0, x: 0, y: 0, out: { x: 0, y: 0, m: 0 } });
 const Input = {
   keys: new Set(), pressed: new Set(), navKeys: new Set(),
   mouse: { x: W / 2, y: H / 2, down: false, clicked: false, used: false, moved: false },
   pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
-  device: 'kb', // which device was used last: 'pad' or 'kb'
+  // Which device was used last: 'kb' (keyboard or mouse), 'pad' or 'touch'. Phones and tablets start on touch.
+  device: typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches ? 'touch' : 'kb',
   move: { x: 0, y: 0 }, ls: { x: 0, y: 0, m: 0 }, rs: { x: 0, y: 0, m: 0 }, arrow: { x: 0, y: 0 },
   rt: false, dash: false, pause: false, mute: false, select: false, back: false,
   navUp: false, navDown: false, navLeft: false, navRight: false,
+  tMove: newStick(), tAim: newStick(),              // touch sticks (id is the finger's pointerId, null when free)
+  tDash: false, tPause: false, tMute: false, tDashAt: -9, // on-screen button taps, read in poll()
 
   init() {
     addEventListener('keydown', e => {
@@ -238,10 +258,13 @@ const Input = {
       Sfx.init();
     });
     addEventListener('keyup', e => this.keys.delete(e.code));
-    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; });
-    addEventListener('mousemove', e => { this.toWorld(e); this.mouse.used = true; this.mouse.moved = true; this.device = 'kb'; });
+    addEventListener('blur', () => { this.keys.clear(); this.mouse.down = false; this.clearTouches(); });
+    addEventListener('mousemove', e => {
+      if (fakeMouse(e)) return;
+      this.toWorld(e); this.mouse.used = true; this.mouse.moved = true; this.device = 'kb';
+    });
     canvas.addEventListener('mousedown', e => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || fakeMouse(e)) return;
       this.toWorld(e);
       this.mouse.down = true; this.mouse.clicked = true; this.mouse.used = true;
       this.device = 'kb';
@@ -249,6 +272,36 @@ const Input = {
     });
     addEventListener('mouseup', e => { if (e.button === 0) this.mouse.down = false; });
     canvas.addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('contextmenu', e => { if (this.device === 'touch') e.preventDefault(); }); // long press on the black bars
+
+    // Touch (and pen). Listened for on the whole window so thumbs on the black bars beside the game still count.
+    // The mouse keeps using the mouse events above, exactly as before.
+    const tp = { x: 0, y: 0 };
+    addEventListener('pointerdown', e => {
+      if (!isTouch(e)) return;
+      if (e.cancelable) e.preventDefault(); // no fake mouse events after the tap
+      // The first finger of a new touch: no other finger can still be down, so drop any stick that missed its pointerup.
+      if (e.isPrimary) this.clearTouches();
+      this.device = 'touch';
+      Sfx.init();
+      this.touchPos(e, tp);
+      touchStart(e.pointerId, tp.x, tp.y);
+    });
+    addEventListener('pointermove', e => {
+      if (!isTouch(e)) return;
+      const s = this.tMove.id === e.pointerId ? this.tMove : this.tAim.id === e.pointerId ? this.tAim : null;
+      if (!s) return;
+      this.touchPos(e, tp);
+      stickDrag(s, tp.x, tp.y);
+    });
+    const up = e => {
+      if (!isTouch(e)) return;
+      this.releaseTouch(e.pointerId);
+      if (e.type === 'pointerup') Sfx.init(); // Android only unlocks sound when the finger lifts
+    };
+    addEventListener('pointerup', up);
+    addEventListener('pointercancel', up);
+    addEventListener('lostpointercapture', up);
     addEventListener('gamepadconnected', e => {
       this.padIndex = e.gamepad.index; this.prev.length = 0; this.device = 'pad';
       showToast('Controller connected');
@@ -266,6 +319,19 @@ const Input = {
     this.mouse.x = ((e.clientX - r.left) / r.width) * W;
     this.mouse.y = ((e.clientY - r.top) / r.height) * H;
   },
+  // A finger in world coordinates (can be outside 0..W on the black bars)
+  touchPos(e, out) {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return out;
+    out.x = ((e.clientX - r.left) / r.width) * W;
+    out.y = ((e.clientY - r.top) / r.height) * H;
+    return out;
+  },
+  releaseTouch(id) {
+    if (this.tMove.id === id) this.tMove.id = null;
+    if (this.tAim.id === id) this.tAim.id = null;
+  },
+  clearTouches() { this.tMove.id = null; this.tAim.id = null; },
 
   getPad() {
     if (!navigator.getGamepads) return null;
@@ -335,6 +401,23 @@ const Input = {
       if (any || this.ls.m > 0 || this.rs.m > 0 || dx || dy) this.device = 'pad';
       if (any) Sfx.init();
     }
+
+    // Touch: left stick moves, right stick aims and fires (like the controller's right stick), buttons tap once.
+    const T = CFG.touch, full = T.stickR * T.fullAt;
+    const tm = this.tMove, ta = this.tAim;
+    if (tm.id != null) {
+      radial((tm.x - tm.ox) / full, (tm.y - tm.oy) / full, T.moveDz, tm.out);
+      mx += tm.out.x; my += tm.out.y;
+    }
+    if (ta.id != null) {
+      radial((ta.x - ta.ox) / T.stickR, (ta.y - ta.oy) / T.stickR, T.aimDz, ta.out);
+      if (ta.out.m > this.rs.m) { this.rs.x = ta.out.x; this.rs.y = ta.out.y; this.rs.m = ta.out.m; }
+    }
+    if (this.tDash) this.dash = true;
+    if (this.tPause) this.pause = true;
+    if (this.tMute) this.mute = true;
+    this.tDash = this.tPause = this.tMute = false;
+
     this.navUp = up; this.navDown = down; this.navLeft = left; this.navRight = right;
     const m = Math.hypot(mx, my);
     if (m > 1) { mx /= m; my /= m; }
@@ -1006,6 +1089,53 @@ function menuInput(items) {
   return null;
 }
 
+// ============================================================
+// Touch controls (shown only while touch is the last-used device)
+// ============================================================
+const SOUND_BTN = { x: W - 112, y: 14, w: 44, h: 44 };
+const PAUSE_BTN = { x: W - 60, y: 14, w: 44, h: 44 };
+const DASH_BTN = { x: W - 86, y: H - 250, r: 46 }; // just above where the right thumb rests
+const MOVE_HOME = { x: 140, y: H - 170 }, AIM_HOME = { x: W - 200, y: H - 170 }; // where the idle sticks are drawn
+
+function touchUI() { return Input.device === 'touch'; }
+
+// The on-screen button under a finger, if any. Hit areas are a little larger than the drawings.
+function touchButtonAt(x, y) {
+  if (state === 'playing') {
+    const dx = x - DASH_BTN.x, dy = y - DASH_BTN.y, rr = DASH_BTN.r + 8;
+    if (dx * dx + dy * dy < rr * rr) return 'dash';
+  }
+  if (state !== 'playing' && state !== 'paused') return null;
+  const m = 10;
+  if (y < SOUND_BTN.y - m || y > SOUND_BTN.y + SOUND_BTN.h + m) return null;
+  const mid = (SOUND_BTN.x + SOUND_BTN.w + PAUSE_BTN.x) / 2; // the buttons are 8 px apart: split the gap
+  if (x >= mid && x <= PAUSE_BTN.x + PAUSE_BTN.w + m) return 'pause';
+  if (x < mid && x >= SOUND_BTN.x - m) return 'sound';
+  return null;
+}
+
+// A new finger: press a button, grab a stick (left half moves, right half aims), or tap a menu.
+function touchStart(id, x, y) {
+  const I = Input, b = touchButtonAt(x, y);
+  if (b === 'pause') { I.tPause = true; return; }
+  if (b === 'sound') { I.tMute = true; return; }
+  if (b === 'dash') { I.tDash = true; I.tDashAt = time; return; }
+  if (state === 'playing') {
+    const left = x < W / 2, want = left ? I.tMove : I.tAim, other = left ? I.tAim : I.tMove;
+    // A thumb that lands just across the middle still gets the free stick; any other extra finger is ignored.
+    const s = want.id == null ? want : other.id == null && Math.abs(x - W / 2) < CFG.touch.midBand ? other : null;
+    if (s) { s.id = id; s.ox = s.x = x; s.oy = s.y = y; s.out.x = s.out.y = s.out.m = 0; }
+    return;
+  }
+  I.mouse.x = x; I.mouse.y = y; I.mouse.clicked = true; // menus: a tap works like a click on that spot
+}
+
+function stickDrag(s, x, y) {
+  s.x = x; s.y = y;
+  const R = CFG.touch.stickR, dx = x - s.ox, dy = y - s.oy, d = Math.hypot(dx, dy);
+  if (d > R) { s.ox = x - (dx / d) * R; s.oy = y - (dy / d) * R; } // the stick's centre follows the thumb
+}
+
 // ---------------- Main update / screen states ----------------
 function updateWorld(dt, alive) {
   if (alive) {
@@ -1311,15 +1441,16 @@ function drawHUD() {
   ctx.textAlign = 'center';
   hudFade(W / 2 - 60, 0, W / 2 + 60, 34);
   text(`WAVE ${wave.n}`, W / 2, 14, `700 15px ${SANS}`, CFG.color.dim);
-  hudFade(W - 170, 0, W, 66);
+  const R = touchUI() ? SOUND_BTN.x - 16 : W; // with touch, lives and best sit left of the sound and pause buttons
+  hudFade(R - 170, 0, R, 66);
   const lifeAlpha = ctx.globalAlpha;
   for (let i = 0; i < player.lives; i++) {
-    shipPath(W - 28 - i * 26, 30, 8, -Math.PI / 2);
+    shipPath(R - 28 - i * 26, 30, 8, -Math.PI / 2);
     ctx.globalAlpha = 0.25 * lifeAlpha; ctx.fillStyle = CFG.color.player; ctx.fill();
     ctx.globalAlpha = lifeAlpha; ctx.strokeStyle = CFG.color.player; ctx.lineWidth = 2; ctx.stroke();
   }
   ctx.textAlign = 'right';
-  text(`BEST ${Math.max(best, score).toLocaleString()}`, W - 18, 50, `600 12px ${MONO}`, CFG.color.dim);
+  text(`BEST ${Math.max(best, score).toLocaleString()}`, R - 18, 50, `600 12px ${MONO}`, CFG.color.dim);
 
   let y = H - 30;
   ctx.textAlign = 'left';
@@ -1353,6 +1484,9 @@ function drawBanner() {
   const y = 150;
   glowText(`WAVE ${wave.n}`, W / 2, y, `800 44px ${SANS}`, CFG.color.text);
   if (wave.sub) text(wave.sub, W / 2, y + 40, `700 17px ${SANS}`, wave.subColor);
+  else if (wave.n === 1 && touchUI()) {
+    text('Left thumb: move   ·   right thumb: aim and fire   ·   DASH to dodge', W / 2, y + 40, `700 17px ${SANS}`, CFG.color.dim);
+  }
   ctx.globalAlpha = 1;
 }
 
@@ -1394,20 +1528,20 @@ function drawTitle() {
   drawMenu(items, menuY);
   const it = items[menuSel] || items[0], N = padNames(), hintY = menuY + items.length * 52 + 4;
   text(it.hint, W / 2, hintY, `500 14px ${SANS}`, CFG.color.dim);
-  text(usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select` : '↑ ↓ choose   ·   Enter select',
+  text(touchUI() ? 'Tap to choose' : usingPad() || Input.pad ? `↑ ↓ choose   ·   ${N.a} select` : '↑ ↓ choose   ·   Enter select',
     W / 2, hintY + 26, `500 12px ${SANS}`, CFG.color.faint);
 
   // Bottom bar: controller status · credits · best scores
-  const yb = H - 32, pad = Input.pad;
-  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? CFG.color.good : CFG.color.warn; ctx.fill();
+  const yb = H - 32, pad = Input.pad, touchOnly = touchUI() && !pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad || touchOnly ? CFG.color.good : CFG.color.warn; ctx.fill();
   ctx.textAlign = 'left';
-  text(!navigator.getGamepads ? 'Controllers unavailable here (see README)' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+  text(touchOnly ? 'Touch controls on' : !navigator.getGamepads ? 'Controllers unavailable here (see README)' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
     42, yb, `600 12px ${SANS}`, CFG.color.dim);
   ctx.textAlign = 'center';
   text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
   ctx.textAlign = 'right';
   text(`BEST ${best.toLocaleString()}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
-  if (!Sfx.ctx || Sfx.ctx.state !== 'running') text('click for sound', W - 24, 28, `500 11px ${SANS}`, CFG.color.faint);
+  if (!Sfx.ctx || Sfx.ctx.state !== 'running') text(touchUI() ? 'tap for sound' : 'click for sound', W - 24, 28, `500 11px ${SANS}`, CFG.color.faint);
 }
 
 function drawHowTo() {
@@ -1416,21 +1550,22 @@ function drawHowTo() {
   glowText('HOW TO PLAY', W / 2, 50, `800 32px ${SANS}`, CFG.color.player);
 
   const rows = [
-    ['Move', 'Left stick / D-pad', 'W A S D'],
-    ['Aim + shoot', `Right stick (or hold ${N.rt})`, 'Mouse + click, or arrow keys'],
-    ['Dash (dodge through)', `${N.a} or ${N.rb}`, 'Space / Shift'],
-    ['Pause', N.start, 'Esc / P'],
-    ['Sound on/off', N.select, 'M'],
+    ['Move', 'Left stick / D-pad', 'W A S D', 'Drag on the left half'],
+    ['Aim + shoot', `Right stick (or hold ${N.rt})`, 'Mouse + click, or arrow keys', 'Drag on the right half'],
+    ['Dash (dodge through)', `${N.a} or ${N.rb}`, 'Space / Shift', 'DASH button'],
+    ['Pause', N.start, 'Esc / P', '‖ button (top right)'],
+    ['Sound on/off', N.select, 'M', 'Speaker button'],
   ];
+  const COLS = [250, 470, 700];
   ctx.textAlign = 'left';
-  text('CONTROLLER', 330, 94, `800 11px ${SANS}`, CFG.color.faint);
-  text('KEYBOARD + MOUSE', 590, 94, `800 11px ${SANS}`, CFG.color.faint);
+  text('CONTROLLER', COLS[0], 94, `800 11px ${SANS}`, CFG.color.faint);
+  text('KEYBOARD + MOUSE', COLS[1], 94, `800 11px ${SANS}`, CFG.color.faint);
+  text('TOUCH', COLS[2], 94, `800 11px ${SANS}`, CFG.color.faint);
   rows.forEach((r, i) => {
     const y = 118 + i * 23;
-    ctx.textAlign = 'right'; text(r[0], 310, y, `600 14px ${SANS}`, CFG.color.dim);
+    ctx.textAlign = 'right'; text(r[0], COLS[0] - 20, y, `600 14px ${SANS}`, CFG.color.dim);
     ctx.textAlign = 'left';
-    text(r[1], 330, y, `600 14px ${SANS}`, CFG.color.text);
-    text(r[2], 590, y, `600 14px ${SANS}`, CFG.color.text);
+    for (let c = 0; c < 3; c++) text(r[c + 1], COLS[c], y, `600 14px ${SANS}`, CFG.color.text);
   });
   ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(90, 248, W - 180, 1);
 
@@ -1451,7 +1586,7 @@ function drawHowTo() {
   });
 
   ctx.textAlign = 'center';
-  text(usingPad() ? `${N.b}: back` : 'Esc or click: back', W / 2, H - 34, `600 13px ${SANS}`, CFG.color.dim);
+  text(usingPad() ? `${N.b}: back` : touchUI() ? 'Tap anywhere to go back' : 'Esc or click: back', W / 2, H - 34, `600 13px ${SANS}`, CFG.color.dim);
 }
 
 function drawPause() {
@@ -1460,7 +1595,8 @@ function drawPause() {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   glowText('PAUSED', W / 2, 170, `800 46px ${SANS}`, CFG.color.text);
   drawMenu(PAUSE_ITEMS, 256);
-  text(`${usingPad() ? N.select : 'M'}: sound ${Sfx.muted ? 'off' : 'on'}`, W / 2, 404, `500 12px ${SANS}`, CFG.color.faint);
+  text(touchUI() ? `Tap an option   ·   sound ${Sfx.muted ? 'off' : 'on'} (button at top right)`
+    : `${usingPad() ? N.select : 'M'}: sound ${Sfx.muted ? 'off' : 'on'}`, W / 2, 404, `500 12px ${SANS}`, CFG.color.faint);
 }
 
 function drawGameOver() {
@@ -1481,6 +1617,80 @@ function drawToast() {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   text(toast.text, W / 2, H - 62, `600 14px ${SANS}`, CFG.color.text);
   ctx.globalAlpha = 1;
+}
+
+// ---------------- Touch controls ----------------
+function drawButton(r, icon, fade) {
+  rrPath(r.x, r.y, r.w, r.h, 12);
+  ctx.globalAlpha = fade; ctx.fillStyle = 'rgba(10,12,30,0.6)'; ctx.fill();
+  ctx.globalAlpha = fade * 0.55; glowStroke(CFG.color.player, 1.2);
+  ctx.globalAlpha = fade;
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  ctx.fillStyle = CFG.color.text; ctx.strokeStyle = CFG.color.text;
+  if (icon === 'pause') { ctx.fillRect(cx - 7, cy - 9, 5, 18); ctx.fillRect(cx + 2, cy - 9, 5, 18); }
+  else if (icon === 'play') { ctx.beginPath(); ctx.moveTo(cx - 6, cy - 10); ctx.lineTo(cx + 10, cy); ctx.lineTo(cx - 6, cy + 10); ctx.closePath(); ctx.fill(); }
+  else { // speaker, with sound waves or a cross
+    ctx.beginPath();
+    ctx.moveTo(cx - 11, cy - 4); ctx.lineTo(cx - 6, cy - 4); ctx.lineTo(cx, cy - 10);
+    ctx.lineTo(cx, cy + 10); ctx.lineTo(cx - 6, cy + 4); ctx.lineTo(cx - 11, cy + 4);
+    ctx.closePath(); ctx.fill();
+    ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.beginPath();
+    if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 5); ctx.lineTo(cx + 12, cy + 5); ctx.moveTo(cx + 12, cy - 5); ctx.lineTo(cx + 4, cy + 5); ctx.stroke(); }
+    else { ctx.arc(cx + 2, cy, 6, -0.9, 0.9); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 2, cy, 11, -0.9, 0.9); ctx.stroke(); }
+    ctx.lineCap = 'butt';
+  }
+  ctx.globalAlpha = 1;
+}
+
+// A stick: drawn where the thumb is, or faintly at its home spot with a label while no thumb is on it.
+function drawStick(s, home, color, label) {
+  const T = CFG.touch, R = T.stickR, on = s.id != null;
+  let bx = home.x, by = home.y, kx = bx, ky = by;
+  if (on) { // keep the drawing on screen even if the thumb is on the black bars
+    bx = clamp(s.ox, R + 4, W - R - 4); by = clamp(s.oy, R + 4, H - R - 4);
+    kx = bx + s.x - s.ox; ky = by + s.y - s.oy;
+  }
+  ctx.beginPath(); ctx.arc(bx, by, R, 0, TAU);
+  ctx.globalAlpha = on ? 0.08 : 0.03; ctx.fillStyle = color; ctx.fill();
+  ctx.globalAlpha = on ? 0.45 : 0.2; glowStroke(color, 1.5);
+  ctx.beginPath(); ctx.arc(kx, ky, T.knobR, 0, TAU);
+  ctx.globalAlpha = on ? (s.out.m > 0 ? 0.32 : 0.2) : 0.06; ctx.fillStyle = color; ctx.fill();
+  ctx.globalAlpha = on ? 0.85 : 0.22; glowStroke(color, 2);
+  if (!on) { ctx.globalAlpha = 0.6; text(label, bx, by + R + 17, `800 13px ${SANS}`, color); }
+  ctx.globalAlpha = 1;
+}
+
+function drawDashButton() {
+  const b = DASH_BTN, p = player, ready = p.dashCd <= 0, col = CFG.color.player;
+  const fade = playerUnder(b.x - b.r, b.y - b.r, b.x + b.r, b.y + b.r) ? 0.35 : 1;
+  const lit = time - Input.tDashAt < 0.15;
+  ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU);
+  ctx.globalAlpha = fade * (lit ? 0.35 : 0.1); ctx.fillStyle = col; ctx.fill();
+  ctx.globalAlpha = fade * (ready ? 0.6 : 0.25); glowStroke(col, 2);
+  if (!ready) { // recharging: the ring fills back up
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, -Math.PI / 2, -Math.PI / 2 + TAU * (1 - p.dashCd / CFG.player.dashCd));
+    ctx.globalAlpha = fade * 0.7; ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.stroke();
+  }
+  ctx.globalAlpha = fade * (ready ? 0.9 : 0.4);
+  ctx.beginPath(); // » chevrons
+  for (const ox of [-9, 3]) { ctx.moveTo(b.x + ox, b.y - 18); ctx.lineTo(b.x + ox + 8, b.y - 9); ctx.lineTo(b.x + ox, b.y); }
+  ctx.strokeStyle = CFG.color.text; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.stroke();
+  ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
+  text('DASH', b.x, b.y + 17, `800 13px ${SANS}`, CFG.color.text);
+  ctx.globalAlpha = 1;
+}
+
+function drawTouch() {
+  if (!touchUI() || (state !== 'playing' && state !== 'paused')) return;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (state === 'playing') {
+    drawStick(Input.tMove, MOVE_HOME, CFG.color.player, 'MOVE');
+    drawStick(Input.tAim, AIM_HOME, CFG.color.warn, 'AIM + FIRE');
+    drawDashButton();
+  }
+  const under = state === 'playing' && playerUnder(SOUND_BTN.x, SOUND_BTN.y, PAUSE_BTN.x + PAUSE_BTN.w, PAUSE_BTN.y + PAUSE_BTN.h);
+  drawButton(SOUND_BTN, 'sound', under ? 0.35 : 1);
+  drawButton(PAUSE_BTN, state === 'paused' ? 'play' : 'pause', under ? 0.35 : 1);
 }
 
 let fps = 60;
@@ -1512,6 +1722,7 @@ function render() {
     if (state === 'gameover') drawGameOver();
   }
   drawToast();
+  drawTouch(); // last, so the sticks and buttons sit on top of everything
   if (SHOW_FPS) {
     ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
     text(`${Math.round(fps)} fps`, W - 12, H - 10, `600 12px ${MONO}`, CFG.color.good);
@@ -1536,6 +1747,7 @@ function frame(now) {
 }
 
 document.addEventListener('visibilitychange', () => {
+  if (document.hidden) Input.clearTouches(); // fingers lifted while away never send pointerup
   if (document.hidden && state === 'playing') pauseGame();
 });
 addEventListener('resize', resize);
@@ -1589,6 +1801,12 @@ requestAnimationFrame(t => { last = t; frame(t); });
   }, 250);
   active();
 })();
+
+// Offline play: the AK Games service worker saves every game. It needs http(s), so it is skipped
+// when the file is opened straight from disk.
+if (typeof navigator !== 'undefined' && navigator.serviceWorker && location.protocol.indexOf('http') === 0) {
+  navigator.serviceWorker.register('../sw.js', { scope: '../' }).catch(function () {});
+}
 </script>
 </body>
 </html>

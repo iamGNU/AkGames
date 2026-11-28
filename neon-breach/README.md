@@ -6,7 +6,7 @@ A simple first-person shooter in neon. It's one HTML file: no install, no downlo
 
 ## Play
 
-Open `../index.html` (the game picker) or this folder's `index.html` in **Chrome** or Firefox. Press any button on your controller so the browser detects it. With a mouse, click the game once to capture the mouse for aiming.
+Open `../index.html` (the game picker) or this folder's `index.html` in **Chrome** or Firefox. You can play with a controller, a keyboard and mouse, or a touch screen (a phone or tablet held sideways). Press any button on your controller so the browser detects it. With a mouse, click the game once to capture the mouse for aiming.
 
 ## Goal
 
@@ -16,17 +16,19 @@ There are 5 levels. Clearing one unlocks the next, and you can replay any level 
 
 ## Controls
 
-| Action | Controller | Keyboard + mouse |
-|---|---|---|
-| Move / strafe | Left stick | W A S D (↑ ↓ also move) |
-| Look / turn | Right stick | Mouse (click to capture), or ← → / Q E |
-| Shoot (hold) | RT / R2 or RB / R1 | Left click, Space or J |
-| Sprint | LB / L1 or click the left stick | Shift |
-| Map on/off | Y / △ | Tab or F |
-| Pause | Start / Options | Esc or P |
-| Sound on/off | Back / Create | M |
+| Action | Controller | Keyboard + mouse | Touch |
+|---|---|---|---|
+| Move / strafe | Left stick | W A S D (↑ ↓ also move) | Put your left thumb anywhere on the left half and drag: a stick appears under it |
+| Look / turn | Right stick | Mouse (click to capture), or ← → / Q E | Drag anywhere on the right half |
+| Shoot (hold) | RT / R2 or RB / R1 | Left click, Space or J | Hold **FIRE** (bottom right); slide the same thumb to aim while firing |
+| Sprint | LB / L1 or click the left stick | Shift | Push the stick all the way up |
+| Map on/off | Y / △ | Tab or F | **MAP** button, top right |
+| Pause | Start / Options | Esc or P | ‖ button, top right |
+| Sound on/off | Back / Create | M | Speaker button, top right |
 
-On a controller, aiming has light assistance: the shot is a little forgiving, and turning slows slightly while your crosshair is on an enemy. You only aim left and right (there's no looking up or down), so the right stick is all you need. **Look speed** in the menu changes how fast you turn.
+On a controller or a touch screen, aiming has light assistance: the shot is a little forgiving, and turning slows slightly while your crosshair is on an enemy. You only aim left and right (there's no looking up or down), so the right stick or a sideways drag is all you need. **Look speed** in the menu changes how fast you turn.
+
+The touch controls only appear once you touch the screen, and the menus work by tapping. The black bars beside the game on a wide phone count too, so you can rest your thumbs there.
 
 ## Enemies
 
