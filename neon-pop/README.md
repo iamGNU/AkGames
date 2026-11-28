@@ -1,6 +1,6 @@
 # Neon Pop
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm bubble-wrap popping toy for any age. There are no timers, no score to beat and nothing to lose. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. Play with a controller, a keyboard, a mouse or a touch screen.
 

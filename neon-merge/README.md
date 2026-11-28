@@ -1,6 +1,6 @@
 # Neon Merge
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm drop-and-merge puzzle for all ages. Drop glowing orbs into a jar, and when two of the same kind touch they merge into a bigger one, with a soft chime. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. It works with a controller, a keyboard, a mouse or a touch screen.
 

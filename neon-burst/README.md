@@ -1,6 +1,6 @@
 # Neon Burst
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm bubble-popping game in neon. Aim the launcher, bounce shots off the walls, and pop groups of matching bubbles. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. There are no timers, and the Relax mode never ends, so it's good for winding down at any age.
 

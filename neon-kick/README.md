@@ -1,6 +1,6 @@
 # Neon Kick
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 Arcade 5-a-side football (soccer) for a game controller, keyboard or touch screen. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops.
 

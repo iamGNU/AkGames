@@ -1,6 +1,6 @@
 # Neon Breach
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A simple first-person shooter in neon. It's one HTML file: no install, no downloads, no internet, and no 3D library. It uses a classic raycasting renderer on a plain 2D canvas, so it runs smoothly on old laptops.
 

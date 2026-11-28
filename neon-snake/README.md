@@ -1,6 +1,6 @@
 # Neon Snake
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm, glowing take on the classic snake game for all ages. Play it with a game controller, a keyboard, a mouse or a touch screen. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops.
 

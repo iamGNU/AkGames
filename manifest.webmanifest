@@ -1,8 +1,8 @@
 {
   "id": "./",
-  "name": "AK Games",
-  "short_name": "AK Games",
-  "description": "19 small neon games to unwind with. Play by touch, with a controller, a keyboard or a mouse. Works offline.",
+  "name": "Zuzu",
+  "short_name": "Zuzu",
+  "description": "Small neon games to unwind with, made with love for Shubu, Tuktuk and Aryan. Play by touch, with a controller, a keyboard or a mouse. Works offline.",
   "start_url": "./",
   "scope": "./",
   "display": "fullscreen",

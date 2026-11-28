@@ -1,9 +1,10 @@
-// AK Games service worker: keeps every game playable offline.
+// Zuzu's service worker: keeps every game playable offline.
 // Online, files come fresh from the network (so updates show up straight away) and the
 // saved copy is refreshed. Offline, or on a connection slower than 4 seconds, the saved copy is used.
 'use strict';
 
-const CACHE = 'ak-games-v1';
+const CACHE = 'zuzu-v1';
+// Adding a game? Put its folder name in this list so it is saved for offline play.
 const GAMES = [
   'neon-pop', 'neon-snake', 'neon-merge', 'neon-burst', 'neon-jigsaw', 'neon-memory',
   'neon-match', 'neon-blocks', 'neon-solitaire', 'neon-mahjong', 'neon-sudoku', 'neon-sort',
@@ -22,7 +23,7 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k.startsWith('ak-games-') && k !== CACHE).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => (k.startsWith('zuzu-') || k.startsWith('ak-games-')) && k !== CACHE).map(k => caches.delete(k))))
       .then(() => self.clients.claim()),
   );
 });

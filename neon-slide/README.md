@@ -1,6 +1,6 @@
 # Neon Slide
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm sliding-tiles puzzle in neon. Slide every tile one way, and two equal numbers merge into their sum. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. There's no timer and nothing harsh happens, and you can undo, so it's good for winding down at any age.
 

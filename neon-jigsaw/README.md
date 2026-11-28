@@ -1,6 +1,6 @@
 # Neon Jigsaw
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 Calm jigsaw puzzles of glowing pictures. Every picture is painted fresh by the game, so there are no image files. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. There is no timer and nothing to lose, so it's good for winding down at any age.
 

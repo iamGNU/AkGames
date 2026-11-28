@@ -1,0 +1,802 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Game Template</title>
+<meta name="author" content="Your Name">
+<meta name="theme-color" content="#05070f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="manifest" href="../manifest.webmanifest">
+<link rel="icon" type="image/png" href="../icons/icon-192.png">
+<link rel="apple-touch-icon" href="../icons/apple-touch-icon.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; touch-action: none; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block; touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+  }
+  #turn { display: none; position: fixed; top: 0; left: 0; right: 0; padding: 14px 16px; text-align: center;
+    font: 600 15px system-ui, sans-serif; color: #e8f0ff; background: rgba(10, 14, 32, 0.88); pointer-events: none; }
+  @media (orientation: portrait) and (pointer: coarse) { #turn { display: block; } }
+</style>
+</head>
+<body>
+<div id="turn">↻ Turn your phone sideways for a bigger view</div>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+// Starter template for Zuzu: a tiny working game (Star Catch) with everything a Zuzu game needs.
+// To make your own:
+//   1. copy this folder and give it your game's name,
+//   2. change the GAME settings just below,
+//   3. replace section 2 ("Your game") with your own game.
+// Menus, pause, sound, controller + keyboard + mouse + touch input, phones, keeping the screen on and
+// offline play already work, so the rest can usually stay as it is. The full guide is CONTRIBUTING.md.
+
+// ============================================================
+// 1. About your game: change these
+// ============================================================
+const GAME = {
+  title: 'STAR CATCH',
+  tagline: 'catch the falling stars, and miss as many as you like',
+  author: 'Your Name',     // shown on the menu as "Made by ..."; put it in <meta name="author"> at the top too
+  color: '#ffd166',        // the title colour; use the same colour for your card on the game picker
+  saveKey: 'starCatch',    // a unique prefix for anything saved in the browser (best score, settings)
+};
+const W = 960, H = 540, TAU = Math.PI * 2;  // the game always draws on 960 x 540; it is scaled to fit the screen
+const QS = new URLSearchParams(location.search);
+const LOW_RES = QS.has('low');              // add ?low to the address for lighter drawing on slow machines
+const SHOW_FPS = QS.has('fps');             // add ?fps to the address to see the frame rate
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif';
+const MONO = 'ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace';
+const COL = { text: '#e8f0ff', dim: '#8390bd', faint: '#56608a', good: '#5dff9e', warn: '#ffd98a' };
+
+// ============================================================
+// Helpers
+// ============================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inRect = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+function load(key, def) { try { const v = localStorage.getItem(GAME.saveKey + '.' + key); return v == null ? def : v; } catch (e) { return def; } }
+function save(key, v) { try { localStorage.setItem(GAME.saveKey + '.' + key, String(v)); } catch (e) { /* storage blocked: ignore */ } }
+
+// ============================================================
+// Canvas: scaled to fit the window, sharp on high-density screens
+// ============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+let rs = 1;           // render scale: canvas pixels per game pixel
+let bgCanvas = null;  // the background, drawn once per resize and copied every frame
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+  rs = LOW_RES ? 1 : clamp(s * (window.devicePixelRatio || 1), 1, 1.5);
+  canvas.width = Math.round(W * rs);
+  canvas.height = Math.round(H * rs);
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width = canvas.width; bgCanvas.height = canvas.height;
+  const g = bgCanvas.getContext('2d');
+  g.setTransform(rs, 0, 0, rs, 0, 0);
+  drawBackground(g);
+}
+
+// ============================================================
+// Sound: a tiny WebAudio synth, so there are no sound files to load
+// ============================================================
+const Sfx = {
+  ctx: null, master: null, muted: load('muted', '0') === '1', last: {},
+  init() { // browsers only allow sound after a key press, click or tap, so this runs on each one
+    try {
+      if (!this.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 0.35;
+        this.master.connect(this.ctx.destination);
+      }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) { /* no audio: the game still works */ }
+  },
+  ok(key, gap) { // false when sound is off; with a key, also stops the same sound playing more than once per `gap` seconds
+    if (!this.ctx || this.muted || this.ctx.state !== 'running') return false;
+    if (key) {
+      const now = this.ctx.currentTime;
+      if (now - (this.last[key] || 0) < gap) return false;
+      this.last[key] = now;
+    }
+    return true;
+  },
+  tone(f1, f2, dur, type, vol, delay = 0) { // a note sliding from f1 to f2 Hz, with a soft start and end (no clicks)
+    const c = this.ctx, t = c.currentTime + delay;
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.02);
+  },
+  bell(f, vol, delay = 0) { // a soft glassy chime
+    this.tone(f, f, 0.9, 'sine', vol, delay);
+    this.tone(f * 2, f * 2, 0.45, 'sine', vol * 0.2, delay);
+  },
+  tick()   { if (this.ok('tick', 0.03)) this.tone(660, 660, 0.05, 'sine', 0.05); },
+  select() { if (this.ok()) { this.tone(523.25, 523.25, 0.12, 'triangle', 0.07); this.tone(783.99, 783.99, 0.18, 'triangle', 0.07, 0.06); } },
+  start()  { if (this.ok('start', 0.2)) { this.bell(392, 0.08); this.bell(587.33, 0.08, 0.1); } },
+  toggle() {
+    this.muted = !this.muted;
+    save('muted', this.muted ? 1 : 0);
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.35;
+  },
+};
+
+// ============================================================
+// Input: controller + keyboard + mouse + touch, merged into one state.
+// Read these in your game every frame:
+//   Input.move.x, Input.move.y   -1..1 each way (arrow keys / WASD, left stick, D-pad)
+//   Input.action                 the main button was pressed this frame (Space / Enter / A)
+//   Input.actionHeld             ... or is being held down
+//   Input.ptr                    the mouse or finger: x, y (game pixels), down, clicked (a tap or click this frame)
+//   Input.device                 what was used last: 'kb', 'mouse', 'touch' or 'pad'
+// ============================================================
+const Input = {
+  held: new Set(), pressed: new Set(),   // keyboard: keys held now, and keys pressed this frame (e.code values)
+  ptr: { x: W / 2, y: H / 2, down: false, clicked: false, moved: false, id: null, x0: 0, y0: 0, dragged: false },
+  pad: null, padIndex: null, prev: [], stickDir: 0, stickHold: 0,
+  device: 'kb',
+  move: { x: 0, y: 0 }, action: false, actionHeld: false,
+  up: false, down: false, left: false, right: false,     // one menu step this frame
+  select: false, back: false, pause: false, mute: false,
+
+  init() {
+    addEventListener('keydown', e => {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+      if (!e.repeat) this.pressed.add(e.code);
+      this.held.add(e.code);
+      this.device = 'kb';
+      Sfx.init();
+    });
+    addEventListener('keyup', e => this.held.delete(e.code));
+    addEventListener('blur', () => { this.held.clear(); this.ptr.down = false; this.ptr.id = null; });
+    // Mouse and touch. The listeners are on the whole window, so the black bars beside the game work too.
+    addEventListener('pointerdown', e => {
+      const p = this.ptr;
+      if (e.pointerType === 'mouse' ? e.button !== 0 : p.id !== null) return; // left button only; one finger at a time
+      this.toWorld(e);
+      p.down = true; p.id = e.pointerId; p.x0 = p.x; p.y0 = p.y; p.dragged = false;
+      this.device = e.pointerType === 'mouse' ? 'mouse' : 'touch';
+      Sfx.init();
+    });
+    addEventListener('pointermove', e => {
+      const p = this.ptr;
+      if (p.id !== null ? e.pointerId !== p.id : e.pointerType !== 'mouse') return;
+      this.toWorld(e);
+      p.moved = true;
+      if (e.pointerType === 'mouse') this.device = 'mouse';
+      if (Math.hypot(p.x - p.x0, p.y - p.y0) > 14) p.dragged = true;
+    });
+    const end = e => {
+      const p = this.ptr;
+      if (p.id !== e.pointerId) return;
+      if (e.type === 'pointerup') {
+        this.toWorld(e);
+        if (!p.dragged) p.clicked = true; // a tap or click, not a drag
+        Sfx.init();                        // phones unlock sound when the finger lifts
+      }
+      p.down = false; p.id = null;
+    };
+    addEventListener('pointerup', end);
+    addEventListener('pointercancel', end);
+    addEventListener('contextmenu', e => e.preventDefault());
+    addEventListener('gamepadconnected', e => { this.padIndex = e.gamepad.index; this.prev.length = 0; showToast('Controller connected'); });
+    addEventListener('gamepaddisconnected', e => {
+      if (this.padIndex === e.gamepad.index) this.padIndex = null;
+      showToast('Controller disconnected');
+      if (state === 'play') pauseGame();
+    });
+  },
+
+  toWorld(e) { // screen position -> game pixels (outside 0..W / 0..H over the black bars)
+    const r = canvas.getBoundingClientRect();
+    if (r.width && r.height) {
+      this.ptr.x = ((e.clientX - r.left) / r.width) * W;
+      this.ptr.y = ((e.clientY - r.top) / r.height) * H;
+    }
+  },
+
+  getPad() {
+    if (!navigator.getGamepads) return null;
+    let pads;
+    try { pads = navigator.getGamepads(); } catch (e) { return null; }
+    if (!pads) return null;
+    const cur = this.padIndex != null ? pads[this.padIndex] : null;
+    if (cur && cur.connected) return cur;
+    for (const p of pads) {
+      if (p && p.connected) { this.padIndex = p.index; this.prev.length = 0; return p; }
+    }
+    this.padIndex = null;
+    return null;
+  },
+
+  poll(dt) {
+    const K = this.held, P = this.pressed;
+    let mx = (K.has('ArrowRight') || K.has('KeyD') ? 1 : 0) - (K.has('ArrowLeft') || K.has('KeyA') ? 1 : 0);
+    let my = (K.has('ArrowDown') || K.has('KeyS') ? 1 : 0) - (K.has('ArrowUp') || K.has('KeyW') ? 1 : 0);
+    let up = P.has('ArrowUp') || P.has('KeyW'), down = P.has('ArrowDown') || P.has('KeyS');
+    let left = P.has('ArrowLeft') || P.has('KeyA'), right = P.has('ArrowRight') || P.has('KeyD');
+    let action = P.has('Space') || P.has('Enter'), actionHeld = K.has('Space') || K.has('Enter');
+    let select = action, back = P.has('Escape') || P.has('Backspace');
+    let pause = P.has('Escape') || P.has('KeyP'), mute = P.has('KeyM');
+
+    const pad = this.getPad();
+    this.pad = pad;
+    if (pad) {
+      const prev = this.prev, btns = pad.buttons;
+      const on = i => { const b = btns[i]; return !!b && (b.pressed || b.value > 0.5); };
+      // The first frame with a controller: buttons already held (like A from the game picker) are not new presses.
+      if (!prev.length) for (let i = 0; i < btns.length; i++) prev[i] = on(i);
+      const tap = i => on(i) && !prev[i];
+      // Left stick (with a small dead zone) or D-pad: movement
+      let ax = pad.axes[0] || 0, ay = pad.axes[1] || 0;
+      const m = Math.hypot(ax, ay);
+      if (m < 0.2) { ax = 0; ay = 0; } else { const k = Math.min(1, (m - 0.2) / 0.8) / m; ax *= k; ay *= k; }
+      if (on(14)) ax = -1;
+      if (on(15)) ax = 1;
+      if (on(12)) ay = -1;
+      if (on(13)) ay = 1;
+      if (ax || ay) { mx = ax; my = ay; }
+      // Buttons (standard layout): 0 A, 1 B, 8 Back/Select, 9 Start, 12-15 D-pad
+      if (tap(0)) { action = true; select = true; }
+      if (on(0)) actionHeld = true;
+      if (tap(1)) back = true;
+      if (tap(9)) { pause = true; select = true; }
+      if (tap(8)) mute = true;
+      if (tap(12)) up = true;
+      if (tap(13)) down = true;
+      if (tap(14)) left = true;
+      if (tap(15)) right = true;
+      // The stick steps through menus too: one step per push, repeating while it is held
+      const sx = pad.axes[0] || 0, sy = pad.axes[1] || 0;
+      let dir = 0;
+      if (Math.abs(sy) > 0.6 && Math.abs(sy) >= Math.abs(sx)) dir = sy < 0 ? 1 : 2;
+      else if (Math.abs(sx) > 0.6) dir = sx < 0 ? 3 : 4;
+      let step = 0;
+      if (dir !== this.stickDir) { this.stickDir = dir; this.stickHold = 0; step = dir; }
+      else if (dir && (this.stickHold += dt) > 0.35) { this.stickHold = 0.22; step = dir; }
+      if (step === 1) up = true; else if (step === 2) down = true; else if (step === 3) left = true; else if (step === 4) right = true;
+
+      let any = false;
+      for (let i = 0; i < btns.length; i++) { const v = on(i); if (v && !prev[i]) any = true; prev[i] = v; }
+      if (any || ax || ay) this.device = 'pad';
+      if (any) Sfx.init();
+    }
+    this.move.x = mx; this.move.y = my;
+    this.action = action; this.actionHeld = actionHeld;
+    this.up = up; this.down = down; this.left = left; this.right = right;
+    this.select = select; this.back = back; this.pause = pause; this.mute = mute;
+  },
+
+  endFrame() { this.pressed.clear(); this.ptr.clicked = false; this.ptr.moved = false; },
+
+  rumble(strong, weak, ms) { // a short controller buzz, where supported
+    const a = this.pad && this.pad.vibrationActuator;
+    if (!a || !a.playEffect) return;
+    try {
+      const r = a.playEffect('dual-rumble', { duration: ms, strongMagnitude: strong, weakMagnitude: weak });
+      if (r && r.catch) r.catch(() => {});
+    } catch (e) { /* rumble not supported */ }
+  },
+};
+
+function usingPad() { return !!Input.pad && Input.device === 'pad'; }
+function padNames() { // button names to show in hints: PlayStation pads use symbols
+  const id = ((Input.pad && Input.pad.id) || '').toLowerCase();
+  const ps = /054c|sony|dualshock|dualsense|playstation/.test(id);
+  return ps ? { a: '✕', b: '○', start: 'Options', select: 'Create' } : { a: 'A', b: 'B', start: 'Start', select: 'Back' };
+}
+function shortId(id) {
+  const s = String(id || '').replace(/\(.*$/, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  return (s || 'Gamepad').slice(0, 32);
+}
+
+// ============================================================
+// Screens and menus
+// ============================================================
+let state = 'title', stateT = 0, time = 0;   // state: 'title', 'howto', 'play' or 'paused'
+let menuSel = 0;
+const menuRects = [];
+const toast = { text: '', t: 0 };
+const HUD_PAUSE = { x: W - 58, y: 8, w: 48, h: 48 };
+const HUD_SOUND = { x: W - 112, y: 8, w: 48, h: 48 };
+
+function showToast(s) { toast.text = s; toast.t = 2; }
+function toggleSound() { Sfx.toggle(); showToast(Sfx.muted ? 'Sound off' : 'Sound on'); }
+function setState(s) { state = s; stateT = 0; menuSel = 0; menuRects.length = 0; }
+function pauseGame() { setState('paused'); Sfx.tick(); }
+function resumeGame() { state = 'play'; Sfx.tick(); }
+
+function titleItems() {
+  return [
+    { id: 'play', label: 'Play', hint: 'Catch as many stars as you like. There is no way to lose.' },
+    { id: 'howto', label: 'How to Play', hint: 'Controls for controller, keyboard, mouse and touch.' },
+    { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On', hint: 'Soft chimes when you catch a star.' },
+    { id: 'games', label: 'All Games', hint: 'Back to Zuzu.' },
+  ];
+}
+function pauseItems() {
+  return [
+    { id: 'resume', label: 'Resume' }, { id: 'restart', label: 'Restart' },
+    { id: 'sound', label: 'Sound', value: Sfx.muted ? 'Off' : 'On' }, { id: 'quit', label: 'Quit to menu' },
+  ];
+}
+function changeSetting(id, dir) { // menu items with a `value` are settings: left/right or select changes them
+  if (id === 'sound') toggleSound();
+  // Add your own settings here (difficulty, speed, colours...) and keep them with save()
+}
+
+// Moves the menu cursor and returns the id of the item chosen this frame (or null)
+function menuInput(items) {
+  const I = Input, p = I.ptr, n = items.length;
+  if (menuSel >= n) menuSel = 0;
+  if (I.up) { menuSel = (menuSel + n - 1) % n; Sfx.tick(); }
+  if (I.down) { menuSel = (menuSel + 1) % n; Sfx.tick(); }
+  if ((p.moved && I.device === 'mouse') || p.clicked) {
+    for (let i = 0; i < n; i++) if (menuRects[i] && inRect(p, menuRects[i]) && menuSel !== i) { menuSel = i; Sfx.tick(); }
+  }
+  const it = items[menuSel], r = menuRects[menuSel];
+  const clicked = p.clicked && r && inRect(p, r);
+  if (it.value !== undefined) {
+    if (I.left || I.right || I.select || clicked) { changeSetting(it.id, I.left ? -1 : 1); Sfx.tick(); }
+    return null;
+  }
+  if (I.select || clicked) { Sfx.select(); return it.id; }
+  return null;
+}
+
+function update(dt) {
+  time += dt; stateT += dt;
+  if (toast.t > 0) toast.t -= dt;
+  if (Input.mute) toggleSound();
+  switch (state) {
+    case 'title': {
+      const id = menuInput(titleItems());
+      if (id === 'play') start();
+      else if (id === 'howto') setState('howto');
+      else if (id === 'games') location.href = '../index.html';
+      break;
+    }
+    case 'howto':
+      if (Input.back || Input.select || Input.ptr.clicked) { setState('title'); menuSel = 1; Sfx.tick(); }
+      break;
+    case 'play':
+      if (Input.pause || (Input.ptr.clicked && inRect(Input.ptr, HUD_PAUSE))) { pauseGame(); break; }
+      if (Input.ptr.clicked && inRect(Input.ptr, HUD_SOUND)) toggleSound();
+      updatePlay(dt);
+      break;
+    case 'paused': {
+      if (Input.pause || Input.back) { resumeGame(); break; }
+      const id = menuInput(pauseItems());
+      if (id === 'resume') resumeGame();
+      else if (id === 'restart') start();
+      else if (id === 'quit') setState('title');
+      break;
+    }
+  }
+}
+
+// ============================================================
+// 2. Your game: replace this section with your own.
+//    start()            begins a new round
+//    updatePlay(dt)     moves everything on (dt = seconds since the last frame)
+//    drawPlay()         draws the round
+//    drawBackground(g)  draws anything that never changes, once (it is cached)
+// ============================================================
+const BASKET_Y = H - 64, BASKET_W = 120;
+const SCALE = [523.25, 587.33, 659.25, 783.99, 880, 1046.5, 1174.66, 1318.51]; // catches in a row climb this scale
+const STAR_HUES = [48, 330, 195, 145, 275];
+const game = { x: W / 2, stars: [], sparks: [], caught: 0, streak: 0, spawn: 0, best: parseInt(load('best', '0'), 10) || 0 };
+
+function start() {
+  game.x = W / 2; game.stars.length = 0; game.sparks.length = 0;
+  game.caught = 0; game.streak = 0; game.spawn = 0.6;
+  setState('play');
+  Sfx.start();
+}
+
+function updatePlay(dt) {
+  // Move the basket with the stick, D-pad or arrow keys...
+  game.x += Input.move.x * 640 * dt;
+  // ...or follow the mouse, or a finger dragging anywhere on the screen
+  if (Input.device === 'mouse' || (Input.device === 'touch' && Input.ptr.down)) {
+    game.x += (Input.ptr.x - game.x) * Math.min(1, dt * 16);
+  }
+  game.x = clamp(game.x, BASKET_W / 2 + 16, W - BASKET_W / 2 - 16);
+
+  // A new star every so often; they fall a little faster as you catch more
+  game.spawn -= dt;
+  if (game.spawn <= 0) {
+    game.spawn = rand(0.55, 1.05);
+    game.stars.push({
+      x: rand(40, W - 40), y: -24, vy: rand(110, 160) + Math.min(110, game.caught * 1.5),
+      hue: STAR_HUES[Math.floor(Math.random() * STAR_HUES.length)], spin: rand(-1.5, 1.5), a: rand(0, TAU),
+    });
+  }
+  const rim = BASKET_Y - 8;
+  for (let i = game.stars.length - 1; i >= 0; i--) {
+    const s = game.stars[i], y0 = s.y;
+    s.y += s.vy * dt; s.a += s.spin * dt;
+    if (y0 < rim && s.y >= rim && Math.abs(s.x - game.x) < BASKET_W / 2 + 6) { // caught!
+      game.stars.splice(i, 1);
+      game.caught++; game.streak++;
+      if (game.caught > game.best) { game.best = game.caught; save('best', game.best); }
+      burst(s.x, rim, s.hue);
+      if (Sfx.ok('catch', 0.03)) Sfx.bell(SCALE[Math.min(game.streak - 1, SCALE.length - 1)], 0.14);
+      Input.rumble(0.1, 0.25, 60);
+    } else if (s.y > H + 24) { // missed: nothing lost, the chime just starts low again
+      game.stars.splice(i, 1);
+      game.streak = 0;
+    }
+  }
+  for (let i = game.sparks.length - 1; i >= 0; i--) {
+    const p = game.sparks[i];
+    p.life -= dt;
+    if (p.life <= 0) { game.sparks.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 260 * dt;
+  }
+}
+
+function burst(x, y, hue) {
+  for (let k = 0; k < 14 && game.sparks.length < 240; k++) {
+    const a = rand(Math.PI, TAU), v = rand(80, 260);
+    game.sparks.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rand(0.4, 0.8), hue });
+  }
+}
+
+function drawBackground(g) {
+  const grd = g.createLinearGradient(0, 0, 0, H);
+  grd.addColorStop(0, '#0b0f26'); grd.addColorStop(1, '#05070f');
+  g.fillStyle = grd; g.fillRect(0, 0, W, H);
+  let seed = 7; // fixed, so the sky looks the same after every resize
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  g.fillStyle = '#cfd8ff';
+  for (let i = 0; i < 90; i++) { g.globalAlpha = 0.15 + rnd() * 0.35; g.fillRect(rnd() * W, rnd() * (H - 90), 1.5, 1.5); }
+  g.globalAlpha = 1;
+  g.fillStyle = 'rgba(131,144,189,0.18)'; g.fillRect(0, BASKET_Y + 28, W, 1);
+}
+
+function starPath(x, y, r, a) {
+  ctx.beginPath();
+  for (let k = 0; k < 10; k++) {
+    const rr = k % 2 ? r * 0.45 : r, t = a + (k * Math.PI) / 5;
+    ctx.lineTo(x + Math.cos(t) * rr, y + Math.sin(t) * rr);
+  }
+  ctx.closePath();
+}
+
+function drawPlay() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  for (const s of game.stars) {
+    starPath(s.x, s.y, 13, s.a);
+    ctx.fillStyle = `hsla(${s.hue},100%,70%,0.25)`; ctx.fill();
+    ctx.lineJoin = 'round'; glowStroke(`hsl(${s.hue},100%,70%)`, 2);
+  }
+  for (const p of game.sparks) {
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    ctx.fillStyle = `hsl(${p.hue},100%,75%)`; ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+  // the basket
+  ctx.beginPath();
+  ctx.moveTo(game.x - BASKET_W / 2, BASKET_Y - 10);
+  ctx.quadraticCurveTo(game.x - BASKET_W / 2 + 6, BASKET_Y + 22, game.x, BASKET_Y + 22);
+  ctx.quadraticCurveTo(game.x + BASKET_W / 2 - 6, BASKET_Y + 22, game.x + BASKET_W / 2, BASKET_Y - 10);
+  ctx.lineCap = 'round'; glowStroke(GAME.color, 4);
+  // score and buttons
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+  glowText(`Caught ${game.caught}`, W / 2, 32, `800 22px ${SANS}`, COL.text, 5);
+  ctx.textAlign = 'right';
+  text(`Best ${game.best}`, HUD_SOUND.x - 10, 32, `600 14px ${MONO}`, COL.dim);
+  drawIconBtn(HUD_SOUND, 'sound');
+  drawIconBtn(HUD_PAUSE, 'pause');
+  // a reminder of the controls for the first few seconds
+  if (state === 'play' && game.caught === 0 && stateT < 6) {
+    const how = usingPad() ? 'Move with the stick or D-pad' : Input.device === 'touch' ? 'Drag anywhere to move the basket'
+      : Input.device === 'mouse' ? 'Move the mouse to move the basket' : 'Move with ← → or A D';
+    ctx.globalAlpha = Math.min(1, (6 - stateT) * 2) * (0.75 + 0.25 * Math.sin(time * 3));
+    ctx.textAlign = 'center';
+    glowText(how, W / 2, H / 2, `700 20px ${SANS}`, COL.text, 4);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ============================================================
+// Drawing helpers and the shared screens
+// ============================================================
+function rrPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function glowStroke(color, w) { // a neon line: a wide faint stroke under a thin bright one (much cheaper than shadowBlur)
+  const a = ctx.globalAlpha;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = a * 0.22; ctx.lineWidth = w * 3.5; ctx.stroke();
+  ctx.globalAlpha = a; ctx.lineWidth = w; ctx.stroke();
+}
+function text(s, x, y, font, color) { ctx.font = font; ctx.fillStyle = color; ctx.fillText(s, x, y); }
+function glowText(s, x, y, font, color, halo = 10) {
+  const a = ctx.globalAlpha;
+  ctx.font = font; ctx.lineJoin = 'round';
+  ctx.globalAlpha = a * 0.22; ctx.strokeStyle = color; ctx.lineWidth = halo; ctx.strokeText(s, x, y);
+  ctx.globalAlpha = a; ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function overlay(alpha) { ctx.fillStyle = `rgba(3,5,10,${alpha})`; ctx.fillRect(0, 0, W, H); }
+
+function drawIconBtn(r, kind) {
+  const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  const hover = Input.device === 'mouse' && inRect(Input.ptr, r);
+  ctx.beginPath(); ctx.arc(cx, cy, 18, 0, TAU);
+  ctx.fillStyle = hover ? 'rgba(255,255,255,0.12)' : 'rgba(131,144,189,0.08)'; ctx.fill();
+  ctx.strokeStyle = hover ? GAME.color : 'rgba(131,144,189,0.45)'; ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.fillStyle = COL.text; ctx.strokeStyle = COL.text;
+  ctx.globalAlpha = hover ? 1 : 0.8;
+  if (kind === 'pause') {
+    ctx.fillRect(cx - 6, cy - 7, 4, 14); ctx.fillRect(cx + 2, cy - 7, 4, 14);
+  } else {
+    ctx.beginPath();
+    ctx.moveTo(cx - 9, cy - 3); ctx.lineTo(cx - 5, cy - 3); ctx.lineTo(cx + 1, cy - 8);
+    ctx.lineTo(cx + 1, cy + 8); ctx.lineTo(cx - 5, cy + 3); ctx.lineTo(cx - 9, cy + 3); ctx.closePath(); ctx.fill();
+    ctx.lineWidth = 1.6; ctx.beginPath();
+    if (Sfx.muted) { ctx.moveTo(cx + 4, cy - 4); ctx.lineTo(cx + 11, cy + 4); ctx.moveTo(cx + 11, cy - 4); ctx.lineTo(cx + 4, cy + 4); }
+    else { ctx.arc(cx + 1, cy, 5, -0.8, 0.8); ctx.moveTo(cx + 1 + Math.cos(-0.8) * 10, cy + Math.sin(-0.8) * 10); ctx.arc(cx + 1, cy, 10, -0.8, 0.8); }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawMenu(items, y0, gap = 50) {
+  menuRects.length = 0;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = 330, h = 42;
+  items.forEach((it, i) => {
+    const y = y0 + i * gap, x = W / 2 - w / 2, sel = i === menuSel;
+    menuRects.push({ x, y: y - h / 2, w, h });
+    if (sel) {
+      rrPath(x, y - h / 2, w, h, h / 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.07)'; ctx.fill();
+      glowStroke(GAME.color, 1.5);
+    }
+    const col = sel ? COL.text : COL.dim;
+    if (it.value !== undefined) {
+      text(it.label, W / 2 - 44, y, `700 20px ${SANS}`, col);
+      text(sel ? `‹ ${it.value} ›` : it.value, W / 2 + 100, y, `700 15px ${SANS}`, sel ? COL.warn : COL.faint);
+    } else {
+      text(it.label, W / 2, y, `700 20px ${SANS}`, col);
+    }
+  });
+}
+function menuHelp(it) {
+  const N = padNames(), side = it.value !== undefined ? '   ·   ← → change' : '';
+  if (usingPad()) return `↑ ↓ choose   ·   ${N.a} select${side}`;
+  if (Input.device === 'touch') return 'Tap a choice';
+  if (Input.device === 'mouse') return 'Click a choice';
+  return `↑ ↓ choose   ·   Enter select${side}`;
+}
+
+function drawTitle() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  for (let i = 0; i < 7; i++) { // a few stars drifting down behind the menu
+    const x = (i * 137 + 60) % W, y = ((time * (30 + i * 6) + i * 97) % (H + 60)) - 30;
+    ctx.globalAlpha = 0.45; starPath(x, y, 10, time * 0.5 + i);
+    ctx.lineJoin = 'round'; glowStroke(`hsl(${STAR_HUES[i % STAR_HUES.length]},100%,70%)`, 1.5);
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText(GAME.title, W / 2, 100, `800 60px ${SANS}`, GAME.color);
+  text(GAME.tagline, W / 2, 146, `500 15px ${SANS}`, COL.dim);
+  const items = titleItems();
+  drawMenu(items, 214);
+  const it = items[menuSel] || items[0];
+  text(it.hint, W / 2, 418, `500 14px ${SANS}`, COL.dim);
+  text(menuHelp(it), W / 2, 446, `500 12px ${SANS}`, COL.faint);
+  // footer: controller status, credits, best score
+  const yb = H - 26, pad = Input.pad;
+  ctx.beginPath(); ctx.arc(30, yb, 4, 0, TAU); ctx.fillStyle = pad ? COL.good : COL.warn; ctx.fill();
+  ctx.textAlign = 'left';
+  text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
+    42, yb, `600 12px ${SANS}`, COL.dim);
+  ctx.textAlign = 'center';
+  text(`Made by ${GAME.author}  ·  part of Zuzu`, W / 2, yb, `500 12px ${SANS}`, COL.dim);
+  ctx.textAlign = 'right';
+  text(`Best ${game.best}`, W - 24, yb, `600 12px ${MONO}`, COL.dim);
+}
+
+function drawHowTo() {
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  overlay(0.5);
+  const N = padNames();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('HOW TO PLAY', W / 2, 56, `800 32px ${SANS}`, GAME.color);
+  const C1 = 230, C2 = 430, C3 = 600;
+  const rows = [
+    ['Move', 'Left stick / D-pad', '← → or A D', 'Drag anywhere, or the mouse'],
+    ['Pause', N.start, 'Esc or P', 'Pause button, top right'],
+    ['Sound on/off', N.select, 'M', 'Speaker button, top right'],
+    ['Menus', `D-pad + ${N.a}, ${N.b} back`, 'Arrows + Enter', 'Tap or click a choice'],
+  ];
+  ctx.textAlign = 'left';
+  text('CONTROLLER', C1, 104, `800 11px ${SANS}`, COL.faint);
+  text('KEYBOARD', C2, 104, `800 11px ${SANS}`, COL.faint);
+  text('TOUCH / MOUSE', C3, 104, `800 11px ${SANS}`, COL.faint);
+  rows.forEach((r, i) => {
+    const y = 134 + i * 28;
+    ctx.textAlign = 'right'; text(r[0], C1 - 20, y, `600 14px ${SANS}`, COL.dim);
+    ctx.textAlign = 'left';
+    text(r[1], C1, y, `600 14px ${SANS}`, COL.text);
+    text(r[2], C2, y, `600 14px ${SANS}`, COL.text);
+    text(r[3], C3, y, `600 14px ${SANS}`, COL.text);
+  });
+  ctx.fillStyle = 'rgba(131,144,189,0.2)'; ctx.fillRect(110, 262, W - 220, 1);
+  ctx.textAlign = 'center';
+  ['Stars drift down from the sky. Catch them in your basket.',
+    'Catch a few in a row and the chime climbs higher.',
+    'Missing a star costs nothing, so play for as long as you like.',
+  ].forEach((s, i) => text(s, W / 2, 300 + i * 30, `500 16px ${SANS}`, COL.text));
+  text(usingPad() ? `${N.b}: back` : Input.device === 'touch' ? 'Tap: back' : 'Esc or click: back', W / 2, H - 32, `600 13px ${SANS}`, COL.dim);
+}
+
+function drawPause() {
+  overlay(0.62);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  glowText('PAUSED', W / 2, 140, `800 46px ${SANS}`, COL.text);
+  text(`Caught ${game.caught}   ·   Best ${game.best}`, W / 2, 186, `600 15px ${SANS}`, COL.dim);
+  const items = pauseItems();
+  drawMenu(items, 250);
+  text(menuHelp(items[menuSel] || items[0]), W / 2, 460, `500 12px ${SANS}`, COL.faint);
+}
+
+function drawToast() {
+  if (toast.t <= 0) return;
+  ctx.globalAlpha = Math.min(1, toast.t * 3);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  text(toast.text, W / 2, H - 50, `600 14px ${SANS}`, COL.text);
+  ctx.globalAlpha = 1;
+}
+
+let fps = 60;
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(rs, 0, 0, rs, 0, 0);
+  if (state === 'title') drawTitle();
+  else if (state === 'howto') drawHowTo();
+  else {
+    drawPlay();
+    if (state === 'paused') drawPause();
+  }
+  drawToast();
+  if (SHOW_FPS) {
+    ctx.textAlign = 'right'; ctx.textBaseline = 'bottom';
+    text(`${Math.round(fps)} fps`, W - 12, H - 6, `600 12px ${MONO}`, COL.good);
+  }
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+let last = 0;
+function frame(now) {
+  let dt = (now - last) / 1000;
+  last = now;
+  if (!(dt > 0)) dt = 0;
+  if (SHOW_FPS && dt > 0) fps += (1 / dt - fps) * 0.05;
+  if (dt > 0.05) dt = 0.05; // after a hiccup, don't jump far ahead
+  Input.poll(dt);
+  update(dt);
+  render();
+  Input.endFrame();
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => { if (document.hidden && state === 'play') pauseGame(); });
+addEventListener('resize', resize);
+Input.init();
+resize();
+requestAnimationFrame(t => { last = t; frame(t); });
+
+// Keep the screen on while someone is playing. The operating system only counts
+// keyboard and mouse as activity, so during controller play it would switch the
+// display off. After 5 minutes with no input at all the lock is let go, so a
+// forgotten tab still lets the screen sleep.
+(function () {
+  if (typeof navigator === 'undefined' || !navigator.wakeLock) return;
+  var IDLE_MS = 5 * 60 * 1000;
+  var lock = null, asking = false, last = Date.now(), axes = [];
+  function hold() {
+    if (lock || asking || document.visibilityState !== 'visible') return;
+    asking = true;
+    navigator.wakeLock.request('screen').then(function (l) {
+      asking = false;
+      lock = l;
+      l.addEventListener('release', function () { if (lock === l) lock = null; });
+    }, function () { asking = false; });
+  }
+  function active() { last = Date.now(); hold(); }
+  ['keydown', 'pointerdown', 'pointermove', 'wheel'].forEach(function (t) {
+    addEventListener(t, active, { passive: true });
+  });
+  // The system drops the lock when the tab is hidden; take it again on return.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') active();
+  });
+  // Controllers fire no events for buttons or sticks, so look at them directly.
+  setInterval(function () {
+    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (var i = 0; i < pads.length; i++) {
+      var p = pads[i];
+      if (!p) continue;
+      var a = axes[i] || (axes[i] = []);
+      for (var b = 0; b < p.buttons.length; b++) if (p.buttons[b].pressed) { active(); break; }
+      for (var k = 0; k < p.axes.length; k++) {
+        if (Math.abs(p.axes[k] - (a[k] || 0)) > 0.25) active();
+        a[k] = p.axes[k];
+      }
+    }
+    if (lock && Date.now() - last > IDLE_MS) {
+      var l = lock;
+      lock = null;
+      l.release().catch(function () {});
+    }
+  }, 250);
+  active();
+})();
+
+// Full screen on phones and tablets. Browsers only allow it after a tap, so the first tap in the
+// game hides the address bar and the system bars, and turns the game sideways where the phone
+// allows it. Swiping back leaves full screen; the next tap returns to it. Mouse players keep their window.
+(function () {
+  var el = typeof document !== 'undefined' && document.documentElement;
+  if (!el || typeof addEventListener === 'undefined') return;
+  var request = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (!request) return;
+  function isFull() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement) ||
+      !!(window.matchMedia && window.matchMedia('(display-mode: fullscreen)').matches);
+  }
+  addEventListener('pointerup', function (e) {
+    if (e.pointerType === 'mouse' || isFull()) return;
+    try {
+      var p = request.call(el, { navigationUI: 'hide' });
+      if (p && p.then) {
+        p.then(function () {
+          var o = screen.orientation;
+          if (o && o.lock) o.lock('landscape').catch(function () {});
+        }, function () {});
+      }
+    } catch (err) { /* not allowed here: the game still works in the window */ }
+  }, { passive: true });
+})();
+
+// Offline play: Zuzu's service worker saves every game. It needs http(s), so it is skipped
+// when the file is opened straight from disk.
+if (typeof navigator !== 'undefined' && navigator.serviceWorker && location.protocol.indexOf('http') === 0) {
+  navigator.serviceWorker.register('../sw.js', { scope: '../' }).catch(function () {});
+}
+</script>
+</body>
+</html>

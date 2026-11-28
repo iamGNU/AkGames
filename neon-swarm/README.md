@@ -1,6 +1,6 @@
 # Neon Swarm
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A small twin-stick arena shooter for a game controller, keyboard and mouse, or a touch screen. The whole game is one HTML file. It needs no install, no build step, no downloads and no internet connection, and it runs smoothly on old laptops.
 

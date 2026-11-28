@@ -1,6 +1,6 @@
 # Neon Blocks
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm block puzzle. Drop pieces onto an 8×8 board, and fill whole rows or columns to clear them. There's no timer and nothing falls, so take your time. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. It works with a controller, keyboard, mouse or touch screen.
 

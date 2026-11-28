@@ -1,6 +1,6 @@
 # Neon Solitaire
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 Classic patience (Klondike rules) in calm neon. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. There's no clock unless you want one, undo is unlimited, and nothing is ever lost, so it's good for winding down at any age.
 

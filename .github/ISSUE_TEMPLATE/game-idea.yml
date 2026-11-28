@@ -1,0 +1,37 @@
+name: Suggest a game
+description: Can't code, or short on time? Tell us a game you'd love to play in Zuzu.
+title: "Game idea: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Zuzu is a collection of small games to unwind with, for every age. Ideas for calm games and action games are both welcome. Quizzes and lessons aren't part of the collection.
+  - type: input
+    id: idea
+    attributes:
+      label: What kind of game?
+      description: For example "a gentle fishing game" or "a two-player air hockey".
+    validations:
+      required: true
+  - type: textarea
+    id: fun
+    attributes:
+      label: What makes it fun or relaxing?
+      description: How it plays, what you'd do, what it feels like.
+    validations:
+      required: true
+  - type: dropdown
+    id: section
+    attributes:
+      label: Which section would it fit?
+      options:
+        - Relax
+        - Brain teasers
+        - Action
+        - Not sure
+  - type: checkboxes
+    id: build
+    attributes:
+      label: Building it
+      options:
+        - label: I'd like to try building it myself (see CONTRIBUTING.md and the starter game in game-template/)

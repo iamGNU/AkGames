@@ -1,6 +1,6 @@
 # Neon Drive
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm neon road racer, seen from behind the car. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. Nobody crashes: bumping a car or a lamp post only slows you down.
 

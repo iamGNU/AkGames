@@ -1,6 +1,6 @@
 # Neon Sort
 
-**Developer:** Akash · **Co-developer:** Claude Code
+**Developer:** [Akash](https://www.linkedin.com/in/iamGnu/) · **Co-developer:** Claude Code
 
 A calm colour-sorting puzzle in neon. It's one HTML file: no install, no downloads, no internet, and it's light enough for old laptops. There's no timer, no move limit and nothing to lose, so it's good for winding down at any age.
 

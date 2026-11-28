@@ -6,6 +6,9 @@
 <title>Neon Kick</title>
 <meta name="author" content="Akash (developer), Claude Code (co-developer)">
 <meta name="theme-color" content="#05070f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <link rel="manifest" href="../manifest.webmanifest">
 <link rel="icon" type="image/png" href="../icons/icon-192.png">
 <link rel="apple-touch-icon" href="../icons/apple-touch-icon.png">
@@ -27,7 +30,7 @@
 // ============================================================
 // 1. Settings (tweak these to change how the game feels)
 // ============================================================
-const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code' };
+const CREDITS = { developer: 'Akash', coDeveloper: 'Claude Code', dedication: 'Shubu, Tuktuk and Aryan', profile: 'https://www.linkedin.com/in/iamGnu/' };
 const W = 960, H = 540, TAU = Math.PI * 2;
 const PITCH = { l: 60, r: 900, t: 62, b: 502 };
 const PW = PITCH.r - PITCH.l, PH = PITCH.b - PITCH.t;
@@ -1801,7 +1804,8 @@ function drawTitle() {
   text(!navigator.getGamepads ? 'Controllers unavailable here' : pad ? shortId(pad.id) : 'Connect a controller, press any button',
     42, yb, `600 12px ${SANS}`, CFG.color.dim);
   ctx.textAlign = 'center';
-  text(`Developer: ${CREDITS.developer}  ·  Co-developer: ${CREDITS.coDeveloper}`, W / 2, yb, `500 12px ${SANS}`, CFG.color.dim);
+  drawCreditsLink(text, yb, `500 12px ${SANS}`, CFG.color.dim);
+  text(`Made with ♥ for ${CREDITS.dedication}`, W / 2, yb - 23, `600 12px ${SANS}`, '#ff9ee0');
   ctx.textAlign = 'right';
   text(`W ${record.w}  ·  D ${record.d}  ·  L ${record.l}`, W - 24, yb, `600 12px ${MONO}`, CFG.color.dim);
   if (!Sfx.ctx || Sfx.ctx.state !== 'running') text(usingTouch() ? 'tap for sound' : 'click for sound', W - 24, 24, `500 11px ${SANS}`, CFG.color.faint);
@@ -2083,7 +2087,80 @@ requestAnimationFrame(t => { last = t; frame(t); });
   active();
 })();
 
-// Offline play: the AK Games service worker saves every game. It needs http(s), so it is skipped
+// The credits link to the developer's LinkedIn profile: "Akash" is underlined with a small "in"
+// badge, and a click or tap on the credits line on the title screen opens the profile in a new tab.
+let creditsHit = null;
+function drawCreditsLink(draw, y, font, color) {
+  const LINK = '#7cc4ff', a = 'Developer: ', b = CREDITS.developer, c = `  ·  Co-developer: ${CREDITS.coDeveloper}`;
+  ctx.font = font;
+  const wa = ctx.measureText(a).width, wb = ctx.measureText(b).width, wc = ctx.measureText(c).width;
+  const badge = 14, gap = 5, total = wa + wb + gap + badge + wc, x0 = W / 2 - total / 2, align = ctx.textAlign;
+  ctx.textAlign = 'left';
+  draw(a, x0, y, font, color);
+  draw(b, x0 + wa, y, font, LINK);
+  ctx.fillStyle = LINK; ctx.fillRect(x0 + wa, y + 7, wb, 1);
+  const bx = x0 + wa + wb + gap;
+  ctx.fillStyle = '#0a66c2';
+  if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(bx, y - badge / 2, badge, badge, 3); ctx.fill(); } else ctx.fillRect(bx, y - badge / 2, badge, badge);
+  ctx.font = `800 10px ${SANS}`; ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center';
+  ctx.fillText('in', bx + badge / 2, y + 0.5);
+  ctx.textAlign = 'left';
+  draw(c, bx + badge, y, font, color);
+  ctx.textAlign = align;
+  creditsHit = { x: x0 - 8, y: y - 13, w: total + 16, h: 26, t: Date.now() };
+}
+(function () {
+  var cv = typeof document !== 'undefined' && document.getElementById('game');
+  if (!cv || !cv.getBoundingClientRect || typeof addEventListener === 'undefined') return;
+  function over(e) { // on the credits line, while the title screen is showing
+    var h = creditsHit;
+    if (!h || Date.now() - h.t > 300) return false;
+    var r = cv.getBoundingClientRect();
+    if (!r.width || !r.height) return false;
+    var x = ((e.clientX - r.left) / r.width) * W, y = ((e.clientY - r.top) / r.height) * H;
+    return x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h;
+  }
+  addEventListener('pointerup', function (e) {
+    if (e.button > 0 || !over(e)) return;
+    try { window.open(CREDITS.profile, '_blank', 'noopener'); } catch (err) { /* pop-ups blocked */ }
+  });
+  var hovering = false, saved = '';
+  addEventListener('pointermove', function (e) {
+    if (e.pointerType !== 'mouse') return;
+    var on = over(e);
+    if (on === hovering) return;
+    hovering = on;
+    if (on) { saved = cv.style.cursor; cv.style.cursor = 'pointer'; } else cv.style.cursor = saved;
+  }, { passive: true });
+})();
+
+// Full screen on phones and tablets. Browsers only allow it after a tap, so the first tap in the
+// game hides the address bar and the system bars, and turns the game sideways where the phone
+// allows it. Swiping back leaves full screen; the next tap returns to it. Mouse players keep their window.
+(function () {
+  var el = typeof document !== 'undefined' && document.documentElement;
+  if (!el || typeof addEventListener === 'undefined') return;
+  var request = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (!request) return;
+  function isFull() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement) ||
+      !!(window.matchMedia && window.matchMedia('(display-mode: fullscreen)').matches);
+  }
+  addEventListener('pointerup', function (e) {
+    if (e.pointerType === 'mouse' || isFull()) return;
+    try {
+      var p = request.call(el, { navigationUI: 'hide' });
+      if (p && p.then) {
+        p.then(function () {
+          var o = screen.orientation;
+          if (o && o.lock) o.lock('landscape').catch(function () {});
+        }, function () {});
+      }
+    } catch (err) { /* not allowed here: the game still works in the window */ }
+  }, { passive: true });
+})();
+
+// Offline play: Zuzu's service worker saves every game. It needs http(s), so it is skipped
 // when the file is opened straight from disk.
 if (typeof navigator !== 'undefined' && navigator.serviceWorker && location.protocol.indexOf('http') === 0) {
   navigator.serviceWorker.register('../sw.js', { scope: '../' }).catch(function () {});
